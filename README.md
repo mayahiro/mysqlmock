@@ -61,6 +61,14 @@ seed:
     - id: 1
       name: "Alice"
       email: "alice@example.com"
+
+fallback:
+  type: sqlite
+  unsupported:
+    type: error
+    code: 1105
+    sql_state: "HY000"
+    message: "Unsupported query"
 ```
 
 ## SQL Rules
@@ -102,6 +110,10 @@ rules:
 go run ./cmd/mysqlmock serve --config testdb.yaml --listen 127.0.0.1:0 --print-dsn
 go run ./cmd/mysqlmock check --config testdb.yaml
 ```
+
+Use `serve --fail-on-unsupported` to exit with an error after shutdown if the
+server observed unsupported SQL. The error includes generated rule snippets that
+can be copied into the config and adjusted.
 
 ## Development
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"github.com/mayahiro/mysqlmock/pkg/mysqlmock"
@@ -47,7 +48,7 @@ func serve(args []string) error {
 	listen := fs.String("listen", "", "listen address override")
 	printDSN := fs.Bool("print-dsn", false, "print DSN after startup")
 	verbose := fs.Bool("verbose", false, "enable query logs")
-	_ = fs.Bool("fail-on-unsupported", false, "reserved for future use")
+	failOnUnsupported := fs.Bool("fail-on-unsupported", false, "exit with an error if unsupported queries were observed")
 	_ = fs.String("log-format", "text", "reserved for future use")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -82,6 +83,9 @@ func serve(args []string) error {
 	}
 
 	<-ctx.Done()
+	if *failOnUnsupported {
+		return unsupportedQueriesError(server.Unsupported())
+	}
 	return nil
 }
 
@@ -96,4 +100,17 @@ func check(args []string) error {
 		return fmt.Errorf("--config is required")
 	}
 	return mysqlmock.CheckConfigFile(context.Background(), *configPath)
+}
+
+func unsupportedQueriesError(queries []mysqlmock.UnsupportedQuery) error {
+	if len(queries) == 0 {
+		return nil
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "unsupported queries observed: %d", len(queries))
+	for i, query := range queries {
+		fmt.Fprintf(&b, "\n\n%d. %s\n%s", i+1, query.SQL, query.Suggestion)
+	}
+	return fmt.Errorf("%s", b.String())
 }

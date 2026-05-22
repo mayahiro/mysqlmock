@@ -216,6 +216,13 @@ seed:
     - id: 1
       name: "Alice"
       email: "alice@example.com"
+fallback:
+  type: sqlite
+  unsupported:
+    type: error
+    code: 1105
+    sql_state: "HY000"
+    message: "Unsupported query"
 `)
 	if err := os.WriteFile(path, content, 0o600); err != nil {
 		t.Fatal(err)
@@ -223,6 +230,72 @@ seed:
 
 	if err := mysqlmock.CheckConfigFile(context.Background(), path); err != nil {
 		t.Fatalf("check config: %v", err)
+	}
+}
+
+func TestFallbackUnsupportedConfig(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cfg := testConfig()
+	cfg.Fallback.Unsupported = mysqlmock.UnsupportedConfig{
+		Type:     "error",
+		Code:     1644,
+		SQLState: "45000",
+		Message:  "Rejected by mysqlmock",
+	}
+
+	server := mysqlmock.Start(t, mysqlmock.WithConfig(cfg))
+	db, err := sql.Open("mysql", server.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	_, err = db.ExecContext(ctx, "CREATE USER unsupported_user")
+	if err == nil {
+		t.Fatal("expected unsupported query error")
+	}
+	if !strings.Contains(err.Error(), "Error 1644 (45000): Rejected by mysqlmock: CREATE USER unsupported_user") {
+		t.Fatalf("unexpected unsupported query error: %v", err)
+	}
+
+	unsupported := server.Unsupported()
+	if len(unsupported) != 1 {
+		t.Fatalf("unsupported query count = %d, want 1", len(unsupported))
+	}
+	if unsupported[0].SQL != "CREATE USER unsupported_user" {
+		t.Fatalf("unsupported SQL = %q", unsupported[0].SQL)
+	}
+	for _, want := range []string{
+		"code: 1644",
+		`sql_state: "45000"`,
+		`message: "Rejected by mysqlmock"`,
+	} {
+		if !strings.Contains(unsupported[0].Suggestion, want) {
+			t.Fatalf("unsupported suggestion %q does not contain %q", unsupported[0].Suggestion, want)
+		}
+	}
+}
+
+func TestFallbackUnsupportedValidation(t *testing.T) {
+	cfg := mysqlmock.DefaultConfig()
+	cfg.Fallback = mysqlmock.FallbackConfig{}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate without fallback: %v", err)
+	}
+
+	cfg = mysqlmock.DefaultConfig()
+	cfg.Fallback.Unsupported.Type = "ok"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected invalid fallback.unsupported.type error")
+	}
+
+	cfg = mysqlmock.DefaultConfig()
+	cfg.Fallback.Unsupported.SQLState = "HY00"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected invalid fallback.unsupported.sql_state error")
 	}
 }
 

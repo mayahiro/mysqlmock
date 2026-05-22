@@ -331,7 +331,7 @@ func (c *mysqlConn) executeQuery(ctx context.Context, sqlText string, args ...an
 	}
 
 	c.server.recordUnsupported(sqlText)
-	return nil, errPacket(mysqlErrUnknown, "HY000", "Unsupported query: "+sqlText)
+	return nil, c.server.unsupportedError(sqlText)
 }
 
 func (c *mysqlConn) setAutocommit(upper string) okResult {
@@ -355,7 +355,7 @@ func (c *mysqlConn) selectVariable(sqlText string) (resultSet, error) {
 	value, ok := c.server.cfg.Compat.Variables[name]
 	if !ok {
 		c.server.recordUnsupported(sqlText)
-		return resultSet{}, errPacket(mysqlErrUnknown, "HY000", "Unsupported query: "+sqlText)
+		return resultSet{}, c.server.unsupportedError(sqlText)
 	}
 	return resultSet{
 		Columns: []resultColumn{{Name: expr, Type: fieldTypeVarString}},
@@ -752,7 +752,13 @@ func translateSQL(sqlText string) string {
 	return replacer.Replace(sqlText)
 }
 
-func suggestedRule(sqlText string) string {
+func (s *Server) unsupportedError(sqlText string) *mysqlError {
+	cfg := normalizedUnsupportedConfig(s.cfg.Fallback.Unsupported)
+	return errPacket(cfg.Code, cfg.SQLState, cfg.Message+": "+sqlText)
+}
+
+func suggestedRule(sqlText string, unsupported UnsupportedConfig) string {
+	unsupported = normalizedUnsupportedConfig(unsupported)
 	quoted := strconv.Quote(sqlText)
 	return "Suggested rule:\n" +
 		"  - name: generated unsupported query\n" +
@@ -761,9 +767,25 @@ func suggestedRule(sqlText string) string {
 		"      sql: " + quoted + "\n" +
 		"    response:\n" +
 		"      type: error\n" +
-		"      code: 1105\n" +
-		"      sql_state: HY000\n" +
-		"      message: \"Unsupported query\""
+		fmt.Sprintf("      code: %d\n", unsupported.Code) +
+		"      sql_state: " + strconv.Quote(fixedSQLState(unsupported.SQLState)) + "\n" +
+		"      message: " + strconv.Quote(unsupported.Message)
+}
+
+func normalizedUnsupportedConfig(cfg UnsupportedConfig) UnsupportedConfig {
+	if cfg.Type == "" {
+		cfg.Type = "error"
+	}
+	if cfg.Code == 0 {
+		cfg.Code = mysqlErrUnknown
+	}
+	if cfg.SQLState == "" {
+		cfg.SQLState = "HY000"
+	}
+	if cfg.Message == "" {
+		cfg.Message = "Unsupported query"
+	}
+	return cfg
 }
 
 func uint64NonNegative(n int64) uint64 {

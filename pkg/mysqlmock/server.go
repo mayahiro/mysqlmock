@@ -383,7 +383,7 @@ func joinQuoted(cols []string) string {
 func (s *Server) recordUnsupported(sqlText string) {
 	u := UnsupportedQuery{
 		SQL:        sqlText,
-		Suggestion: suggestedRule(sqlText),
+		Suggestion: suggestedRule(sqlText, s.cfg.Fallback.Unsupported),
 	}
 	s.mu.Lock()
 	s.unsupported = append(s.unsupported, u)

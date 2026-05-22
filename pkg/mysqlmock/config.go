@@ -10,13 +10,14 @@ import (
 
 // Config describes a mysqlmock server instance.
 type Config struct {
-	Version int                         `yaml:"version"`
-	Server  ServerConfig                `yaml:"server"`
-	Backend DatabaseConfig              `yaml:"database"`
-	Schema  []string                    `yaml:"schema"`
-	Seed    map[string][]map[string]any `yaml:"seed"`
-	Compat  CompatConfig                `yaml:"compat"`
-	Rules   []RuleConfig                `yaml:"rules"`
+	Version  int                         `yaml:"version"`
+	Server   ServerConfig                `yaml:"server"`
+	Backend  DatabaseConfig              `yaml:"database"`
+	Schema   []string                    `yaml:"schema"`
+	Seed     map[string][]map[string]any `yaml:"seed"`
+	Compat   CompatConfig                `yaml:"compat"`
+	Rules    []RuleConfig                `yaml:"rules"`
+	Fallback FallbackConfig              `yaml:"fallback"`
 }
 
 // ServerConfig contains listener and MySQL compatibility settings.
@@ -43,6 +44,20 @@ type DatabaseConfig struct {
 // CompatConfig contains built-in MySQL compatibility values.
 type CompatConfig struct {
 	Variables map[string]string `yaml:"variables"`
+}
+
+// FallbackConfig controls behavior after rules and built-in compatibility handlers.
+type FallbackConfig struct {
+	Type        string            `yaml:"type"`
+	Unsupported UnsupportedConfig `yaml:"unsupported"`
+}
+
+// UnsupportedConfig controls errors returned for unsupported SQL.
+type UnsupportedConfig struct {
+	Type     string `yaml:"type"`
+	Code     uint16 `yaml:"code"`
+	SQLState string `yaml:"sql_state"`
+	Message  string `yaml:"message"`
 }
 
 // RuleConfig overrides matching SQL before built-in compatibility handlers or SQLite fallback.
@@ -114,6 +129,15 @@ func DefaultConfig() Config {
 				"version_comment":          "mysqlmock",
 			},
 		},
+		Fallback: FallbackConfig{
+			Type: "sqlite",
+			Unsupported: UnsupportedConfig{
+				Type:     "error",
+				Code:     mysqlErrUnknown,
+				SQLState: "HY000",
+				Message:  "Unsupported query",
+			},
+		},
 	}
 }
 
@@ -160,6 +184,21 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Backend.Mode == "" {
 		c.Backend.Mode = def.Backend.Mode
+	}
+	if c.Fallback.Type == "" {
+		c.Fallback.Type = def.Fallback.Type
+	}
+	if c.Fallback.Unsupported.Type == "" {
+		c.Fallback.Unsupported.Type = def.Fallback.Unsupported.Type
+	}
+	if c.Fallback.Unsupported.Code == 0 {
+		c.Fallback.Unsupported.Code = def.Fallback.Unsupported.Code
+	}
+	if c.Fallback.Unsupported.SQLState == "" {
+		c.Fallback.Unsupported.SQLState = def.Fallback.Unsupported.SQLState
+	}
+	if c.Fallback.Unsupported.Message == "" {
+		c.Fallback.Unsupported.Message = def.Fallback.Unsupported.Message
 	}
 	if c.Seed == nil {
 		c.Seed = map[string][]map[string]any{}
@@ -210,6 +249,27 @@ func (c Config) Validate() error {
 		}
 	default:
 		return fmt.Errorf("unsupported database mode: %s", c.Backend.Mode)
+	}
+	fallbackType := c.Fallback.Type
+	if fallbackType == "" {
+		fallbackType = "sqlite"
+	}
+	if fallbackType != "sqlite" {
+		return fmt.Errorf("unsupported fallback type: %s", c.Fallback.Type)
+	}
+	unsupportedType := c.Fallback.Unsupported.Type
+	if unsupportedType == "" {
+		unsupportedType = "error"
+	}
+	if unsupportedType != "error" {
+		return fmt.Errorf("unsupported fallback.unsupported.type: %s", c.Fallback.Unsupported.Type)
+	}
+	unsupportedSQLState := c.Fallback.Unsupported.SQLState
+	if unsupportedSQLState == "" {
+		unsupportedSQLState = "HY000"
+	}
+	if unsupportedSQLState != fixedSQLState(unsupportedSQLState) {
+		return fmt.Errorf("fallback.unsupported.sql_state must be 5 characters: %s", c.Fallback.Unsupported.SQLState)
 	}
 	for i, rule := range c.Rules {
 		if err := validateRuleConfig(rule); err != nil {
