@@ -40,6 +40,39 @@ func TestServerWithGoSQLDriverMySQL(t *testing.T) {
 		t.Fatalf("unexpected version: %s", version)
 	}
 
+	if _, err := db.ExecContext(ctx, "SET NAMES latin1 COLLATE latin1_swedish_ci"); err != nil {
+		t.Fatalf("set names: %v", err)
+	}
+	for query, want := range map[string]string{
+		"SELECT @@character_set_client":     "latin1",
+		"SELECT @@character_set_connection": "latin1",
+		"SELECT @@character_set_results":    "latin1",
+		"SELECT @@collation_connection":     "latin1_swedish_ci",
+	} {
+		var got string
+		if err := db.QueryRowContext(ctx, query).Scan(&got); err != nil {
+			t.Fatalf("%s: %v", query, err)
+		}
+		if got != want {
+			t.Fatalf("%s returned %q, want %q", query, got, want)
+		}
+	}
+	assertShowVariable(t, ctx, db, "character_set_results", "latin1")
+
+	if _, err := db.ExecContext(ctx, "SET autocommit = 0"); err != nil {
+		t.Fatalf("set autocommit off: %v", err)
+	}
+	var autocommit string
+	if err := db.QueryRowContext(ctx, "SELECT @@autocommit").Scan(&autocommit); err != nil {
+		t.Fatalf("select autocommit: %v", err)
+	}
+	if autocommit != "0" {
+		t.Fatalf("unexpected autocommit: %s", autocommit)
+	}
+	if _, err := db.ExecContext(ctx, "SET autocommit = 1"); err != nil {
+		t.Fatalf("set autocommit on: %v", err)
+	}
+
 	var name string
 	if err := db.QueryRowContext(ctx, "SELECT name FROM users WHERE id = ?", 1).Scan(&name); err != nil {
 		t.Fatalf("select seed row: %v", err)
@@ -365,6 +398,35 @@ func TestFallbackUnsupportedValidation(t *testing.T) {
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected invalid fallback.unsupported.sql_state error")
 	}
+}
+
+func assertShowVariable(t *testing.T, ctx context.Context, db *sql.DB, name, want string) {
+	t.Helper()
+
+	rows, err := db.QueryContext(ctx, "SHOW VARIABLES")
+	if err != nil {
+		t.Fatalf("show variables: %v", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var gotName string
+		var gotValue string
+		if err := rows.Scan(&gotName, &gotValue); err != nil {
+			t.Fatalf("scan show variables: %v", err)
+		}
+		if gotName != name {
+			continue
+		}
+		if gotValue != want {
+			t.Fatalf("SHOW VARIABLES %s = %q, want %q", name, gotValue, want)
+		}
+		return
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("show variables rows: %v", err)
+	}
+	t.Fatalf("SHOW VARIABLES did not include %s", name)
 }
 
 func testConfig() mysqlmock.Config {

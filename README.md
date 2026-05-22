@@ -129,6 +129,8 @@ make build
 
 - Prepared statement support does not aim to cover every MySQL binary protocol
   type yet.
+- `SET NAMES` records connection character set variables but does not transcode
+  query or result data.
 - No TLS, compression, `multiStatements=true`, or `LOAD DATA LOCAL INFILE`.
 - MySQL-specific SQL compatibility is intentionally small and will be expanded
   from real unsupported-query reports.

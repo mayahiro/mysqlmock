@@ -78,6 +78,11 @@ type mysqlConn struct {
 	statusFlags  uint16
 	currentDB    string
 
+	characterSetClient     string
+	characterSetConnection string
+	characterSetResults    string
+	collationConnection    string
+
 	nextStatementID uint32
 	statements      map[uint32]*preparedStatement
 }
@@ -297,7 +302,7 @@ func (c *mysqlConn) executeQuery(ctx context.Context, sqlText string, args ...an
 
 	switch {
 	case strings.HasPrefix(upper, "SET NAMES "):
-		return okResult{}, nil
+		return c.setNames(normalized), nil
 	case strings.HasPrefix(upper, "SET AUTOCOMMIT"):
 		return c.setAutocommit(upper), nil
 	case upper == "SELECT VERSION()" || upper == "SELECT VERSION":
@@ -346,6 +351,37 @@ func (c *mysqlConn) setAutocommit(upper string) okResult {
 	return okResult{}
 }
 
+func (c *mysqlConn) setNames(normalizedSQL string) okResult {
+	fields := strings.Fields(normalizedSQL)
+	if len(fields) < 3 {
+		return okResult{}
+	}
+
+	charset := unquoteSQLWord(fields[2])
+	if strings.EqualFold(charset, "DEFAULT") {
+		c.resetCharacterSetState()
+		return okResult{}
+	}
+
+	c.characterSetClient = charset
+	c.characterSetConnection = charset
+	c.characterSetResults = charset
+	for i := 3; i+1 < len(fields); i++ {
+		if strings.EqualFold(fields[i], "COLLATE") {
+			c.collationConnection = unquoteSQLWord(fields[i+1])
+			break
+		}
+	}
+	return okResult{}
+}
+
+func (c *mysqlConn) resetCharacterSetState() {
+	c.characterSetClient = c.server.cfg.Compat.Variables["character_set_client"]
+	c.characterSetConnection = c.server.cfg.Compat.Variables["character_set_connection"]
+	c.characterSetResults = c.server.cfg.Compat.Variables["character_set_results"]
+	c.collationConnection = c.server.cfg.Compat.Variables["collation_connection"]
+}
+
 func (c *mysqlConn) selectVariable(sqlText, normalizedSQL string) (resultSet, error) {
 	expr := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(normalizedSQL), "SELECT"))
 	expr = strings.TrimSuffix(expr, ";")
@@ -355,7 +391,7 @@ func (c *mysqlConn) selectVariable(sqlText, normalizedSQL string) (resultSet, er
 	name = strings.TrimPrefix(name, "session.")
 	name = strings.TrimPrefix(name, "global.")
 
-	value, ok := c.server.cfg.Compat.Variables[name]
+	value, ok := c.compatVariable(name)
 	if !ok {
 		c.recordUnsupported(sqlText, normalizedSQL, "compat")
 		return resultSet{}, c.server.unsupportedError(normalizedSQL)
@@ -367,15 +403,16 @@ func (c *mysqlConn) selectVariable(sqlText, normalizedSQL string) (resultSet, er
 }
 
 func (c *mysqlConn) showVariables() resultSet {
-	keys := make([]string, 0, len(c.server.cfg.Compat.Variables))
-	for k := range c.server.cfg.Compat.Variables {
+	variables := c.compatVariables()
+	keys := make([]string, 0, len(variables))
+	for k := range variables {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 
 	rows := make([][]any, 0, len(keys))
 	for _, k := range keys {
-		rows = append(rows, []any{k, c.server.cfg.Compat.Variables[k]})
+		rows = append(rows, []any{k, variables[k]})
 	}
 	return resultSet{
 		Columns: []resultColumn{
@@ -384,6 +421,45 @@ func (c *mysqlConn) showVariables() resultSet {
 		},
 		Rows: rows,
 	}
+}
+
+func (c *mysqlConn) compatVariable(name string) (string, bool) {
+	switch name {
+	case "autocommit":
+		if c.statusFlags&serverStatusAutocommit != 0 {
+			return "1", true
+		}
+		return "0", true
+	case "character_set_client":
+		return c.characterSetClient, true
+	case "character_set_connection":
+		return c.characterSetConnection, true
+	case "character_set_results":
+		return c.characterSetResults, true
+	case "collation_connection":
+		return c.collationConnection, true
+	default:
+		value, ok := c.server.cfg.Compat.Variables[name]
+		return value, ok
+	}
+}
+
+func (c *mysqlConn) compatVariables() map[string]string {
+	variables := make(map[string]string, len(c.server.cfg.Compat.Variables))
+	for k, v := range c.server.cfg.Compat.Variables {
+		variables[k] = v
+	}
+	for _, name := range []string{
+		"autocommit",
+		"character_set_client",
+		"character_set_connection",
+		"character_set_results",
+		"collation_connection",
+	} {
+		value, _ := c.compatVariable(name)
+		variables[name] = value
+	}
+	return variables
 }
 
 func (c *mysqlConn) showTables(ctx context.Context) (resultSet, error) {
@@ -747,6 +823,18 @@ func normalizeSQL(sqlText string) string {
 	trimmed := strings.TrimSpace(sqlText)
 	trimmed = strings.TrimSuffix(trimmed, ";")
 	return strings.Join(strings.Fields(trimmed), " ")
+}
+
+func unquoteSQLWord(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.TrimSuffix(value, ";")
+	if len(value) >= 2 {
+		quote := value[0]
+		if (quote == '\'' || quote == '"' || quote == '`') && value[len(value)-1] == quote {
+			return value[1 : len(value)-1]
+		}
+	}
+	return value
 }
 
 func translateSQL(sqlText string) string {

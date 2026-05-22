@@ -256,14 +256,18 @@ func (s *Server) handleNetConn(conn net.Conn) {
 	defer sqliteConn.Close()
 
 	c := &mysqlConn{
-		netConn:         conn,
-		sqliteConn:      sqliteConn,
-		server:          s,
-		connectionID:    s.nextConnectionID.Add(1) - 1,
-		statusFlags:     serverStatusAutocommit,
-		currentDB:       "mysqlmock",
-		nextStatementID: 1,
-		statements:      map[uint32]*preparedStatement{},
+		netConn:                conn,
+		sqliteConn:             sqliteConn,
+		server:                 s,
+		connectionID:           s.nextConnectionID.Add(1) - 1,
+		statusFlags:            serverStatusAutocommit,
+		currentDB:              "mysqlmock",
+		characterSetClient:     s.cfg.Compat.Variables["character_set_client"],
+		characterSetConnection: s.cfg.Compat.Variables["character_set_connection"],
+		characterSetResults:    s.cfg.Compat.Variables["character_set_results"],
+		collationConnection:    s.cfg.Compat.Variables["collation_connection"],
+		nextStatementID:        1,
+		statements:             map[uint32]*preparedStatement{},
 	}
 	if err := c.serve(ctx); err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, errRuleDisconnect) {
 		s.logf("connection=%d error=%v", c.connectionID, err)
