@@ -49,7 +49,7 @@ func serve(args []string) error {
 	printDSN := fs.Bool("print-dsn", false, "print DSN after startup")
 	verbose := fs.Bool("verbose", false, "enable query logs")
 	failOnUnsupported := fs.Bool("fail-on-unsupported", false, "exit with an error if unsupported queries were observed")
-	_ = fs.String("log-format", "text", "reserved for future use")
+	logFormat := fs.String("log-format", "text", "log format: text or json")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -64,6 +64,7 @@ func serve(args []string) error {
 	if *verbose {
 		opts = append(opts, mysqlmock.LogWriter(os.Stderr))
 	}
+	opts = append(opts, mysqlmock.LogFormat(*logFormat))
 
 	server, err := mysqlmock.New(opts...)
 	if err != nil {
@@ -116,6 +117,9 @@ func unsupportedQueriesError(queries []mysqlmock.UnsupportedQuery) error {
 		}
 		if query.ConnectionID != 0 {
 			fmt.Fprintf(&b, "\nconnection_id: %d", query.ConnectionID)
+		}
+		if query.Command != "" {
+			fmt.Fprintf(&b, "\ncommand: %s", query.Command)
 		}
 		if query.CurrentDB != "" {
 			fmt.Fprintf(&b, "\ndatabase: %s", query.CurrentDB)

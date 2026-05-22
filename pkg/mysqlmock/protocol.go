@@ -261,9 +261,7 @@ func (c *mysqlConn) writeHandshake() error {
 }
 
 func (c *mysqlConn) handleQuery(ctx context.Context, sqlText string) error {
-	c.server.logf("connection=%d command=COM_QUERY sql=%q", c.connectionID, sqlText)
-
-	resp, err := c.executeQuery(ctx, sqlText)
+	resp, err := c.executeQuery(ctx, "COM_QUERY", sqlText)
 	if err != nil {
 		if errors.Is(err, errRuleDisconnect) {
 			return err
@@ -273,7 +271,7 @@ func (c *mysqlConn) handleQuery(ctx context.Context, sqlText string) error {
 			return c.writeErr(1, mysqlErr)
 		}
 		if isSQLiteSyntaxError(err) {
-			c.recordUnsupported(sqlText, normalizeSQL(sqlText), "sqlite")
+			c.recordUnsupported("COM_QUERY", sqlText, normalizeSQL(sqlText), "sqlite")
 		}
 		return c.writeErr(1, mapSQLiteError(sqlText, err))
 	}
@@ -288,7 +286,7 @@ func (c *mysqlConn) handleQuery(ctx context.Context, sqlText string) error {
 	}
 }
 
-func (c *mysqlConn) executeQuery(ctx context.Context, sqlText string, args ...any) (any, error) {
+func (c *mysqlConn) executeQuery(ctx context.Context, command, sqlText string, args ...any) (any, error) {
 	trimmed := strings.TrimSpace(sqlText)
 	if trimmed == "" {
 		return nil, errPacket(mysqlErrUnknown, "HY000", "Unsupported query: empty SQL")
@@ -297,48 +295,61 @@ func (c *mysqlConn) executeQuery(ctx context.Context, sqlText string, args ...an
 	upper := strings.ToUpper(normalized)
 
 	if resp, matched, err := c.server.executeRule(ctx, sqlText, args); matched || err != nil {
+		c.logQuery(command, "rules", sqlText, normalized)
 		return resp, err
 	}
 
 	switch {
 	case strings.HasPrefix(upper, "SET NAMES "):
+		c.logQuery(command, "compat", sqlText, normalized)
 		return c.setNames(normalized), nil
 	case strings.HasPrefix(upper, "SET AUTOCOMMIT"):
+		c.logQuery(command, "compat", sqlText, normalized)
 		return c.setAutocommit(upper), nil
 	case upper == "SELECT VERSION()" || upper == "SELECT VERSION":
+		c.logQuery(command, "compat", sqlText, normalized)
 		return oneRow("VERSION()", c.server.cfg.Server.MySQLVersion), nil
 	case upper == "SELECT @@VERSION" || upper == "SELECT @@SESSION.VERSION" || upper == "SELECT @@GLOBAL.VERSION":
+		c.logQuery(command, "compat", sqlText, normalized)
 		return oneRow("@@version", c.server.cfg.Server.MySQLVersion), nil
 	case strings.HasPrefix(upper, "SELECT @@"):
-		return c.selectVariable(sqlText, normalized)
+		return c.selectVariable(command, sqlText, normalized)
 	case upper == "SHOW VARIABLES":
+		c.logQuery(command, "compat", sqlText, normalized)
 		return c.showVariables(), nil
 	case upper == "SHOW TABLES":
+		c.logQuery(command, "compat", sqlText, normalized)
 		return c.showTables(ctx)
 	case upper == "BEGIN" || upper == "START TRANSACTION":
+		c.logQuery(command, "sqlite", sqlText, normalized)
 		return c.execSQLite(ctx, "BEGIN")
 	case upper == "COMMIT":
+		c.logQuery(command, "sqlite", sqlText, normalized)
 		resp, err := c.execSQLite(ctx, "COMMIT")
 		c.statusFlags &^= serverStatusInTrans
 		return resp, err
 	case upper == "ROLLBACK":
+		c.logQuery(command, "sqlite", sqlText, normalized)
 		resp, err := c.execSQLite(ctx, "ROLLBACK")
 		c.statusFlags &^= serverStatusInTrans
 		return resp, err
 	case strings.HasPrefix(upper, "SAVEPOINT ") ||
 		strings.HasPrefix(upper, "RELEASE SAVEPOINT ") ||
 		strings.HasPrefix(upper, "ROLLBACK TO SAVEPOINT "):
+		c.logQuery(command, "sqlite", sqlText, normalized)
 		return c.execSQLite(ctx, trimmed)
 	}
 
 	if isReadQuery(upper) {
+		c.logQuery(command, "sqlite", sqlText, normalized)
 		return c.querySQLite(ctx, translateSQL(trimmed), args...)
 	}
 	if isWriteQuery(upper) {
+		c.logQuery(command, "sqlite", sqlText, normalized)
 		return c.execSQLite(ctx, translateSQL(trimmed), args...)
 	}
 
-	c.recordUnsupported(sqlText, normalized, "unsupported")
+	c.recordUnsupported(command, sqlText, normalized, "unsupported")
 	return nil, c.server.unsupportedError(sqlText)
 }
 
@@ -382,7 +393,7 @@ func (c *mysqlConn) resetCharacterSetState() {
 	c.collationConnection = c.server.cfg.Compat.Variables["collation_connection"]
 }
 
-func (c *mysqlConn) selectVariable(sqlText, normalizedSQL string) (resultSet, error) {
+func (c *mysqlConn) selectVariable(command, sqlText, normalizedSQL string) (resultSet, error) {
 	expr := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(normalizedSQL), "SELECT"))
 	expr = strings.TrimSuffix(expr, ";")
 	name := strings.TrimSpace(expr)
@@ -393,9 +404,10 @@ func (c *mysqlConn) selectVariable(sqlText, normalizedSQL string) (resultSet, er
 
 	value, ok := c.compatVariable(name)
 	if !ok {
-		c.recordUnsupported(sqlText, normalizedSQL, "compat")
+		c.recordUnsupported(command, sqlText, normalizedSQL, "compat")
 		return resultSet{}, c.server.unsupportedError(normalizedSQL)
 	}
+	c.logQuery(command, "compat", sqlText, normalizedSQL)
 	return resultSet{
 		Columns: []resultColumn{{Name: expr, Type: fieldTypeVarString}},
 		Rows:    [][]any{{value}},
@@ -847,11 +859,24 @@ func translateSQL(sqlText string) string {
 	return replacer.Replace(sqlText)
 }
 
-func (c *mysqlConn) recordUnsupported(sqlText, normalizedSQL, routeStage string) {
+func (c *mysqlConn) logQuery(command, route, sqlText, normalizedSQL string) {
+	c.server.logQuery(queryLogEvent{
+		Event:         "query",
+		ConnectionID:  c.connectionID,
+		Command:       command,
+		Route:         route,
+		Database:      c.currentDB,
+		SQL:           sqlText,
+		NormalizedSQL: normalizedSQL,
+	})
+}
+
+func (c *mysqlConn) recordUnsupported(command, sqlText, normalizedSQL, routeStage string) {
 	c.server.recordUnsupported(UnsupportedQuery{
 		SQL:           sqlText,
 		NormalizedSQL: normalizedSQL,
 		ConnectionID:  c.connectionID,
+		Command:       command,
 		CurrentDB:     c.currentDB,
 		RouteStage:    routeStage,
 	})

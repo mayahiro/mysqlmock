@@ -108,6 +108,7 @@ rules:
 
 ```sh
 go run ./cmd/mysqlmock serve --config testdb.yaml --listen 127.0.0.1:0 --print-dsn
+go run ./cmd/mysqlmock serve --config testdb.yaml --verbose --log-format json
 go run ./cmd/mysqlmock check --config testdb.yaml
 ```
 
@@ -115,6 +116,7 @@ Use `serve --fail-on-unsupported` to exit with an error after shutdown if the
 server observed unsupported SQL. The error includes generated rule snippets that
 can be copied into the config and adjusted. Unsupported query diagnostics include
 the raw SQL, normalized SQL, connection ID, current database, and route stage.
+Use `--verbose --log-format=json` to emit route-aware query logs as JSON Lines.
 
 ## Development
 

@@ -85,7 +85,7 @@ func (c *mysqlConn) handleStmtExecute(ctx context.Context, payload []byte) error
 		return c.writeErr(1, errPacket(mysqlErrUnknown, "HY000", err.Error()))
 	}
 
-	resp, err := c.executeQuery(ctx, stmt.SQL, args...)
+	resp, err := c.executeQuery(ctx, "COM_STMT_EXECUTE", stmt.SQL, args...)
 	if err != nil {
 		if errors.Is(err, errRuleDisconnect) {
 			return err
@@ -95,7 +95,7 @@ func (c *mysqlConn) handleStmtExecute(ctx context.Context, payload []byte) error
 			return c.writeErr(1, mysqlErr)
 		}
 		if isSQLiteSyntaxError(err) {
-			c.recordUnsupported(stmt.SQL, normalizeSQL(stmt.SQL), "sqlite")
+			c.recordUnsupported("COM_STMT_EXECUTE", stmt.SQL, normalizeSQL(stmt.SQL), "sqlite")
 		}
 		return c.writeErr(1, mapSQLiteError(stmt.SQL, err))
 	}

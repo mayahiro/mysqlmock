@@ -1,8 +1,10 @@
 package mysqlmock_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -266,6 +268,94 @@ fallback:
 	}
 }
 
+func TestQueryLoggingTextRoutes(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var logs bytes.Buffer
+	server := mysqlmock.Start(t,
+		mysqlmock.WithConfig(testConfig()),
+		mysqlmock.LogWriter(&logs),
+		mysqlmock.LogFormat("text"),
+	)
+	db, err := sql.Open("mysql", server.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	var version string
+	if err := db.QueryRowContext(ctx, "SELECT VERSION()").Scan(&version); err != nil {
+		t.Fatalf("select version: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "INSERT INTO users (name, email) VALUES (?, ?)", "Logged", "logged@example.com"); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	got := logs.String()
+	for _, want := range []string{
+		`command=COM_QUERY route=compat`,
+		`sql="SELECT VERSION()"`,
+		`command=COM_QUERY route=sqlite`,
+		`INSERT INTO users`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("logs %q do not contain %q", got, want)
+		}
+	}
+}
+
+func TestQueryLoggingJSONRoutes(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var logs bytes.Buffer
+	server := mysqlmock.Start(t,
+		mysqlmock.WithConfig(testConfig()),
+		mysqlmock.LogWriter(&logs),
+		mysqlmock.LogFormat("json"),
+	)
+	db, err := sql.Open("mysql", server.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	var version string
+	if err := db.QueryRowContext(ctx, "SELECT VERSION()").Scan(&version); err != nil {
+		t.Fatalf("select version: %v", err)
+	}
+
+	found := false
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var event map[string]any
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("decode log line %q: %v", line, err)
+		}
+		if event["event"] == "query" &&
+			event["command"] == "COM_QUERY" &&
+			event["route"] == "compat" &&
+			event["database"] == "mysqlmock" &&
+			event["sql"] == "SELECT VERSION()" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("compat query log not found in %q", logs.String())
+	}
+}
+
+func TestLogFormatValidation(t *testing.T) {
+	if _, err := mysqlmock.New(mysqlmock.LogFormat("yaml")); err == nil {
+		t.Fatal("expected unsupported log format error")
+	}
+}
+
 func TestFallbackUnsupportedConfig(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -306,6 +396,9 @@ func TestFallbackUnsupportedConfig(t *testing.T) {
 	}
 	if unsupported[0].ConnectionID == 0 {
 		t.Fatal("unsupported connection id was not recorded")
+	}
+	if unsupported[0].Command != "COM_QUERY" {
+		t.Fatalf("unsupported command = %q", unsupported[0].Command)
 	}
 	if unsupported[0].CurrentDB != "mysqlmock" {
 		t.Fatalf("unsupported current DB = %q", unsupported[0].CurrentDB)

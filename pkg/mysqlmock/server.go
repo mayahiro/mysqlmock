@@ -3,6 +3,7 @@ package mysqlmock
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -25,6 +26,7 @@ type serverOptions struct {
 	config     *Config
 	listen     string
 	logWriter  io.Writer
+	logFormat  string
 }
 
 // ConfigFile loads server configuration from a YAML file.
@@ -55,6 +57,13 @@ func LogWriter(w io.Writer) Option {
 	}
 }
 
+// LogFormat configures diagnostic logging format. Supported values are text and json.
+func LogFormat(format string) Option {
+	return func(opts *serverOptions) {
+		opts.logFormat = format
+	}
+}
+
 // Server is a lightweight MySQL-protocol test server backed by SQLite.
 type Server struct {
 	cfg Config
@@ -71,6 +80,8 @@ type Server struct {
 
 	nextConnectionID atomic.Uint32
 	logWriter        io.Writer
+	logFormat        string
+	logMu            sync.Mutex
 
 	mu           sync.Mutex
 	unsupported  []UnsupportedQuery
@@ -82,9 +93,21 @@ type UnsupportedQuery struct {
 	SQL           string
 	NormalizedSQL string
 	ConnectionID  uint32
+	Command       string
 	CurrentDB     string
 	RouteStage    string
 	Suggestion    string
+}
+
+type queryLogEvent struct {
+	Event         string `json:"event"`
+	ConnectionID  uint32 `json:"connection_id"`
+	Command       string `json:"command"`
+	Route         string `json:"route"`
+	Database      string `json:"database,omitempty"`
+	SQL           string `json:"sql"`
+	NormalizedSQL string `json:"normalized_sql,omitempty"`
+	Suggestion    string `json:"suggestion,omitempty"`
 }
 
 // New creates a server. Call Start before using Addr or DSN.
@@ -117,11 +140,19 @@ func New(opts ...Option) (*Server, error) {
 	if cfg.Server.ConnectionIDStart == 0 {
 		cfg.Server.ConnectionIDStart = 1
 	}
+	logFormat := options.logFormat
+	if logFormat == "" {
+		logFormat = "text"
+	}
+	if logFormat != "text" && logFormat != "json" {
+		return nil, fmt.Errorf("unsupported log format: %s", logFormat)
+	}
 
 	s := &Server{
 		cfg:       cfg,
 		done:      make(chan struct{}),
 		logWriter: options.logWriter,
+		logFormat: logFormat,
 	}
 	s.nextConnectionID.Store(cfg.Server.ConnectionIDStart)
 	return s, nil
@@ -395,25 +426,74 @@ func (s *Server) recordUnsupported(u UnsupportedQuery) {
 	if u.RouteStage == "" {
 		u.RouteStage = "unsupported"
 	}
+	if u.Command == "" {
+		u.Command = "COM_QUERY"
+	}
 	u.Suggestion = suggestedRule(u.SQL, s.cfg.Fallback.Unsupported)
 
 	s.mu.Lock()
 	s.unsupported = append(s.unsupported, u)
 	s.mu.Unlock()
-	s.logf(
-		"connection=%d database=%q route=%s unsupported sql=%q normalized=%q\n%s",
-		u.ConnectionID,
-		u.CurrentDB,
-		u.RouteStage,
-		u.SQL,
-		u.NormalizedSQL,
-		u.Suggestion,
-	)
+	s.logQuery(queryLogEvent{
+		Event:         "query",
+		ConnectionID:  u.ConnectionID,
+		Command:       u.Command,
+		Route:         u.RouteStage,
+		Database:      u.CurrentDB,
+		SQL:           u.SQL,
+		NormalizedSQL: u.NormalizedSQL,
+		Suggestion:    u.Suggestion,
+	})
 }
 
 func (s *Server) logf(format string, args ...any) {
 	if s.logWriter == nil {
 		return
 	}
-	fmt.Fprintf(s.logWriter, format+"\n", args...)
+	message := fmt.Sprintf(format, args...)
+	s.logMu.Lock()
+	defer s.logMu.Unlock()
+
+	if s.logFormat == "json" {
+		_ = json.NewEncoder(s.logWriter).Encode(map[string]string{
+			"event":   "log",
+			"message": message,
+		})
+		return
+	}
+	fmt.Fprintln(s.logWriter, message)
+}
+
+func (s *Server) logQuery(event queryLogEvent) {
+	if s.logWriter == nil {
+		return
+	}
+	if event.Event == "" {
+		event.Event = "query"
+	}
+
+	s.logMu.Lock()
+	defer s.logMu.Unlock()
+
+	if s.logFormat == "json" {
+		_ = json.NewEncoder(s.logWriter).Encode(event)
+		return
+	}
+
+	fmt.Fprintf(
+		s.logWriter,
+		"connection=%d command=%s route=%s database=%q sql=%q",
+		event.ConnectionID,
+		event.Command,
+		event.Route,
+		event.Database,
+		event.SQL,
+	)
+	if event.NormalizedSQL != "" && event.NormalizedSQL != event.SQL {
+		fmt.Fprintf(s.logWriter, " normalized=%q", event.NormalizedSQL)
+	}
+	if event.Suggestion != "" {
+		fmt.Fprintf(s.logWriter, "\n%s", event.Suggestion)
+	}
+	fmt.Fprintln(s.logWriter)
 }

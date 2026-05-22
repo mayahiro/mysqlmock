@@ -17,6 +17,7 @@ func TestUnsupportedQueriesError(t *testing.T) {
 			SQL:           "CREATE USER unsupported_user",
 			NormalizedSQL: "CREATE USER unsupported_user",
 			ConnectionID:  7,
+			Command:       "COM_QUERY",
 			CurrentDB:     "mysqlmock",
 			RouteStage:    "unsupported",
 			Suggestion: "Suggested rule:\n" +
@@ -31,6 +32,7 @@ func TestUnsupportedQueriesError(t *testing.T) {
 		"CREATE USER unsupported_user",
 		"normalized: CREATE USER unsupported_user",
 		"connection_id: 7",
+		"command: COM_QUERY",
 		"database: mysqlmock",
 		"route_stage: unsupported",
 		"Suggested rule:",
