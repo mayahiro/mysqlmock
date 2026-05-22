@@ -87,6 +87,9 @@ func (c *mysqlConn) handleStmtExecute(ctx context.Context, payload []byte) error
 
 	resp, err := c.executeQuery(ctx, stmt.SQL, args...)
 	if err != nil {
+		if errors.Is(err, errRuleDisconnect) {
+			return err
+		}
 		var mysqlErr *mysqlError
 		if errors.As(err, &mysqlErr) {
 			return c.writeErr(1, mysqlErr)

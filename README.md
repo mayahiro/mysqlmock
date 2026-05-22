@@ -63,6 +63,39 @@ seed:
       email: "alice@example.com"
 ```
 
+## SQL Rules
+
+`rules` can override matching SQL before mysqlmock uses built-in compatibility
+handlers or the SQLite backend. Supported match modes are `exact`,
+`normalized`, `regex`, `contains`, and `any`. Supported response types are
+`ok`, `result_set`, `error`, and `disconnect`.
+
+```yaml
+rules:
+  - name: force duplicate email
+    request:
+      match: contains
+      sql: "INSERT INTO users"
+    response:
+      type: error
+      code: 1062
+      sql_state: "23000"
+      message: "Duplicate entry for key 'users.email'"
+      once: true
+
+  - name: fixed version
+    request:
+      match: exact
+      sql: "SELECT VERSION()"
+    response:
+      type: result_set
+      columns:
+        - name: "VERSION()"
+          type: VARCHAR
+      rows:
+        - ["8.0.36-mock"]
+```
+
 ## CLI
 
 ```sh

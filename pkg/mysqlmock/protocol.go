@@ -95,6 +95,7 @@ type resultSet struct {
 type okResult struct {
 	AffectedRows uint64
 	LastInsertID uint64
+	Warnings     uint16
 }
 
 type mysqlError struct {
@@ -259,6 +260,9 @@ func (c *mysqlConn) handleQuery(ctx context.Context, sqlText string) error {
 
 	resp, err := c.executeQuery(ctx, sqlText)
 	if err != nil {
+		if errors.Is(err, errRuleDisconnect) {
+			return err
+		}
 		var mysqlErr *mysqlError
 		if errors.As(err, &mysqlErr) {
 			return c.writeErr(1, mysqlErr)
@@ -283,6 +287,10 @@ func (c *mysqlConn) executeQuery(ctx context.Context, sqlText string, args ...an
 	}
 	normalized := normalizeSQL(trimmed)
 	upper := strings.ToUpper(normalized)
+
+	if resp, matched, err := c.server.executeRule(ctx, sqlText, args); matched || err != nil {
+		return resp, err
+	}
 
 	switch {
 	case strings.HasPrefix(upper, "SET NAMES "):
@@ -504,7 +512,7 @@ func (c *mysqlConn) writeOK(seq byte, ok okResult) error {
 	payload = appendLenEncInt(payload, ok.AffectedRows)
 	payload = appendLenEncInt(payload, ok.LastInsertID)
 	payload = appendUint16(payload, c.statusFlags)
-	payload = appendUint16(payload, 0)
+	payload = appendUint16(payload, ok.Warnings)
 	return c.writePacket(seq, payload)
 }
 

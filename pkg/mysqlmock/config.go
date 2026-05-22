@@ -16,6 +16,7 @@ type Config struct {
 	Schema  []string                    `yaml:"schema"`
 	Seed    map[string][]map[string]any `yaml:"seed"`
 	Compat  CompatConfig                `yaml:"compat"`
+	Rules   []RuleConfig                `yaml:"rules"`
 }
 
 // ServerConfig contains listener and MySQL compatibility settings.
@@ -42,6 +43,43 @@ type DatabaseConfig struct {
 // CompatConfig contains built-in MySQL compatibility values.
 type CompatConfig struct {
 	Variables map[string]string `yaml:"variables"`
+}
+
+// RuleConfig overrides matching SQL before built-in compatibility handlers or SQLite fallback.
+type RuleConfig struct {
+	Name     string             `yaml:"name"`
+	Request  RuleRequestConfig  `yaml:"request"`
+	Response RuleResponseConfig `yaml:"response"`
+}
+
+// RuleRequestConfig describes how an incoming SQL statement is matched.
+type RuleRequestConfig struct {
+	Match  string `yaml:"match"`
+	SQL    string `yaml:"sql"`
+	Params []any  `yaml:"params"`
+}
+
+// RuleResponseConfig describes the response returned by a matching rule.
+type RuleResponseConfig struct {
+	Type         string             `yaml:"type"`
+	Columns      []RuleColumnConfig `yaml:"columns"`
+	RowFormat    string             `yaml:"row_format"`
+	Rows         []any              `yaml:"rows"`
+	AffectedRows uint64             `yaml:"affected_rows"`
+	LastInsertID uint64             `yaml:"last_insert_id"`
+	Warnings     uint16             `yaml:"warnings"`
+	Code         uint16             `yaml:"code"`
+	SQLState     string             `yaml:"sql_state"`
+	Message      string             `yaml:"message"`
+	DelayMS      int                `yaml:"delay_ms"`
+	AfterMS      int                `yaml:"after_ms"`
+	Once         bool               `yaml:"once"`
+}
+
+// RuleColumnConfig describes one result-set column returned by a rule.
+type RuleColumnConfig struct {
+	Name string `yaml:"name"`
+	Type string `yaml:"type"`
 }
 
 // DefaultConfig returns a minimal in-memory mysqlmock configuration.
@@ -135,6 +173,22 @@ func (c *Config) applyDefaults() {
 		}
 	}
 	c.Compat.Variables["version"] = c.Server.MySQLVersion
+	for i := range c.Rules {
+		if c.Rules[i].Request.Match == "" {
+			c.Rules[i].Request.Match = "exact"
+		}
+		if c.Rules[i].Response.Type == "error" {
+			if c.Rules[i].Response.Code == 0 {
+				c.Rules[i].Response.Code = mysqlErrUnknown
+			}
+			if c.Rules[i].Response.SQLState == "" {
+				c.Rules[i].Response.SQLState = "HY000"
+			}
+			if c.Rules[i].Response.Message == "" {
+				c.Rules[i].Response.Message = "Unsupported query"
+			}
+		}
+	}
 }
 
 // Validate checks config values that affect public behavior.
@@ -156,6 +210,11 @@ func (c Config) Validate() error {
 		}
 	default:
 		return fmt.Errorf("unsupported database mode: %s", c.Backend.Mode)
+	}
+	for i, rule := range c.Rules {
+		if err := validateRuleConfig(rule); err != nil {
+			return fmt.Errorf("rules[%d]: %w", i, err)
+		}
 	}
 	return nil
 }

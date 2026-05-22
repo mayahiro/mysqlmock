@@ -72,8 +72,9 @@ type Server struct {
 	nextConnectionID atomic.Uint32
 	logWriter        io.Writer
 
-	mu          sync.Mutex
-	unsupported []UnsupportedQuery
+	mu           sync.Mutex
+	unsupported  []UnsupportedQuery
+	ruleOnceUsed map[int]bool
 }
 
 // UnsupportedQuery records a query that mysqlmock could not execute.
@@ -260,7 +261,7 @@ func (s *Server) handleNetConn(conn net.Conn) {
 		nextStatementID: 1,
 		statements:      map[uint32]*preparedStatement{},
 	}
-	if err := c.serve(ctx); err != nil && !errors.Is(err, io.EOF) {
+	if err := c.serve(ctx); err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, errRuleDisconnect) {
 		s.logf("connection=%d error=%v", c.connectionID, err)
 	}
 }
