@@ -11,11 +11,12 @@ The current implementation targets:
 - Go `database/sql`
 - `github.com/go-sql-driver/mysql`
 - `PingContext`
-- `QueryContext` and `ExecContext` with `interpolateParams=true`
+- `QueryContext` and `ExecContext`
+- `PrepareContext` and prepared statement execution
 - `BeginTx`, `Commit`, and `Rollback`
 
-Prepared statements are intentionally not supported yet. Use a DSN with
-`interpolateParams=true` for MVP-0:
+Prepared statements are supported for the common scalar parameter types used by
+Go repository tests. `interpolateParams=true` is optional:
 
 ```text
 user:password@tcp(127.0.0.1:<port>)/mysqlmock?interpolateParams=true&charset=utf8mb4&parseTime=true
@@ -80,7 +81,8 @@ make build
 
 ## Known Limitations
 
-- No `COM_STMT_*` prepared statement support yet.
+- Prepared statement support does not aim to cover every MySQL binary protocol
+  type yet.
 - No TLS, compression, `multiStatements=true`, or `LOAD DATA LOCAL INFILE`.
 - MySQL-specific SQL compatibility is intentionally small and will be expanded
   from real unsupported-query reports.

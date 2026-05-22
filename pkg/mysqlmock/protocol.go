@@ -28,30 +28,45 @@ const (
 	serverStatusInTrans    uint16 = 0x0001
 	serverStatusAutocommit uint16 = 0x0002
 
-	commandQuit        byte = 0x01
-	commandInitDB      byte = 0x02
-	commandQuery       byte = 0x03
-	commandPing        byte = 0x0e
-	commandStmtPrepare byte = 0x16
-	commandStmtExecute byte = 0x17
-	commandStmtClose   byte = 0x19
-	commandStmtReset   byte = 0x1a
-	commandResetConn   byte = 0x1f
+	commandQuit         byte = 0x01
+	commandInitDB       byte = 0x02
+	commandQuery        byte = 0x03
+	commandPing         byte = 0x0e
+	commandStmtPrepare  byte = 0x16
+	commandStmtExecute  byte = 0x17
+	commandStmtSendLong byte = 0x18
+	commandStmtClose    byte = 0x19
+	commandStmtReset    byte = 0x1a
+	commandResetConn    byte = 0x1f
 
 	fieldTypeDecimal   byte = 0x00
+	fieldTypeTiny      byte = 0x01
+	fieldTypeShort     byte = 0x02
+	fieldTypeLong      byte = 0x03
+	fieldTypeFloat     byte = 0x04
 	fieldTypeDouble    byte = 0x05
+	fieldTypeNull      byte = 0x06
+	fieldTypeTimestamp byte = 0x07
 	fieldTypeLongLong  byte = 0x08
+	fieldTypeInt24     byte = 0x09
+	fieldTypeDate      byte = 0x0a
+	fieldTypeTime      byte = 0x0b
 	fieldTypeDateTime  byte = 0x0c
+	fieldTypeYear      byte = 0x0d
+	fieldTypeVarChar   byte = 0x0f
+	fieldTypeBit       byte = 0x10
+	fieldTypeJSON      byte = 0xf5
+	fieldTypeNewDec    byte = 0xf6
 	fieldTypeVarString byte = 0xfd
+	fieldTypeString    byte = 0xfe
 	fieldTypeBlob      byte = 0xfc
 
-	mysqlErrUnknown       uint16 = 1105
-	mysqlErrNoSuchTable   uint16 = 1146
-	mysqlErrDupEntry      uint16 = 1062
-	mysqlErrBadNull       uint16 = 1048
-	mysqlErrNoReferenced  uint16 = 1452
-	mysqlErrCheck         uint16 = 3819
-	mysqlErrUnsupportedPS uint16 = 1295
+	mysqlErrUnknown      uint16 = 1105
+	mysqlErrNoSuchTable  uint16 = 1146
+	mysqlErrDupEntry     uint16 = 1062
+	mysqlErrBadNull      uint16 = 1048
+	mysqlErrNoReferenced uint16 = 1452
+	mysqlErrCheck        uint16 = 3819
 )
 
 type mysqlConn struct {
@@ -62,6 +77,9 @@ type mysqlConn struct {
 	clientCaps   uint32
 	statusFlags  uint16
 	currentDB    string
+
+	nextStatementID uint32
+	statements      map[uint32]*preparedStatement
 }
 
 type resultColumn struct {
@@ -130,12 +148,22 @@ func (c *mysqlConn) serve(ctx context.Context) error {
 			if err := c.handleQuery(ctx, string(payload[1:])); err != nil {
 				return err
 			}
-		case commandStmtPrepare, commandStmtExecute, commandStmtClose, commandStmtReset:
-			if payload[0] == commandStmtClose {
-				continue
+		case commandStmtPrepare:
+			if err := c.handleStmtPrepare(string(payload[1:])); err != nil {
+				return err
 			}
-			err := errPacket(mysqlErrUnsupportedPS, "HY000", "Prepared statements are not supported by mysqlmock MVP-0. Use interpolateParams=true or avoid db.Prepare.")
-			if err := c.writeErr(1, err); err != nil {
+		case commandStmtExecute:
+			if err := c.handleStmtExecute(ctx, payload[1:]); err != nil {
+				return err
+			}
+		case commandStmtSendLong:
+			if err := c.handleStmtSendLongData(payload[1:]); err != nil {
+				return err
+			}
+		case commandStmtClose:
+			c.handleStmtClose(payload[1:])
+		case commandStmtReset:
+			if err := c.handleStmtReset(payload[1:]); err != nil {
 				return err
 			}
 		default:
@@ -248,7 +276,7 @@ func (c *mysqlConn) handleQuery(ctx context.Context, sqlText string) error {
 	}
 }
 
-func (c *mysqlConn) executeQuery(ctx context.Context, sqlText string) (any, error) {
+func (c *mysqlConn) executeQuery(ctx context.Context, sqlText string, args ...any) (any, error) {
 	trimmed := strings.TrimSpace(sqlText)
 	if trimmed == "" {
 		return nil, errPacket(mysqlErrUnknown, "HY000", "Unsupported query: empty SQL")
@@ -288,10 +316,10 @@ func (c *mysqlConn) executeQuery(ctx context.Context, sqlText string) (any, erro
 	}
 
 	if isReadQuery(upper) {
-		return c.querySQLite(ctx, translateSQL(trimmed))
+		return c.querySQLite(ctx, translateSQL(trimmed), args...)
 	}
 	if isWriteQuery(upper) {
-		return c.execSQLite(ctx, translateSQL(trimmed))
+		return c.execSQLite(ctx, translateSQL(trimmed), args...)
 	}
 
 	c.server.recordUnsupported(sqlText)
@@ -358,11 +386,11 @@ func (c *mysqlConn) showTables(ctx context.Context) (resultSet, error) {
 	return rs, nil
 }
 
-func (c *mysqlConn) execSQLite(ctx context.Context, query string) (okResult, error) {
+func (c *mysqlConn) execSQLite(ctx context.Context, query string, args ...any) (okResult, error) {
 	if strings.EqualFold(strings.TrimSpace(query), "BEGIN") {
 		c.statusFlags |= serverStatusInTrans
 	}
-	res, err := c.sqliteConn.ExecContext(ctx, query)
+	res, err := c.sqliteConn.ExecContext(ctx, query, args...)
 	if err != nil {
 		return okResult{}, err
 	}
@@ -371,8 +399,8 @@ func (c *mysqlConn) execSQLite(ctx context.Context, query string) (okResult, err
 	return okResult{AffectedRows: uint64NonNegative(affected), LastInsertID: uint64NonNegative(lastID)}, nil
 }
 
-func (c *mysqlConn) querySQLite(ctx context.Context, query string) (resultSet, error) {
-	rows, err := c.sqliteConn.QueryContext(ctx, query)
+func (c *mysqlConn) querySQLite(ctx context.Context, query string, args ...any) (resultSet, error) {
+	rows, err := c.sqliteConn.QueryContext(ctx, query, args...)
 	if err != nil {
 		return resultSet{}, err
 	}
@@ -431,6 +459,39 @@ func (c *mysqlConn) writeResultSet(seq byte, rs resultSet) error {
 	seq++
 	for _, row := range rs.Rows {
 		if err := c.writePacket(seq, textRow(row)); err != nil {
+			return err
+		}
+		seq++
+	}
+	return c.writeEOF(seq)
+}
+
+func (c *mysqlConn) writeBinaryResultSet(seq byte, rs resultSet) error {
+	rows := make([][]byte, len(rs.Rows))
+	for i, row := range rs.Rows {
+		payload, err := binaryRow(rs.Columns, row)
+		if err != nil {
+			return err
+		}
+		rows[i] = payload
+	}
+
+	if err := c.writePacket(seq, appendLenEncInt(nil, uint64(len(rs.Columns)))); err != nil {
+		return err
+	}
+	seq++
+	for _, col := range rs.Columns {
+		if err := c.writePacket(seq, columnDefinition(c.currentDB, col)); err != nil {
+			return err
+		}
+		seq++
+	}
+	if err := c.writeEOF(seq); err != nil {
+		return err
+	}
+	seq++
+	for _, payload := range rows {
+		if err := c.writePacket(seq, payload); err != nil {
 			return err
 		}
 		seq++

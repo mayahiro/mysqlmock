@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -14,7 +15,7 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 )
 
-func TestServerWithGoSQLDriverMySQLMVP0(t *testing.T) {
+func TestServerWithGoSQLDriverMySQL(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -116,10 +117,79 @@ func TestServerWithGoSQLDriverMySQLMVP0(t *testing.T) {
 		t.Fatalf("unexpected duplicate error: %v", err)
 	}
 
-	if _, err := db.PrepareContext(ctx, "SELECT name FROM users WHERE id = ?"); err == nil {
-		t.Fatal("expected prepared statement to be unsupported")
-	} else if !strings.Contains(err.Error(), "Prepared statements are not supported") {
-		t.Fatalf("unexpected prepare error: %v", err)
+	stmt, err := db.PrepareContext(ctx, "SELECT name FROM users WHERE id = ?")
+	if err != nil {
+		t.Fatalf("prepare select: %v", err)
+	}
+	defer stmt.Close()
+	if err := stmt.QueryRowContext(ctx, 2).Scan(&name); err != nil {
+		t.Fatalf("prepared select: %v", err)
+	}
+	if name != "Bob" {
+		t.Fatalf("unexpected prepared select name: %s", name)
+	}
+
+	insertStmt, err := db.PrepareContext(ctx, "INSERT INTO users (name, email) VALUES (?, ?)")
+	if err != nil {
+		t.Fatalf("prepare insert: %v", err)
+	}
+	defer insertStmt.Close()
+	preparedInsert, err := insertStmt.ExecContext(ctx, "Prepared", "prepared@example.com")
+	if err != nil {
+		t.Fatalf("prepared insert: %v", err)
+	}
+	preparedInsertID, err := preparedInsert.LastInsertId()
+	if err != nil {
+		t.Fatalf("prepared last insert id: %v", err)
+	}
+	if preparedInsertID == 0 {
+		t.Fatal("expected prepared insert id")
+	}
+}
+
+func TestServerWithGoSQLDriverMySQLPreparedDirectQuery(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	server := mysqlmock.Start(t, mysqlmock.WithConfig(testConfig()))
+
+	dsn := fmt.Sprintf("user:password@tcp(%s)/mysqlmock?charset=utf8mb4&parseTime=true", server.Addr())
+	db, err := sql.Open("mysql", dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	var name string
+	if err := db.QueryRowContext(ctx, "SELECT name FROM users WHERE id = ?", 1).Scan(&name); err != nil {
+		t.Fatalf("prepared direct query select: %v", err)
+	}
+	if name != "Alice" {
+		t.Fatalf("unexpected prepared direct query name: %s", name)
+	}
+
+	result, err := db.ExecContext(ctx, "UPDATE users SET name = ? WHERE id = ?", "Alicia", 1)
+	if err != nil {
+		t.Fatalf("prepared direct query update: %v", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		t.Fatalf("prepared direct query rows affected: %v", err)
+	}
+	if affected != 1 {
+		t.Fatalf("unexpected prepared direct query rows affected: %d", affected)
+	}
+
+	var gotInt int64
+	var gotText string
+	var gotBytes []byte
+	var gotNull sql.NullString
+	if err := db.QueryRowContext(ctx, "SELECT ?, ?, ?, ?", int64(42), "hello", []byte("bytes"), nil).Scan(&gotInt, &gotText, &gotBytes, &gotNull); err != nil {
+		t.Fatalf("prepared direct query scalar round trip: %v", err)
+	}
+	if gotInt != 42 || gotText != "hello" || string(gotBytes) != "bytes" || gotNull.Valid {
+		t.Fatalf("unexpected scalar round trip: int=%d text=%q bytes=%q null=%v", gotInt, gotText, gotBytes, gotNull.Valid)
 	}
 }
 

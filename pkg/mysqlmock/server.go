@@ -251,12 +251,14 @@ func (s *Server) handleNetConn(conn net.Conn) {
 	defer sqliteConn.Close()
 
 	c := &mysqlConn{
-		netConn:      conn,
-		sqliteConn:   sqliteConn,
-		server:       s,
-		connectionID: s.nextConnectionID.Add(1) - 1,
-		statusFlags:  serverStatusAutocommit,
-		currentDB:    "mysqlmock",
+		netConn:         conn,
+		sqliteConn:      sqliteConn,
+		server:          s,
+		connectionID:    s.nextConnectionID.Add(1) - 1,
+		statusFlags:     serverStatusAutocommit,
+		currentDB:       "mysqlmock",
+		nextStatementID: 1,
+		statements:      map[uint32]*preparedStatement{},
 	}
 	if err := c.serve(ctx); err != nil && !errors.Is(err, io.EOF) {
 		s.logf("connection=%d error=%v", c.connectionID, err)
