@@ -267,6 +267,9 @@ func (c *mysqlConn) handleQuery(ctx context.Context, sqlText string) error {
 		if errors.As(err, &mysqlErr) {
 			return c.writeErr(1, mysqlErr)
 		}
+		if isSQLiteSyntaxError(err) {
+			c.recordUnsupported(sqlText, normalizeSQL(sqlText), "sqlite")
+		}
 		return c.writeErr(1, mapSQLiteError(sqlText, err))
 	}
 
@@ -302,7 +305,7 @@ func (c *mysqlConn) executeQuery(ctx context.Context, sqlText string, args ...an
 	case upper == "SELECT @@VERSION" || upper == "SELECT @@SESSION.VERSION" || upper == "SELECT @@GLOBAL.VERSION":
 		return oneRow("@@version", c.server.cfg.Server.MySQLVersion), nil
 	case strings.HasPrefix(upper, "SELECT @@"):
-		return c.selectVariable(normalized)
+		return c.selectVariable(sqlText, normalized)
 	case upper == "SHOW VARIABLES":
 		return c.showVariables(), nil
 	case upper == "SHOW TABLES":
@@ -330,7 +333,7 @@ func (c *mysqlConn) executeQuery(ctx context.Context, sqlText string, args ...an
 		return c.execSQLite(ctx, translateSQL(trimmed), args...)
 	}
 
-	c.server.recordUnsupported(sqlText)
+	c.recordUnsupported(sqlText, normalized, "unsupported")
 	return nil, c.server.unsupportedError(sqlText)
 }
 
@@ -343,8 +346,8 @@ func (c *mysqlConn) setAutocommit(upper string) okResult {
 	return okResult{}
 }
 
-func (c *mysqlConn) selectVariable(sqlText string) (resultSet, error) {
-	expr := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(sqlText), "SELECT"))
+func (c *mysqlConn) selectVariable(sqlText, normalizedSQL string) (resultSet, error) {
+	expr := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(normalizedSQL), "SELECT"))
 	expr = strings.TrimSuffix(expr, ";")
 	name := strings.TrimSpace(expr)
 	name = strings.TrimPrefix(name, "@@")
@@ -354,8 +357,8 @@ func (c *mysqlConn) selectVariable(sqlText string) (resultSet, error) {
 
 	value, ok := c.server.cfg.Compat.Variables[name]
 	if !ok {
-		c.server.recordUnsupported(sqlText)
-		return resultSet{}, c.server.unsupportedError(sqlText)
+		c.recordUnsupported(sqlText, normalizedSQL, "compat")
+		return resultSet{}, c.server.unsupportedError(normalizedSQL)
 	}
 	return resultSet{
 		Columns: []resultColumn{{Name: expr, Type: fieldTypeVarString}},
@@ -722,6 +725,10 @@ func mapSQLiteError(sqlText string, err error) *mysqlError {
 	}
 }
 
+func isSQLiteSyntaxError(err error) bool {
+	return strings.Contains(strings.ToLower(err.Error()), "syntax error")
+}
+
 func isReadQuery(upper string) bool {
 	return strings.HasPrefix(upper, "SELECT ") ||
 		upper == "SELECT" ||
@@ -750,6 +757,16 @@ func translateSQL(sqlText string) string {
 		"now()", "CURRENT_TIMESTAMP",
 	)
 	return replacer.Replace(sqlText)
+}
+
+func (c *mysqlConn) recordUnsupported(sqlText, normalizedSQL, routeStage string) {
+	c.server.recordUnsupported(UnsupportedQuery{
+		SQL:           sqlText,
+		NormalizedSQL: normalizedSQL,
+		ConnectionID:  c.connectionID,
+		CurrentDB:     c.currentDB,
+		RouteStage:    routeStage,
+	})
 }
 
 func (s *Server) unsupportedError(sqlText string) *mysqlError {

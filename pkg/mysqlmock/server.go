@@ -79,8 +79,12 @@ type Server struct {
 
 // UnsupportedQuery records a query that mysqlmock could not execute.
 type UnsupportedQuery struct {
-	SQL        string
-	Suggestion string
+	SQL           string
+	NormalizedSQL string
+	ConnectionID  uint32
+	CurrentDB     string
+	RouteStage    string
+	Suggestion    string
 }
 
 // New creates a server. Call Start before using Addr or DSN.
@@ -380,15 +384,27 @@ func joinQuoted(cols []string) string {
 	return strings.Join(out, ", ")
 }
 
-func (s *Server) recordUnsupported(sqlText string) {
-	u := UnsupportedQuery{
-		SQL:        sqlText,
-		Suggestion: suggestedRule(sqlText, s.cfg.Fallback.Unsupported),
+func (s *Server) recordUnsupported(u UnsupportedQuery) {
+	if u.NormalizedSQL == "" {
+		u.NormalizedSQL = normalizeSQL(u.SQL)
 	}
+	if u.RouteStage == "" {
+		u.RouteStage = "unsupported"
+	}
+	u.Suggestion = suggestedRule(u.SQL, s.cfg.Fallback.Unsupported)
+
 	s.mu.Lock()
 	s.unsupported = append(s.unsupported, u)
 	s.mu.Unlock()
-	s.logf("unsupported query: %s\n%s", sqlText, u.Suggestion)
+	s.logf(
+		"connection=%d database=%q route=%s unsupported sql=%q normalized=%q\n%s",
+		u.ConnectionID,
+		u.CurrentDB,
+		u.RouteStage,
+		u.SQL,
+		u.NormalizedSQL,
+		u.Suggestion,
+	)
 }
 
 func (s *Server) logf(format string, args ...any) {

@@ -14,7 +14,11 @@ func TestUnsupportedQueriesError(t *testing.T) {
 
 	err := unsupportedQueriesError([]mysqlmock.UnsupportedQuery{
 		{
-			SQL: "CREATE USER unsupported_user",
+			SQL:           "CREATE USER unsupported_user",
+			NormalizedSQL: "CREATE USER unsupported_user",
+			ConnectionID:  7,
+			CurrentDB:     "mysqlmock",
+			RouteStage:    "unsupported",
 			Suggestion: "Suggested rule:\n" +
 				"  - name: generated unsupported query",
 		},
@@ -25,6 +29,10 @@ func TestUnsupportedQueriesError(t *testing.T) {
 	for _, want := range []string{
 		"unsupported queries observed: 1",
 		"CREATE USER unsupported_user",
+		"normalized: CREATE USER unsupported_user",
+		"connection_id: 7",
+		"database: mysqlmock",
+		"route_stage: unsupported",
 		"Suggested rule:",
 	} {
 		if !strings.Contains(err.Error(), want) {

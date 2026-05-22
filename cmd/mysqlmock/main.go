@@ -110,7 +110,20 @@ func unsupportedQueriesError(queries []mysqlmock.UnsupportedQuery) error {
 	var b strings.Builder
 	fmt.Fprintf(&b, "unsupported queries observed: %d", len(queries))
 	for i, query := range queries {
-		fmt.Fprintf(&b, "\n\n%d. %s\n%s", i+1, query.SQL, query.Suggestion)
+		fmt.Fprintf(&b, "\n\n%d. %s", i+1, query.SQL)
+		if query.NormalizedSQL != "" {
+			fmt.Fprintf(&b, "\nnormalized: %s", query.NormalizedSQL)
+		}
+		if query.ConnectionID != 0 {
+			fmt.Fprintf(&b, "\nconnection_id: %d", query.ConnectionID)
+		}
+		if query.CurrentDB != "" {
+			fmt.Fprintf(&b, "\ndatabase: %s", query.CurrentDB)
+		}
+		if query.RouteStage != "" {
+			fmt.Fprintf(&b, "\nroute_stage: %s", query.RouteStage)
+		}
+		fmt.Fprintf(&b, "\n%s", query.Suggestion)
 	}
 	return fmt.Errorf("%s", b.String())
 }

@@ -268,6 +268,18 @@ func TestFallbackUnsupportedConfig(t *testing.T) {
 	if unsupported[0].SQL != "CREATE USER unsupported_user" {
 		t.Fatalf("unsupported SQL = %q", unsupported[0].SQL)
 	}
+	if unsupported[0].NormalizedSQL != "CREATE USER unsupported_user" {
+		t.Fatalf("unsupported normalized SQL = %q", unsupported[0].NormalizedSQL)
+	}
+	if unsupported[0].ConnectionID == 0 {
+		t.Fatal("unsupported connection id was not recorded")
+	}
+	if unsupported[0].CurrentDB != "mysqlmock" {
+		t.Fatalf("unsupported current DB = %q", unsupported[0].CurrentDB)
+	}
+	if unsupported[0].RouteStage != "unsupported" {
+		t.Fatalf("unsupported route stage = %q", unsupported[0].RouteStage)
+	}
 	for _, want := range []string{
 		"code: 1644",
 		`sql_state: "45000"`,
@@ -276,6 +288,62 @@ func TestFallbackUnsupportedConfig(t *testing.T) {
 		if !strings.Contains(unsupported[0].Suggestion, want) {
 			t.Fatalf("unsupported suggestion %q does not contain %q", unsupported[0].Suggestion, want)
 		}
+	}
+}
+
+func TestUnsupportedQueryRecordsCompatRoute(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	server := mysqlmock.Start(t, mysqlmock.WithConfig(testConfig()))
+	db, err := sql.Open("mysql", server.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	if err := db.QueryRowContext(ctx, " SELECT   @@session.unknown_variable ;").Scan(new(string)); err == nil {
+		t.Fatal("expected unsupported compat variable error")
+	}
+
+	unsupported := server.Unsupported()
+	if len(unsupported) != 1 {
+		t.Fatalf("unsupported query count = %d, want 1", len(unsupported))
+	}
+	if !strings.Contains(unsupported[0].SQL, "@@session.unknown_variable") {
+		t.Fatalf("unsupported SQL = %q", unsupported[0].SQL)
+	}
+	if unsupported[0].NormalizedSQL != "SELECT @@session.unknown_variable" {
+		t.Fatalf("unsupported normalized SQL = %q", unsupported[0].NormalizedSQL)
+	}
+	if unsupported[0].RouteStage != "compat" {
+		t.Fatalf("unsupported route stage = %q", unsupported[0].RouteStage)
+	}
+}
+
+func TestUnsupportedQueryRecordsSQLiteRoute(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	server := mysqlmock.Start(t, mysqlmock.WithConfig(testConfig()))
+	db, err := sql.Open("mysql", server.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	if _, err := db.ExecContext(ctx, "INSERT INTO users (name, email) VALUES ()"); err == nil {
+		t.Fatal("expected sqlite syntax error")
+	}
+
+	unsupported := server.Unsupported()
+	if len(unsupported) != 1 {
+		t.Fatalf("unsupported query count = %d, want 1", len(unsupported))
+	}
+	if unsupported[0].RouteStage != "sqlite" {
+		t.Fatalf("unsupported route stage = %q", unsupported[0].RouteStage)
 	}
 }
 
