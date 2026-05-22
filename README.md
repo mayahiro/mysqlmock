@@ -32,6 +32,11 @@ if err != nil {
     t.Fatal(err)
 }
 defer db.Close()
+
+// Reset restores the configured schema and seed data for another test step.
+if err := server.Reset(context.Background()); err != nil {
+    t.Fatal(err)
+}
 ```
 
 ## Config Example

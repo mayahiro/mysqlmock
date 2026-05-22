@@ -239,6 +239,22 @@ func (s *Server) Unsupported() []UnsupportedQuery {
 	return out
 }
 
+// Reset drops all current SQLite objects, reapplies schema and seed data, and clears diagnostics.
+func (s *Server) Reset(ctx context.Context) error {
+	if s.keepConn == nil {
+		return errors.New("mysqlmock server not started")
+	}
+	if err := s.resetBackend(ctx, s.keepConn); err != nil {
+		return err
+	}
+
+	s.mu.Lock()
+	s.unsupported = nil
+	s.ruleOnceUsed = nil
+	s.mu.Unlock()
+	return nil
+}
+
 // CheckConfigFile validates config and verifies that schema and seed data apply to SQLite.
 func CheckConfigFile(ctx context.Context, path string) error {
 	cfg, err := LoadConfigFile(path)
@@ -402,6 +418,81 @@ func (s *Server) applySeed(ctx context.Context, conn *sql.Conn) error {
 			if _, err := conn.ExecContext(ctx, query, args...); err != nil {
 				return fmt.Errorf("apply seed for table %s: %w", table, err)
 			}
+		}
+	}
+	return nil
+}
+
+func (s *Server) resetBackend(ctx context.Context, conn *sql.Conn) error {
+	if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys = OFF"); err != nil {
+		return fmt.Errorf("disable foreign keys for reset: %w", err)
+	}
+	if err := s.dropSQLiteObjects(ctx, conn); err != nil {
+		_, _ = conn.ExecContext(ctx, "PRAGMA foreign_keys = ON")
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys = ON"); err != nil {
+		return fmt.Errorf("enable foreign keys for reset: %w", err)
+	}
+	if err := s.applySchema(ctx, conn); err != nil {
+		return err
+	}
+	if err := s.applySeed(ctx, conn); err != nil {
+		return err
+	}
+	return nil
+}
+
+type sqliteObject struct {
+	Type string
+	Name string
+}
+
+func (s *Server) dropSQLiteObjects(ctx context.Context, conn *sql.Conn) error {
+	rows, err := conn.QueryContext(ctx, `
+SELECT type, name
+FROM sqlite_master
+WHERE type IN ('trigger', 'view', 'table')
+  AND name NOT LIKE 'sqlite_%'
+ORDER BY CASE type
+  WHEN 'trigger' THEN 0
+  WHEN 'view' THEN 1
+  ELSE 2
+END, name`)
+	if err != nil {
+		return fmt.Errorf("list sqlite objects for reset: %w", err)
+	}
+	defer rows.Close()
+
+	objects := []sqliteObject{}
+	for rows.Next() {
+		var obj sqliteObject
+		if err := rows.Scan(&obj.Type, &obj.Name); err != nil {
+			return fmt.Errorf("scan sqlite object for reset: %w", err)
+		}
+		objects = append(objects, obj)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("list sqlite objects for reset: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close sqlite object list for reset: %w", err)
+	}
+
+	for _, obj := range objects {
+		var stmt string
+		switch obj.Type {
+		case "trigger":
+			stmt = "DROP TRIGGER IF EXISTS " + quoteIdent(obj.Name)
+		case "view":
+			stmt = "DROP VIEW IF EXISTS " + quoteIdent(obj.Name)
+		case "table":
+			stmt = "DROP TABLE IF EXISTS " + quoteIdent(obj.Name)
+		default:
+			continue
+		}
+		if _, err := conn.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("drop sqlite %s %s for reset: %w", obj.Type, obj.Name, err)
 		}
 	}
 	return nil

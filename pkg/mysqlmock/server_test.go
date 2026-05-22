@@ -268,6 +268,76 @@ fallback:
 	}
 }
 
+func TestServerResetReappliesSchemaSeedAndClearsRuntimeState(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cfg := testConfig()
+	cfg.Rules = []mysqlmock.RuleConfig{
+		{
+			Name: "once reset rule",
+			Request: mysqlmock.RuleRequestConfig{
+				Match: "contains",
+				SQL:   "reset_once",
+			},
+			Response: mysqlmock.RuleResponseConfig{
+				Type:     "error",
+				Code:     1205,
+				SQLState: "HY000",
+				Message:  "Lock wait timeout exceeded",
+				Once:     true,
+			},
+		},
+	}
+	server := mysqlmock.Start(t, mysqlmock.WithConfig(cfg))
+	db, err := sql.Open("mysql", server.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	if _, err := db.ExecContext(ctx, "INSERT INTO users (name, email) VALUES (?, ?)", "Reset", "reset@example.com"); err != nil {
+		t.Fatalf("insert before reset: %v", err)
+	}
+	assertUserCount(t, ctx, db, 3)
+
+	if err := db.QueryRowContext(ctx, "SELECT 'reset_once'").Scan(new(string)); err == nil {
+		t.Fatal("expected once rule error before reset")
+	}
+	if err := db.QueryRowContext(ctx, "SELECT 'reset_once'").Scan(new(string)); err != nil {
+		t.Fatalf("expected once rule to be exhausted before reset: %v", err)
+	}
+
+	if _, err := db.ExecContext(ctx, "CREATE USER reset_unsupported"); err == nil {
+		t.Fatal("expected unsupported query before reset")
+	}
+	if len(server.Unsupported()) != 1 {
+		t.Fatalf("unsupported count before reset = %d, want 1", len(server.Unsupported()))
+	}
+
+	if err := server.Reset(ctx); err != nil {
+		t.Fatalf("reset: %v", err)
+	}
+	assertUserCount(t, ctx, db, 2)
+	if len(server.Unsupported()) != 0 {
+		t.Fatalf("unsupported count after reset = %d, want 0", len(server.Unsupported()))
+	}
+	if err := db.QueryRowContext(ctx, "SELECT 'reset_once'").Scan(new(string)); err == nil {
+		t.Fatal("expected once rule error after reset")
+	}
+}
+
+func TestServerResetBeforeStart(t *testing.T) {
+	server, err := mysqlmock.New(mysqlmock.WithConfig(testConfig()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Reset(context.Background()); err == nil {
+		t.Fatal("expected reset before start error")
+	}
+}
+
 func TestQueryLoggingTextRoutes(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -520,6 +590,18 @@ func assertShowVariable(t *testing.T, ctx context.Context, db *sql.DB, name, wan
 		t.Fatalf("show variables rows: %v", err)
 	}
 	t.Fatalf("SHOW VARIABLES did not include %s", name)
+}
+
+func assertUserCount(t *testing.T, ctx context.Context, db *sql.DB, want int) {
+	t.Helper()
+
+	var got int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM users").Scan(&got); err != nil {
+		t.Fatalf("select user count: %v", err)
+	}
+	if got != want {
+		t.Fatalf("user count = %d, want %d", got, want)
+	}
 }
 
 func testConfig() mysqlmock.Config {
