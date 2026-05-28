@@ -24,14 +24,14 @@ func (c *mysqlConn) execMySQLDDLCompatibility(ctx context.Context, sqlText strin
 		return resp, handled, err
 	}
 	if tableName, indexName, ok := parseAlterTableDropIndex(sqlText); ok {
-		resp, err := c.execSQLite(ctx, "DROP INDEX "+quoteIdent(indexName))
+		resp, err := c.execSQLite(ctx, "DROP INDEX "+quoteIdent(c.server.sqliteIndexNameForMySQL(tableName, indexName)))
 		if err == nil {
 			c.server.dropMySQLIndexMetadata(tableName, indexName)
 		}
 		return resp, true, err
 	}
 	if tableName, indexName, ok := parseDropIndexOnTable(sqlText); ok {
-		resp, err := c.execSQLite(ctx, "DROP INDEX "+quoteIdent(indexName))
+		resp, err := c.execSQLite(ctx, "DROP INDEX "+quoteIdent(c.server.sqliteIndexNameForMySQL(tableName, indexName)))
 		if err == nil {
 			c.server.dropMySQLIndexMetadata(tableName, indexName)
 		}
@@ -71,19 +71,20 @@ func (c *mysqlConn) renameIndex(ctx context.Context, tableName, oldName, newName
 	if err != nil {
 		return okResult{}, true, err
 	}
-	if _, err := c.execSQLite(ctx, "DROP INDEX "+quoteIdent(oldName)); err != nil {
+	if _, err := c.execSQLite(ctx, "DROP INDEX "+quoteIdent(index.Name)); err != nil {
 		return okResult{}, true, err
 	}
 	create := "CREATE "
 	if index.Unique {
 		create += "UNIQUE "
 	}
-	create += fmt.Sprintf("INDEX %s ON %s (%s)", quoteIdent(newName), quoteIdent(tableName), joinQuoted(index.Columns))
+	create += fmt.Sprintf("INDEX %s ON %s (%s)", quoteIdent(sqliteIndexName(tableName, newName)), quoteIdent(tableName), joinQuoted(index.Columns))
 	resp, err := c.execSQLite(ctx, create)
 	return resp, true, err
 }
 
 type sqliteIndexDefinition struct {
+	Name    string
 	Unique  bool
 	Columns []string
 }
@@ -96,7 +97,9 @@ func (c *mysqlConn) sqliteIndexDefinition(ctx context.Context, tableName, indexN
 	defer rows.Close()
 
 	var found bool
+	var sqliteName string
 	var unique bool
+	expectedSQLiteName := c.server.sqliteIndexNameForMySQL(tableName, indexName)
 	for rows.Next() {
 		var seq int
 		var name string
@@ -109,8 +112,9 @@ func (c *mysqlConn) sqliteIndexDefinition(ctx context.Context, tableName, indexN
 		_ = seq
 		_ = origin
 		_ = partial
-		if strings.EqualFold(name, indexName) {
+		if strings.EqualFold(name, expectedSQLiteName) || strings.EqualFold(name, indexName) {
 			found = true
+			sqliteName = name
 			unique = uniqueInt != 0
 			break
 		}
@@ -121,14 +125,14 @@ func (c *mysqlConn) sqliteIndexDefinition(ctx context.Context, tableName, indexN
 	if !found {
 		return sqliteIndexDefinition{}, errPacket(mysqlErrUnknown, "42000", "Key '"+indexName+"' doesn't exist in table '"+tableName+"'")
 	}
-	columns, err := c.indexColumns(ctx, indexName)
+	columns, err := c.indexColumns(ctx, sqliteName)
 	if err != nil {
 		return sqliteIndexDefinition{}, err
 	}
 	if len(columns) == 0 {
 		return sqliteIndexDefinition{}, errPacket(mysqlErrUnknown, "HY000", "Unsupported expression index: "+indexName)
 	}
-	return sqliteIndexDefinition{Unique: unique, Columns: columns}, nil
+	return sqliteIndexDefinition{Name: sqliteName, Unique: unique, Columns: columns}, nil
 }
 
 func (c *mysqlConn) columnExists(ctx context.Context, tableName, columnName string) (bool, error) {

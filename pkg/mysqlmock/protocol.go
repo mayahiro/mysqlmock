@@ -1249,6 +1249,7 @@ func translateMySQLAlterTableAddIndex(sqlText string) (string, bool) {
 	if !ok {
 		return "", false
 	}
+	visibleIndexName := unquoteSQLWord(indexName)
 	if next, ok := consumeSQLNamedOption(sqlText, pos, "USING"); ok {
 		pos = next
 	}
@@ -1285,11 +1286,11 @@ func translateMySQLAlterTableAddIndex(sqlText string) (string, bool) {
 		out.WriteString("UNIQUE ")
 	}
 	out.WriteString("INDEX ")
-	out.WriteString(indexName)
+	out.WriteString(quoteIdent(sqliteIndexName(tableName, visibleIndexName)))
 	out.WriteString(" ON ")
 	out.WriteString(tableName)
 	out.WriteByte(' ')
-	out.WriteString(columns)
+	out.WriteString(translateMySQLIndexColumns(columns))
 	return out.String(), true
 }
 
@@ -1303,9 +1304,16 @@ func translateMySQLCreateIndex(sqlText string) (string, bool) {
 		return "", false
 	}
 	indexName, pos, ok := readSQLNameToken(sqlText, pos)
-	if !ok || !consumeKeyword(sqlText, &pos, "ON") {
+	if !ok {
 		return "", false
 	}
+	if next, ok := consumeSQLNamedOption(sqlText, pos, "USING"); ok {
+		pos = next
+	}
+	if !consumeKeyword(sqlText, &pos, "ON") {
+		return "", false
+	}
+	visibleIndexName := unquoteSQLWord(indexName)
 	tableName, pos, ok := readSQLQualifiedName(sqlText, pos)
 	if !ok {
 		return "", false
@@ -1341,7 +1349,7 @@ func translateMySQLCreateIndex(sqlText string) (string, bool) {
 		out.WriteString("UNIQUE ")
 	}
 	out.WriteString("INDEX ")
-	out.WriteString(indexName)
+	out.WriteString(quoteIdent(sqliteIndexName(tableName, visibleIndexName)))
 	out.WriteString(" ON ")
 	out.WriteString(tableName)
 	out.WriteByte(' ')

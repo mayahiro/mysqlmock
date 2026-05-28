@@ -245,27 +245,27 @@ func TestTranslateSQLConvertsMySQLIndexDDL(t *testing.T) {
 		{
 			name:  "create index using before on",
 			input: "CREATE INDEX idx_users_email USING BTREE ON users (email);",
-			want:  "CREATE INDEX idx_users_email  ON users (email);",
+			want:  "CREATE INDEX " + quoteIdent(sqliteIndexName("users", "idx_users_email")) + " ON users (email)",
 		},
 		{
 			name:  "create index using after columns",
 			input: "CREATE INDEX idx_users_name ON users (name) USING BTREE;",
-			want:  "CREATE INDEX idx_users_name ON users (name)",
+			want:  "CREATE INDEX " + quoteIdent(sqliteIndexName("users", "idx_users_name")) + " ON users (name)",
 		},
 		{
 			name:  "create index prefix and invisible",
 			input: "CREATE INDEX idx_users_name_prefix ON users (name(10)) INVISIBLE;",
-			want:  "CREATE INDEX idx_users_name_prefix ON users (name)",
+			want:  "CREATE INDEX " + quoteIdent(sqliteIndexName("users", "idx_users_name_prefix")) + " ON users (name)",
 		},
 		{
 			name:  "alter table add index",
 			input: "ALTER TABLE users ADD INDEX idx_users_name (name) USING BTREE;",
-			want:  "CREATE INDEX idx_users_name ON users (name)",
+			want:  "CREATE INDEX " + quoteIdent(sqliteIndexName("users", "idx_users_name")) + " ON users (name)",
 		},
 		{
 			name:  "alter table add unique key",
 			input: "ALTER TABLE `users` ADD UNIQUE KEY `idx_users_email` (`email`);",
-			want:  "CREATE UNIQUE INDEX `idx_users_email` ON `users` (`email`)",
+			want:  "CREATE UNIQUE INDEX " + quoteIdent(sqliteIndexName("users", "idx_users_email")) + " ON `users` (`email`)",
 		},
 		{
 			name:  "concat function",
@@ -339,10 +339,12 @@ CREATE TABLE update_patterns (
 			t.Fatalf("create table translation = %q, want it to omit %q", got[0], unwanted)
 		}
 	}
-	if got[1] != "CREATE UNIQUE INDEX uniq_update_patterns_code ON update_patterns (code)" {
+	wantUniqueIndex := "CREATE UNIQUE INDEX " + quoteIdent(sqliteIndexName("update_patterns", "uniq_update_patterns_code")) + " ON update_patterns (code)"
+	if got[1] != wantUniqueIndex {
 		t.Fatalf("unique index translation = %q", got[1])
 	}
-	if got[2] != "CREATE INDEX idx_update_patterns_channel_id ON update_patterns (channel_id)" {
+	wantIndex := "CREATE INDEX " + quoteIdent(sqliteIndexName("update_patterns", "idx_update_patterns_channel_id")) + " ON update_patterns (channel_id)"
+	if got[2] != wantIndex {
 		t.Fatalf("index translation = %q", got[2])
 	}
 }

@@ -121,14 +121,14 @@ func translateCreateTableIndex(item, tableName string) (string, bool) {
 		pos = next
 	}
 
-	indexName := constraintName
+	indexName := unquoteSQLWord(constraintName)
 	columnsStart := skipSQLSpaces(item, pos)
 	if columnsStart >= len(item) || item[columnsStart] != '(' {
 		name, next, ok := readSQLNameToken(item, pos)
 		if !ok {
 			return "", false
 		}
-		indexName = name
+		indexName = unquoteSQLWord(name)
 		pos = next
 		if next, ok := consumeSQLNamedOption(item, pos, "USING"); ok {
 			pos = next
@@ -140,7 +140,7 @@ func translateCreateTableIndex(item, tableName string) (string, bool) {
 		return "", false
 	}
 	if indexName == "" {
-		indexName = quoteIdent(generatedIndexName(tableName, item[columnsStart:columnsEnd], unique))
+		indexName = generatedIndexName(tableName, item[columnsStart:columnsEnd], unique)
 	}
 
 	var out strings.Builder
@@ -149,7 +149,7 @@ func translateCreateTableIndex(item, tableName string) (string, bool) {
 		out.WriteString("UNIQUE ")
 	}
 	out.WriteString("INDEX ")
-	out.WriteString(indexName)
+	out.WriteString(quoteIdent(sqliteIndexName(tableName, indexName)))
 	out.WriteString(" ON ")
 	out.WriteString(tableName)
 	out.WriteByte(' ')

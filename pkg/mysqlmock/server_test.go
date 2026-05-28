@@ -1319,6 +1319,72 @@ WHERE TABLE_SCHEMA = DATABASE()
 	}
 }
 
+func TestSchemaFileAllowsTableScopedDuplicateIndexNames(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	dir := t.TempDir()
+	schemaPath := filepath.Join(dir, "schema.sql")
+	if err := os.WriteFile(schemaPath, []byte(`
+CREATE TABLE index_scope_users (
+  id INTEGER PRIMARY KEY AUTO_INCREMENT,
+  status VARCHAR(32) NOT NULL,
+  KEY idx_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE index_scope_posts (
+  id INTEGER PRIMARY KEY AUTO_INCREMENT,
+  status VARCHAR(32) NOT NULL,
+  KEY idx_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+`), 0o644); err != nil {
+		t.Fatalf("write schema file: %v", err)
+	}
+
+	cfg := mysqlmock.DefaultConfig()
+	cfg.SchemaFiles = []string{schemaPath}
+	server := mysqlmock.Start(t, mysqlmock.WithConfig(cfg))
+	db, err := sql.Open("mysql", server.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	assertIndexCount := func(tableName, indexName string, want int) {
+		t.Helper()
+		var got int
+		if err := db.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM information_schema.statistics
+WHERE TABLE_SCHEMA = DATABASE()
+  AND TABLE_NAME = ?
+  AND INDEX_NAME = ?`, tableName, indexName).Scan(&got); err != nil {
+			t.Fatalf("query index metadata for %s.%s: %v", tableName, indexName, err)
+		}
+		if got != want {
+			t.Fatalf("index metadata count for %s.%s = %d, want %d", tableName, indexName, got, want)
+		}
+	}
+
+	assertIndexCount("index_scope_users", "idx_status", 1)
+	assertIndexCount("index_scope_posts", "idx_status", 1)
+
+	if _, err := db.ExecContext(ctx, "ALTER TABLE index_scope_posts DROP INDEX idx_status"); err != nil {
+		t.Fatalf("drop table-scoped duplicate index: %v", err)
+	}
+	assertIndexCount("index_scope_users", "idx_status", 1)
+	assertIndexCount("index_scope_posts", "idx_status", 0)
+
+	if _, err := db.ExecContext(ctx, "ALTER TABLE index_scope_users RENAME INDEX idx_status TO idx_state"); err != nil {
+		t.Fatalf("rename table-scoped duplicate index: %v", err)
+	}
+	assertIndexCount("index_scope_users", "idx_status", 0)
+	assertIndexCount("index_scope_users", "idx_state", 1)
+
+	mysqlmock.AssertNoUnsupported(t, server)
+}
+
 func TestSchemaAppliesTiDBDDL(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

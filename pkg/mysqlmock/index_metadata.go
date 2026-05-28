@@ -1,15 +1,18 @@
 package mysqlmock
 
 import (
+	"fmt"
+	"hash/fnv"
 	"strconv"
 	"strings"
 )
 
 type mysqlIndexMetadata struct {
-	TableName string
-	IndexName string
-	Columns   []mysqlIndexColumnMetadata
-	Visible   string
+	TableName  string
+	IndexName  string
+	SQLiteName string
+	Columns    []mysqlIndexColumnMetadata
+	Visible    string
 }
 
 type mysqlIndexColumnMetadata struct {
@@ -25,6 +28,9 @@ func (s *Server) recordMySQLIndexMetadata(sqlText string) {
 		}
 		if metadata.Visible == "" {
 			metadata.Visible = "YES"
+		}
+		if metadata.SQLiteName == "" {
+			metadata.SQLiteName = sqliteIndexName(metadata.TableName, metadata.IndexName)
 		}
 		s.mu.Lock()
 		if s.indexMetadata == nil {
@@ -45,6 +51,7 @@ func (s *Server) renameMySQLIndexMetadata(tableName, oldName, newName string) {
 	}
 	delete(s.indexMetadata, key)
 	metadata.IndexName = newName
+	metadata.SQLiteName = sqliteIndexName(tableName, newName)
 	s.indexMetadata[indexMetadataKey(tableName, newName)] = metadata
 }
 
@@ -76,8 +83,9 @@ func (s *Server) setMySQLIndexVisibility(tableName, indexName, visible string) {
 	metadata, ok := s.indexMetadata[key]
 	if !ok {
 		metadata = mysqlIndexMetadata{
-			TableName: tableName,
-			IndexName: indexName,
+			TableName:  tableName,
+			IndexName:  indexName,
+			SQLiteName: sqliteIndexName(tableName, indexName),
 		}
 	}
 	metadata.Visible = visible
@@ -89,6 +97,32 @@ func (s *Server) lookupMySQLIndexMetadata(tableName, indexName string) (mysqlInd
 	defer s.mu.Unlock()
 	metadata, ok := s.indexMetadata[indexMetadataKey(tableName, indexName)]
 	return metadata, ok
+}
+
+func (s *Server) lookupMySQLIndexMetadataBySQLiteName(tableName, sqliteName string) (mysqlIndexMetadata, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, metadata := range s.indexMetadata {
+		if !strings.EqualFold(metadata.TableName, tableName) {
+			continue
+		}
+		if metadata.SQLiteName == "" {
+			metadata.SQLiteName = sqliteIndexName(metadata.TableName, metadata.IndexName)
+		}
+		if strings.EqualFold(metadata.SQLiteName, sqliteName) {
+			return metadata, true
+		}
+	}
+	return mysqlIndexMetadata{}, false
+}
+
+func (s *Server) sqliteIndexNameForMySQL(tableName, indexName string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if metadata, ok := s.indexMetadata[indexMetadataKey(tableName, indexName)]; ok && metadata.SQLiteName != "" {
+		return metadata.SQLiteName
+	}
+	return sqliteIndexName(tableName, indexName)
 }
 
 func (s *Server) recordMySQLTableDDL(sqlText string) {
@@ -149,6 +183,21 @@ func indexMetadataKey(tableName, indexName string) string {
 
 func tableMetadataKey(tableName string) string {
 	return strings.ToLower(unquoteSQLWord(tableName))
+}
+
+func sqliteIndexName(tableName, indexName string) string {
+	tableName = unquoteSQLWord(tableName)
+	indexName = unquoteSQLWord(indexName)
+
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(strings.ToLower(tableName)))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(strings.ToLower(indexName)))
+
+	return fmt.Sprintf("__mysqlmock_idx_%s_%s_%08x",
+		sanitizeSQLName(tableName),
+		sanitizeSQLName(indexName),
+		h.Sum32())
 }
 
 func parseCreateTableDDLTableName(sqlText string) (string, bool) {
@@ -221,7 +270,13 @@ func parseCreateIndexMetadata(sqlText string) (mysqlIndexMetadata, bool) {
 		return mysqlIndexMetadata{}, false
 	}
 	indexName, pos, ok := readSQLNameToken(sqlText, pos)
-	if !ok || !consumeKeyword(sqlText, &pos, "ON") {
+	if !ok {
+		return mysqlIndexMetadata{}, false
+	}
+	if next, ok := consumeSQLNamedOption(sqlText, pos, "USING"); ok {
+		pos = next
+	}
+	if !consumeKeyword(sqlText, &pos, "ON") {
 		return mysqlIndexMetadata{}, false
 	}
 	tableName, pos, ok := readSQLQualifiedName(sqlText, pos)

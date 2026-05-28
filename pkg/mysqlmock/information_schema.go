@@ -281,25 +281,29 @@ func (c *mysqlConn) insertInformationSchemaIndexes(ctx context.Context, tableNam
 
 	for rows.Next() {
 		var seq int
-		var indexName string
+		var sqliteIndexName string
 		var unique int
 		var origin string
 		var partial int
-		if err := rows.Scan(&seq, &indexName, &unique, &origin, &partial); err != nil {
+		if err := rows.Scan(&seq, &sqliteIndexName, &unique, &origin, &partial); err != nil {
 			return fmt.Errorf("scan sqlite index for information_schema.%s: %w", tableName, err)
 		}
 		_ = seq
 		_ = origin
 		_ = partial
-		if indexName == "" {
+		if sqliteIndexName == "" {
 			continue
+		}
+		indexName := sqliteIndexName
+		if metadata, ok := c.server.lookupMySQLIndexMetadataBySQLiteName(tableName, sqliteIndexName); ok {
+			indexName = metadata.IndexName
 		}
 		if unique != 0 && origin != "pk" {
 			if err := c.insertInformationSchemaTableConstraint(ctx, indexName, tableName, "UNIQUE"); err != nil {
 				return err
 			}
 		}
-		if err := c.insertInformationSchemaIndexColumns(ctx, tableName, indexName, unique); err != nil {
+		if err := c.insertInformationSchemaIndexColumns(ctx, tableName, sqliteIndexName, indexName, unique); err != nil {
 			return err
 		}
 	}
@@ -309,9 +313,13 @@ func (c *mysqlConn) insertInformationSchemaIndexes(ctx context.Context, tableNam
 	return nil
 }
 
-func (c *mysqlConn) insertInformationSchemaIndexColumns(ctx context.Context, tableName, indexName string, unique int) error {
-	metadata, hasMetadata := c.server.lookupMySQLIndexMetadata(tableName, indexName)
-	rows, err := c.sqliteConn.QueryContext(ctx, "PRAGMA main.index_info("+quoteIdent(indexName)+")")
+func (c *mysqlConn) insertInformationSchemaIndexColumns(ctx context.Context, tableName, sqliteIndexName, indexName string, unique int) error {
+	metadata, hasMetadata := c.server.lookupMySQLIndexMetadataBySQLiteName(tableName, sqliteIndexName)
+	visible := "YES"
+	if hasMetadata && metadata.Visible != "" {
+		visible = metadata.Visible
+	}
+	rows, err := c.sqliteConn.QueryContext(ctx, "PRAGMA main.index_info("+quoteIdent(sqliteIndexName)+")")
 	if err != nil {
 		return fmt.Errorf("list sqlite index columns for information_schema.%s.%s: %w", tableName, indexName, err)
 	}
@@ -341,7 +349,7 @@ func (c *mysqlConn) insertInformationSchemaIndexColumns(ctx context.Context, tab
 				return err
 			}
 		}
-		if err := c.insertInformationSchemaStatisticWithMetadata(ctx, tableName, indexName, boolInt(unique == 0), position, insertColumnName, columnMetadata.SubPart, metadata.Visible, columnMetadata.Expression); err != nil {
+		if err := c.insertInformationSchemaStatisticWithMetadata(ctx, tableName, indexName, boolInt(unique == 0), position, insertColumnName, columnMetadata.SubPart, visible, columnMetadata.Expression); err != nil {
 			return err
 		}
 	}

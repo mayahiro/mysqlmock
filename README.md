@@ -43,7 +43,7 @@ Compatibility scope for `v0.1.0`:
 Add the library to a Go module:
 
 ```sh
-go get github.com/mayahiro/mysqlmock
+go get github.com/mayahiro/mysqlmock/pkg/mysqlmock
 ```
 
 Install the CLI:
@@ -250,6 +250,8 @@ Schema and query fallback translate `TRUE`, `FALSE`, `NOW()`,
 TiDB DDL options, table-level `PRIMARY KEY` / `UNIQUE KEY` / `KEY` definitions,
 simple MySQL index DDL, and common `ALTER TABLE` / `RENAME TABLE` variants into
 SQLite-compatible SQL where possible.
+MySQL-visible index names remain table-scoped; mysqlmock maps them to private
+SQLite index names internally to avoid SQLite's schema-wide index namespace.
 Common scalar functions used by ORM queries include `IFNULL`, `COALESCE`,
 `CONCAT`, `CAST`, `DATE_FORMAT`, `JSON_EXTRACT`, and `JSON_UNQUOTE`.
 
@@ -284,6 +286,7 @@ files.
 
 - [Configuration Reference](docs/configuration.md)
 - [Rules and Diagnostics](docs/rules-and-diagnostics.md)
+- [v0.1.1 Release Notes](docs/releases/v0.1.1.md)
 - [v0.1.0 Release Notes](docs/releases/v0.1.0.md)
 - [Architecture](ARCHITECTURE.md)
 - [Basic Example](examples/basic)
