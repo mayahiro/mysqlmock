@@ -25,6 +25,19 @@ bytes, floats, doubles, `time.Time` values encoded as strings, and common MySQL
 binary protocol aliases such as `NEWDATE`, `ENUM`, `SET`, and blob variants.
 `interpolateParams=true` is optional.
 
+Compatibility scope for `v0.1.0`:
+
+| Area | Status |
+| --- | --- |
+| Go version | Go 1.25 or newer |
+| Go SQL client | `database/sql` with `github.com/go-sql-driver/mysql` |
+| Core operations | Ping, query, exec, prepared statements, transactions, savepoints |
+| Schema setup | Inline schema, SQL dump files, common MySQL/TiDB DDL translation |
+| Seed data | Inline rows and YAML, JSON, or CSV seed files |
+| ORM behavior | Common GORM setup variables and ActiveRecord-style schema introspection |
+| MySQL/TiDB comparison | Optional compatibility scenarios against real MySQL or TiDB |
+| Out of scope | Full MySQL SQL parsing, optimizer behavior, real row locks, TLS, compression, `multiStatements=true`, `LOAD DATA LOCAL INFILE` |
+
 ## Installation
 
 Add the library to a Go module:
@@ -39,7 +52,8 @@ Install the CLI:
 go install github.com/mayahiro/mysqlmock/cmd/mysqlmock@latest
 ```
 
-The module's Go version is declared in `go.mod`.
+mysqlmock requires Go 1.25 or newer. The exact module Go version is declared in
+`go.mod`.
 
 ## Library Usage
 
@@ -270,6 +284,7 @@ files.
 
 - [Configuration Reference](docs/configuration.md)
 - [Rules and Diagnostics](docs/rules-and-diagnostics.md)
+- [v0.1.0 Release Notes](docs/releases/v0.1.0.md)
 - [Architecture](ARCHITECTURE.md)
 - [Basic Example](examples/basic)
 - [Japanese README](README_ja.md)
