@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -57,6 +58,77 @@ func TestPreparedStatementDecodeExecuteArgs(t *testing.T) {
 	}
 }
 
+func TestDecodePreparedValueCoversAdditionalTypes(t *testing.T) {
+	datePayload := []byte{0x04}
+	datePayload = appendUint16(datePayload, 2026)
+	datePayload = append(datePayload, 5, 23)
+
+	tests := []struct {
+		name  string
+		input []byte
+		typ   preparedParamType
+		want  any
+	}{
+		{
+			name:  "newdate",
+			input: datePayload,
+			typ:   preparedParamType{FieldType: fieldTypeNewDate},
+			want:  time.Date(2026, 5, 23, 0, 0, 0, 0, time.Local),
+		},
+		{
+			name:  "enum",
+			input: appendLenEncBytes(nil, []byte("active")),
+			typ:   preparedParamType{FieldType: fieldTypeEnum},
+			want:  "active",
+		},
+		{
+			name:  "set",
+			input: appendLenEncBytes(nil, []byte("read,write")),
+			typ:   preparedParamType{FieldType: fieldTypeSet},
+			want:  "read,write",
+		},
+		{
+			name:  "tinyblob",
+			input: appendLenEncBytes(nil, []byte("tiny")),
+			typ:   preparedParamType{FieldType: fieldTypeTinyBlob},
+			want:  []byte("tiny"),
+		},
+		{
+			name:  "mediumblob",
+			input: appendLenEncBytes(nil, []byte("medium")),
+			typ:   preparedParamType{FieldType: fieldTypeMedBlob},
+			want:  []byte("medium"),
+		},
+		{
+			name:  "longblob",
+			input: appendLenEncBytes(nil, []byte("long")),
+			typ:   preparedParamType{FieldType: fieldTypeLongBlob},
+			want:  []byte("long"),
+		},
+		{
+			name:  "geometry",
+			input: appendLenEncBytes(nil, []byte{0x01, 0x02, 0x03}),
+			typ:   preparedParamType{FieldType: fieldTypeGeometry},
+			want:  []byte{0x01, 0x02, 0x03},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, n, err := decodePreparedValue(tt.input, tt.typ)
+			if err != nil {
+				t.Fatalf("decodePreparedValue(): %v", err)
+			}
+			if n != len(tt.input) {
+				t.Fatalf("decodePreparedValue() consumed %d bytes, want %d", n, len(tt.input))
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("decodePreparedValue() = %#v, want %#v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestBinaryRowEncodesPreparedResultValues(t *testing.T) {
 	got, err := binaryRow(
 		[]resultColumn{
@@ -77,6 +149,236 @@ func TestBinaryRowEncodesPreparedResultValues(t *testing.T) {
 	want = appendLenEncBytes(want, []byte("bytes"))
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("binaryRow() = %#v, want %#v", got, want)
+	}
+}
+
+func TestTranslateSQLConvertsMySQLTokensOutsideQuotedText(t *testing.T) {
+	input := `
+SELECT TRUE, FALSE, NOW(), CURRENT_TIMESTAMP(), 'TRUE FALSE NOW() AUTO_INCREMENT', ` + "`AUTO_INCREMENT`" + `
+-- TRUE FALSE NOW() AUTO_INCREMENT
+/* TRUE FALSE NOW() AUTO_INCREMENT */
+`
+	got := translateSQL(input)
+	for _, want := range []string{
+		"SELECT 1, 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP",
+		"'TRUE FALSE NOW() AUTO_INCREMENT'",
+		"`AUTO_INCREMENT`",
+		"-- TRUE FALSE NOW() AUTO_INCREMENT",
+		"/* TRUE FALSE NOW() AUTO_INCREMENT */",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("translateSQL() = %q, want it to contain %q", got, want)
+		}
+	}
+}
+
+func TestTranslateSQLStripsCommonMySQLDDLOptions(t *testing.T) {
+	input := `
+CREATE TABLE users (
+  id INTEGER PRIMARY KEY AUTO_INCREMENT COMMENT 'primary id',
+  name VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci NOT NULL COMMENT 'display name',
+  quantity INT UNSIGNED NOT NULL DEFAULT 0
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='users table';
+`
+	got := translateSQL(input)
+	for _, want := range []string{
+		"id INTEGER PRIMARY KEY AUTOINCREMENT",
+		"name VARCHAR(255)",
+		"quantity INT  NOT NULL DEFAULT 0",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("translateSQL() = %q, want it to contain %q", got, want)
+		}
+	}
+	for _, unwanted := range []string{
+		"AUTO_INCREMENT",
+		"UNSIGNED",
+		"CHARACTER SET",
+		"COLLATE",
+		"ENGINE",
+		"COMMENT",
+	} {
+		if strings.Contains(strings.ToUpper(got), unwanted) {
+			t.Fatalf("translateSQL() = %q, want it to omit %q", got, unwanted)
+		}
+	}
+}
+
+func TestTranslateSQLStripsAdditionalMySQLDDLOptions(t *testing.T) {
+	input := `
+CREATE TABLE events (
+  id INTEGER PRIMARY KEY AUTO_INCREMENT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP(6),
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6)
+) ENGINE=InnoDB AUTO_INCREMENT=100 ROW_FORMAT=DYNAMIC KEY_BLOCK_SIZE=8 STATS_PERSISTENT=1;
+`
+	got := translateSQL(input)
+	for _, want := range []string{
+		"id INTEGER PRIMARY KEY AUTOINCREMENT",
+		"created_at DATETIME DEFAULT CURRENT_TIMESTAMP",
+		"updated_at DATETIME DEFAULT CURRENT_TIMESTAMP",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("translateSQL() = %q, want it to contain %q", got, want)
+		}
+	}
+	for _, unwanted := range []string{
+		"CURRENT_TIMESTAMP(6)",
+		"ON UPDATE",
+		"AUTO_INCREMENT=100",
+		"ROW_FORMAT",
+		"KEY_BLOCK_SIZE",
+		"STATS_PERSISTENT",
+	} {
+		if strings.Contains(strings.ToUpper(got), unwanted) {
+			t.Fatalf("translateSQL() = %q, want it to omit %q", got, unwanted)
+		}
+	}
+}
+
+func TestTranslateSQLConvertsMySQLIndexDDL(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "create index using before on",
+			input: "CREATE INDEX idx_users_email USING BTREE ON users (email);",
+			want:  "CREATE INDEX idx_users_email  ON users (email);",
+		},
+		{
+			name:  "create index using after columns",
+			input: "CREATE INDEX idx_users_name ON users (name) USING BTREE;",
+			want:  "CREATE INDEX idx_users_name ON users (name) ;",
+		},
+		{
+			name:  "alter table add index",
+			input: "ALTER TABLE users ADD INDEX idx_users_name (name) USING BTREE;",
+			want:  "CREATE INDEX idx_users_name ON users (name)",
+		},
+		{
+			name:  "alter table add unique key",
+			input: "ALTER TABLE `users` ADD UNIQUE KEY `idx_users_email` (`email`);",
+			want:  "CREATE UNIQUE INDEX `idx_users_email` ON `users` (`email`)",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := translateSQL(tt.input); got != tt.want {
+				t.Fatalf("translateSQL() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTranslateSQLStatementsConvertsTiDBCreateTable(t *testing.T) {
+	input := `
+CREATE TABLE update_patterns (
+  id BIGINT PRIMARY KEY /*T![clustered_index] CLUSTERED */ AUTO_RANDOM(5),
+  code VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+  channel_id BIGINT NOT NULL,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+  UNIQUE KEY uniq_update_patterns_code (code),
+  KEY idx_update_patterns_channel_id (channel_id(20))
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin AUTO_RANDOM_BASE=100;
+`
+	got := translateSQLStatements(input)
+	if len(got) != 3 {
+		t.Fatalf("translateSQLStatements() returned %d statements, want 3: %#v", len(got), got)
+	}
+	for _, want := range []string{
+		"id INTEGER PRIMARY KEY AUTOINCREMENT",
+		"code VARCHAR(255)",
+		"updated_at DATETIME DEFAULT CURRENT_TIMESTAMP",
+	} {
+		if !strings.Contains(got[0], want) {
+			t.Fatalf("create table translation = %q, want it to contain %q", got[0], want)
+		}
+	}
+	for _, unwanted := range []string{
+		"AUTO_RANDOM",
+		"AUTO_RANDOM_BASE",
+		"CLUSTERED",
+		"ON UPDATE",
+		"CHARACTER SET",
+		"COLLATE",
+	} {
+		if strings.Contains(strings.ToUpper(got[0]), unwanted) {
+			t.Fatalf("create table translation = %q, want it to omit %q", got[0], unwanted)
+		}
+	}
+	if got[1] != "CREATE UNIQUE INDEX uniq_update_patterns_code ON update_patterns (code)" {
+		t.Fatalf("unique index translation = %q", got[1])
+	}
+	if got[2] != "CREATE INDEX idx_update_patterns_channel_id ON update_patterns (channel_id)" {
+		t.Fatalf("index translation = %q", got[2])
+	}
+}
+
+func TestTranslateSQLStripsLockingClause(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "for update nowait",
+			input: "SELECT * FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 1 FOR UPDATE NOWAIT;",
+			want:  "SELECT * FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 1;",
+		},
+		{
+			name:  "for update skip locked",
+			input: "SELECT * FROM jobs FOR UPDATE SKIP LOCKED",
+			want:  "SELECT * FROM jobs",
+		},
+		{
+			name:  "lock in share mode",
+			input: "SELECT * FROM jobs LOCK IN SHARE MODE",
+			want:  "SELECT * FROM jobs",
+		},
+		{
+			name:  "quoted text is untouched",
+			input: "SELECT 'FOR UPDATE NOWAIT'",
+			want:  "SELECT 'FOR UPDATE NOWAIT'",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := translateSQL(tt.input); got != tt.want {
+				t.Fatalf("translateSQL() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSchemaStatementsFromDumpKeepsSchemaDDL(t *testing.T) {
+	input := `
+-- MySQL dump
+/*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */;
+CREATE DATABASE ` + "`ignored`" + ` /*!40100 DEFAULT CHARACTER SET utf8mb4 */;
+USE ` + "`ignored`" + `;
+DROP TABLE IF EXISTS ` + "`users`" + `;
+CREATE TABLE ` + "`users`" + ` (
+  ` + "`id`" + ` BIGINT PRIMARY KEY /*T![auto_rand] AUTO_RANDOM(5) */,
+  ` + "`email`" + ` varchar(255) NOT NULL,
+  UNIQUE KEY ` + "`uniq_users_email`" + ` (` + "`email`" + `)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+LOCK TABLES ` + "`users`" + ` WRITE;
+INSERT INTO ` + "`users`" + ` VALUES (1, 'alice@example.com');
+UNLOCK TABLES;
+ALTER TABLE ` + "`users`" + ` ADD KEY ` + "`idx_users_email`" + ` (` + "`email`" + `);
+`
+	got := schemaStatementsFromDump(input)
+	want := []string{
+		"DROP TABLE IF EXISTS `users`",
+		"CREATE TABLE `users` (\n  `id` BIGINT PRIMARY KEY /*T![auto_rand] AUTO_RANDOM(5) */,\n  `email` varchar(255) NOT NULL,\n  UNIQUE KEY `uniq_users_email` (`email`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+		"ALTER TABLE `users` ADD KEY `idx_users_email` (`email`)",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("schemaStatementsFromDump() = %#v, want %#v", got, want)
 	}
 }
 
@@ -158,6 +460,18 @@ func TestPreparedStatementsWithGoSQLDriverOverPipe(t *testing.T) {
 	}
 	if gotInt != 42 || gotText != "hello" || string(gotBytes) != "bytes" || gotNull.Valid {
 		t.Fatalf("unexpected scalar round trip: int=%d text=%q bytes=%q null=%v", gotInt, gotText, gotBytes, gotNull.Valid)
+	}
+
+	inputTime := time.Date(2026, 5, 23, 14, 15, 16, 123456000, time.UTC)
+	var gotBool bool
+	var gotUint uint64
+	var gotFloat float64
+	var gotTime string
+	if err := db.QueryRowContext(ctx, "SELECT ?, ?, ?, ?", true, uint64(99), float64(3.5), inputTime).Scan(&gotBool, &gotUint, &gotFloat, &gotTime); err != nil {
+		t.Fatalf("additional scalar round trip: %v", err)
+	}
+	if !gotBool || gotUint != 99 || gotFloat != 3.5 || gotTime != "2026-05-23 14:15:16.123456" {
+		t.Fatalf("unexpected additional scalar round trip: bool=%v uint=%d float=%f time=%q", gotBool, gotUint, gotFloat, gotTime)
 	}
 }
 

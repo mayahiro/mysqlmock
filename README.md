@@ -1,10 +1,14 @@
 # mysqlmock
 
-`mysqlmock` is a lightweight MySQL-protocol test server for Go repository tests.
-It accepts connections from MySQL client drivers and executes stateful CRUD
-queries against an in-memory SQLite backend.
+`mysqlmock` is a lightweight MySQL-protocol test server for Go repository
+tests. It accepts connections from MySQL client drivers, routes common MySQL
+queries, and executes stateful CRUD operations against a SQLite backend.
 
-## MVP-0 Scope
+It is designed for fast tests that need a real MySQL client connection without
+starting Docker or an external MySQL server. It is not a production database and
+does not aim for full MySQL compatibility.
+
+## Status and Scope
 
 The current implementation targets:
 
@@ -13,33 +17,78 @@ The current implementation targets:
 - `PingContext`
 - `QueryContext` and `ExecContext`
 - `PrepareContext` and prepared statement execution
-- `BeginTx`, `Commit`, and `Rollback`
+- `BeginTx`, `Commit`, `Rollback`, and savepoints
 
-Prepared statements are supported for the common scalar parameter types used by
-Go repository tests. `interpolateParams=true` is optional:
+Prepared statements support the common scalar parameter types used by Go
+repository tests: `NULL`, signed and unsigned integers, booleans, strings,
+bytes, floats, doubles, `time.Time` values encoded as strings, and common MySQL
+binary protocol aliases such as `NEWDATE`, `ENUM`, `SET`, and blob variants.
+`interpolateParams=true` is optional.
+
+## Installation
+
+Add the library to a Go module:
+
+```sh
+go get github.com/mayahiro/mysqlmock
+```
+
+Install the CLI:
+
+```sh
+go install github.com/mayahiro/mysqlmock/cmd/mysqlmock@latest
+```
+
+The module's Go version is declared in `go.mod`.
+
+## Library Usage
+
+```go
+package users_test
+
+import (
+    "context"
+    "database/sql"
+    "testing"
+
+    "github.com/mayahiro/mysqlmock/pkg/mysqlmock"
+
+    _ "github.com/go-sql-driver/mysql"
+)
+
+func TestRepository(t *testing.T) {
+    ctx := context.Background()
+    server := mysqlmock.Start(t, mysqlmock.ConfigFile("testdb.yaml"))
+
+    db, err := sql.Open("mysql", server.DSN())
+    if err != nil {
+        t.Fatal(err)
+    }
+    defer db.Close()
+
+    if err := db.PingContext(ctx); err != nil {
+        t.Fatal(err)
+    }
+
+    // Reset restores the configured schema and seed data and clears diagnostics.
+    if err := server.Reset(ctx); err != nil {
+        t.Fatal(err)
+    }
+}
+```
+
+`Server.DSN()` returns a `go-sql-driver/mysql` DSN like:
 
 ```text
 user:password@tcp(127.0.0.1:<port>)/mysqlmock?interpolateParams=true&charset=utf8mb4&parseTime=true
 ```
 
-## Library Usage
+See [examples/basic](examples/basic) for a complete repository-style test.
 
-```go
-server := mysqlmock.Start(t, mysqlmock.ConfigFile("testdb.yaml"))
+## Configuration
 
-db, err := sql.Open("mysql", server.DSN())
-if err != nil {
-    t.Fatal(err)
-}
-defer db.Close()
-
-// Reset restores the configured schema and seed data for another test step.
-if err := server.Reset(context.Background()); err != nil {
-    t.Fatal(err)
-}
-```
-
-## Config Example
+Config files are YAML. `version`, `server`, and `database` are required
+top-level sections. Other top-level sections are optional.
 
 ```yaml
 version: 1
@@ -52,6 +101,15 @@ server:
 database:
   engine: sqlite
   mode: memory
+  shared: true
+
+schema_files:
+  - db/schema.sql
+
+seed_files:
+  - testdata/users.yaml
+  - testdata/posts.json
+  - testdata/tags.csv
 
 schema:
   - |
@@ -67,6 +125,9 @@ seed:
       name: "Alice"
       email: "alice@example.com"
 
+compat:
+  profile: gorm
+
 fallback:
   type: sqlite
   unsupported:
@@ -76,9 +137,22 @@ fallback:
     message: "Unsupported query"
 ```
 
-## SQL Rules
+Schema and query fallback apply a small MySQL-to-SQLite translation for common
+Repository-test SQL. `database.mode: memory` uses an in-memory SQLite backend.
+Use `schema_files` to load DDL from SQL dump files before inline `schema`
+statements.
+Use `seed_files` to load seed rows from YAML, JSON, or CSV files before inline
+`seed` rows.
+Set `database.shared: false` to initialize a separate in-memory database for
+each MySQL client connection. Set `database.mode: file` and `database.path` to
+persist the SQLite database across mysqlmock server restarts.
 
-`rules` can override matching SQL before mysqlmock uses built-in compatibility
+See [docs/configuration.md](docs/configuration.md) for the full config
+reference.
+
+## SQL Rules and Diagnostics
+
+`rules` override matching SQL before mysqlmock uses built-in compatibility
 handlers or the SQLite backend. Supported match modes are `exact`,
 `normalized`, `regex`, `contains`, and `any`. Supported response types are
 `ok`, `result_set`, `error`, and `disconnect`.
@@ -90,10 +164,7 @@ rules:
       match: contains
       sql: "INSERT INTO users"
     response:
-      type: error
-      code: 1062
-      sql_state: "23000"
-      message: "Duplicate entry for key 'users.email'"
+      profile: duplicate_key
       once: true
 
   - name: fixed version
@@ -109,19 +180,69 @@ rules:
         - ["8.0.36-mock"]
 ```
 
+For common fault injection, `response.profile` can expand to MySQL-like errors
+or disconnect behavior. Supported profiles are `deadlock`,
+`lock_wait_timeout`, `duplicate_key`, `foreign_key_violation`, and
+`disconnect`.
+
+Unsupported query diagnostics include raw SQL, normalized SQL, connection ID,
+current database, route stage, and a generated rule snippet. Query events can
+also be written as stable JSON for golden-file tests.
+
+See [docs/rules-and-diagnostics.md](docs/rules-and-diagnostics.md) for rule,
+logging, unsupported-query, and snapshot details.
+
+## Compatibility Notes
+
+Built-in compatibility handlers cover common MySQL client and ORM setup queries,
+including `SET NAMES`, `SET autocommit`, `SELECT VERSION()`, `SELECT @@...`,
+`SHOW VARIABLES`, `SHOW TABLES`, and a small `information_schema` subset.
+
+Built-in scalar compatibility functions include `DATABASE()`, `SCHEMA()`,
+`USER()`, `CURRENT_USER()`, `CONNECTION_ID()`, `LAST_INSERT_ID()`, and
+`ROW_COUNT()`.
+
+`information_schema.schemata`, `tables`, `columns`, `key_column_usage`,
+`statistics`, `table_constraints`, and `referential_constraints` are available
+as a small metadata subset derived from the SQLite schema.
+
+Schema and query fallback translate `TRUE`, `FALSE`, `NOW()`,
+`CURRENT_TIMESTAMP()`, `AUTO_INCREMENT`, TiDB `AUTO_RANDOM`, common MySQL and
+TiDB DDL options, table-level `PRIMARY KEY` / `UNIQUE KEY` / `KEY` definitions,
+and simple MySQL index DDL into SQLite-compatible SQL where possible.
+
+The SQLite fallback also handles common MySQL repository-test syntax such as
+`INSERT ... ON DUPLICATE KEY UPDATE` with `VALUES(column)` and insert-side
+`DEFAULT` values. It also strips `FOR UPDATE` locking clauses, including
+`NOWAIT` and `SKIP LOCKED`. mysqlmock does not emulate real MySQL row locks.
+
 ## CLI
 
+From an installed CLI:
+
 ```sh
-go run ./cmd/mysqlmock serve --config testdb.yaml --listen 127.0.0.1:0 --print-dsn
-go run ./cmd/mysqlmock serve --config testdb.yaml --verbose --log-format json
-go run ./cmd/mysqlmock check --config testdb.yaml
+mysqlmock serve --config testdb.yaml --listen 127.0.0.1:0 --print-dsn
+mysqlmock serve --config testdb.yaml --verbose --log-format json
+mysqlmock serve --config testdb.yaml --fail-on-unsupported
+mysqlmock check --config testdb.yaml
+mysqlmock dump-unsupported-template
+mysqlmock dump-config-schema
 ```
 
-Use `serve --fail-on-unsupported` to exit with an error after shutdown if the
-server observed unsupported SQL. The error includes generated rule snippets that
-can be copied into the config and adjusted. Unsupported query diagnostics include
-the raw SQL, normalized SQL, connection ID, current database, and route stage.
-Use `--verbose --log-format=json` to emit route-aware query logs as JSON Lines.
+From a source checkout, replace `mysqlmock` with `go run ./cmd/mysqlmock`.
+
+Use `serve --fail-on-unsupported` to exit with an error when the server observes
+unsupported SQL. Use `--verbose --log-format=json` to emit route-aware query
+logs as JSON Lines. Use `dump-config-schema` to print a JSON Schema for config
+files.
+
+## Documentation
+
+- [Configuration Reference](docs/configuration.md)
+- [Rules and Diagnostics](docs/rules-and-diagnostics.md)
+- [Architecture](ARCHITECTURE.md)
+- [Basic Example](examples/basic)
+- [Japanese README](README_ja.md)
 
 ## Development
 
@@ -132,12 +253,32 @@ make test
 make build
 ```
 
+Set `MYSQLMOCK_REAL_MYSQL_DSN` to run the optional compatibility scenario that
+compares a small CRUD, transaction, and duplicate-key workflow against a real
+MySQL database:
+
+```sh
+MYSQLMOCK_REAL_MYSQL_DSN='user:password@tcp(127.0.0.1:3306)/testdb?parseTime=true' \
+  go test ./pkg/mysqlmock -run TestRealMySQLCompatibilityScenario
+```
+
+Set `MYSQLMOCK_CLIENT_COMPAT_COMMANDS` to a JSON array of external client
+commands to run opt-in compatibility checks for other languages. Each command is
+run without a shell and receives `MYSQLMOCK_HOST`, `MYSQLMOCK_PORT`,
+`MYSQLMOCK_USER`, `MYSQLMOCK_PASSWORD`, `MYSQLMOCK_DATABASE`, `MYSQLMOCK_ADDR`,
+and `MYSQLMOCK_DSN` in its environment.
+
 ## Known Limitations
 
 - Prepared statement support does not aim to cover every MySQL binary protocol
   type yet.
 - `SET NAMES` records connection character set variables but does not transcode
   query or result data.
-- No TLS, compression, `multiStatements=true`, or `LOAD DATA LOCAL INFILE`.
-- MySQL-specific SQL compatibility is intentionally small and will be expanded
+- TLS, compression, `multiStatements=true`, and `LOAD DATA LOCAL INFILE` are
+  not supported.
+- MySQL-specific SQL compatibility is intentionally small and should be expanded
   from real unsupported-query reports.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

@@ -8,6 +8,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/mayahiro/mysqlmock/pkg/mysqlmock"
 )
@@ -32,13 +33,16 @@ func run(args []string) error {
 	case "dump-unsupported-template":
 		fmt.Println(mysqlmock.UnsupportedTemplate())
 		return nil
+	case "dump-config-schema":
+		fmt.Println(string(mysqlmock.ConfigSchemaJSON()))
+		return nil
 	default:
 		return usage()
 	}
 }
 
 func usage() error {
-	return fmt.Errorf("usage: mysqlmock <serve|check|dump-unsupported-template> [options]")
+	return fmt.Errorf("usage: mysqlmock <serve|check|dump-unsupported-template|dump-config-schema> [options]")
 }
 
 func serve(args []string) error {
@@ -83,11 +87,7 @@ func serve(args []string) error {
 		fmt.Println(server.DSN())
 	}
 
-	<-ctx.Done()
-	if *failOnUnsupported {
-		return unsupportedQueriesError(server.Unsupported())
-	}
-	return nil
+	return waitForServeStop(ctx, server, *failOnUnsupported, 100*time.Millisecond)
 }
 
 func check(args []string) error {
@@ -130,4 +130,27 @@ func unsupportedQueriesError(queries []mysqlmock.UnsupportedQuery) error {
 		fmt.Fprintf(&b, "\n%s", query.Suggestion)
 	}
 	return fmt.Errorf("%s", b.String())
+}
+
+func waitForServeStop(ctx context.Context, server *mysqlmock.Server, failOnUnsupported bool, checkInterval time.Duration) error {
+	if !failOnUnsupported {
+		<-ctx.Done()
+		return nil
+	}
+	if checkInterval <= 0 {
+		checkInterval = 100 * time.Millisecond
+	}
+
+	ticker := time.NewTicker(checkInterval)
+	defer ticker.Stop()
+	for {
+		if err := unsupportedQueriesError(server.Unsupported()); err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return unsupportedQueriesError(server.Unsupported())
+		case <-ticker.C:
+		}
+	}
 }

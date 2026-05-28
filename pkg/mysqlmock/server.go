@@ -9,6 +9,8 @@ import (
 	"io"
 	"net"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -85,6 +87,7 @@ type Server struct {
 
 	mu           sync.Mutex
 	unsupported  []UnsupportedQuery
+	queries      []QueryEvent
 	ruleOnceUsed map[int]bool
 }
 
@@ -99,7 +102,8 @@ type UnsupportedQuery struct {
 	Suggestion    string
 }
 
-type queryLogEvent struct {
+// QueryEvent records one query routed by the server.
+type QueryEvent struct {
 	Event         string `json:"event"`
 	ConnectionID  uint32 `json:"connection_id"`
 	Command       string `json:"command"`
@@ -239,6 +243,16 @@ func (s *Server) Unsupported() []UnsupportedQuery {
 	return out
 }
 
+// Queries returns a snapshot of query events observed by the server.
+func (s *Server) Queries() []QueryEvent {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	out := make([]QueryEvent, len(s.queries))
+	copy(out, s.queries)
+	return out
+}
+
 // Reset drops all current SQLite objects, reapplies schema and seed data, and clears diagnostics.
 func (s *Server) Reset(ctx context.Context) error {
 	if s.keepConn == nil {
@@ -250,6 +264,7 @@ func (s *Server) Reset(ctx context.Context) error {
 
 	s.mu.Lock()
 	s.unsupported = nil
+	s.queries = nil
 	s.ruleOnceUsed = nil
 	s.mu.Unlock()
 	return nil
@@ -301,6 +316,16 @@ func (s *Server) handleNetConn(conn net.Conn) {
 		return
 	}
 	defer sqliteConn.Close()
+	if _, err := sqliteConn.ExecContext(ctx, "PRAGMA foreign_keys = ON"); err != nil {
+		s.logf("sqlite connection initialization error: %v", err)
+		return
+	}
+	if s.usesPrivateMemoryDB() {
+		if err := s.resetBackend(ctx, sqliteConn); err != nil {
+			s.logf("sqlite connection initialization error: %v", err)
+			return
+		}
+	}
 
 	c := &mysqlConn{
 		netConn:                conn,
@@ -348,7 +373,7 @@ func (s *Server) openBackend(ctx context.Context) error {
 		_ = s.closeBackend()
 		return err
 	}
-	if err := s.applySeed(ctx, keepConn); err != nil {
+	if err := s.applySeed(ctx, keepConn, s.cfg.Seed); err != nil {
 		_ = s.closeBackend()
 		return err
 	}
@@ -374,30 +399,109 @@ func (s *Server) sqliteDSN() string {
 	if s.cfg.Backend.Mode == "file" {
 		return s.cfg.Backend.Path
 	}
+	if s.usesPrivateMemoryDB() {
+		return ":memory:"
+	}
 	return fmt.Sprintf("file:mysqlmock_%p?mode=memory&cache=shared", s)
 }
 
+func (s *Server) usesPrivateMemoryDB() bool {
+	return s.cfg.Backend.Mode == "memory" && !s.cfg.Backend.Shared
+}
+
 func (s *Server) applySchema(ctx context.Context, conn *sql.Conn) error {
+	for _, path := range s.cfg.SchemaFiles {
+		statements, err := s.loadSchemaFileStatements(path)
+		if err != nil {
+			return err
+		}
+		for _, stmt := range statements {
+			if err := s.applySchemaStatement(ctx, conn, stmt); err != nil {
+				return err
+			}
+		}
+	}
 	for _, stmt := range s.cfg.Schema {
 		if strings.TrimSpace(stmt) == "" {
 			continue
 		}
-		if _, err := conn.ExecContext(ctx, stmt); err != nil {
+		if err := s.applySchemaStatement(ctx, conn, stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) loadSchemaFileStatements(path string) ([]string, error) {
+	resolved := path
+	if !filepath.IsAbs(resolved) {
+		baseDir := s.cfg.schemaBaseDir
+		if baseDir == "" {
+			baseDir = "."
+		}
+		resolved = filepath.Join(baseDir, path)
+	}
+	data, err := os.ReadFile(resolved)
+	if err != nil {
+		return nil, fmt.Errorf("read schema file %s: %w", path, err)
+	}
+	return schemaStatementsFromDump(string(data)), nil
+}
+
+func (s *Server) applySchemaStatement(ctx context.Context, conn *sql.Conn, stmt string) error {
+	for _, translated := range translateSQLStatements(stmt) {
+		if strings.TrimSpace(translated) == "" {
+			continue
+		}
+		if _, err := conn.ExecContext(ctx, translated); err != nil {
 			return fmt.Errorf("apply schema: %w", err)
 		}
 	}
 	return nil
 }
 
-func (s *Server) applySeed(ctx context.Context, conn *sql.Conn) error {
-	tables := make([]string, 0, len(s.cfg.Seed))
-	for table := range s.cfg.Seed {
+func (s *Server) applySeed(ctx context.Context, conn *sql.Conn, seed map[string][]map[string]any) error {
+	for _, path := range s.cfg.SeedFiles {
+		loaded, err := s.loadSeedFile(path)
+		if err != nil {
+			return err
+		}
+		if err := s.applySeedRows(ctx, conn, loaded); err != nil {
+			return err
+		}
+	}
+	return s.applySeedRows(ctx, conn, seed)
+}
+
+func (s *Server) loadSeedFile(path string) (map[string][]map[string]any, error) {
+	resolved := path
+	if !filepath.IsAbs(resolved) {
+		baseDir := s.cfg.schemaBaseDir
+		if baseDir == "" {
+			baseDir = "."
+		}
+		resolved = filepath.Join(baseDir, path)
+	}
+	data, err := os.ReadFile(resolved)
+	if err != nil {
+		return nil, fmt.Errorf("read seed file %s: %w", path, err)
+	}
+	seed, err := decodeSeedFile(resolved, data)
+	if err != nil {
+		return nil, fmt.Errorf("read seed file %s: %w", path, err)
+	}
+	return seed, nil
+}
+
+func (s *Server) applySeedRows(ctx context.Context, conn *sql.Conn, seed map[string][]map[string]any) error {
+	tables := make([]string, 0, len(seed))
+	for table := range seed {
 		tables = append(tables, table)
 	}
 	sort.Strings(tables)
 
 	for _, table := range tables {
-		for _, row := range s.cfg.Seed[table] {
+		for _, row := range seed[table] {
 			if len(row) == 0 {
 				continue
 			}
@@ -427,19 +531,44 @@ func (s *Server) resetBackend(ctx context.Context, conn *sql.Conn) error {
 	if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys = OFF"); err != nil {
 		return fmt.Errorf("disable foreign keys for reset: %w", err)
 	}
-	if err := s.dropSQLiteObjects(ctx, conn); err != nil {
+	if err := withSQLiteTransaction(ctx, conn, "reset drop", func() error {
+		return s.dropSQLiteObjects(ctx, conn)
+	}); err != nil {
 		_, _ = conn.ExecContext(ctx, "PRAGMA foreign_keys = ON")
 		return err
 	}
 	if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys = ON"); err != nil {
 		return fmt.Errorf("enable foreign keys for reset: %w", err)
 	}
-	if err := s.applySchema(ctx, conn); err != nil {
+	return withSQLiteTransaction(ctx, conn, "reset setup", func() error {
+		if err := s.applySchema(ctx, conn); err != nil {
+			return err
+		}
+		if err := s.applySeed(ctx, conn, s.cfg.Seed); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+func withSQLiteTransaction(ctx context.Context, conn *sql.Conn, label string, fn func() error) (err error) {
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return fmt.Errorf("begin %s transaction: %w", label, err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		}
+	}()
+
+	if err := fn(); err != nil {
 		return err
 	}
-	if err := s.applySeed(ctx, conn); err != nil {
-		return err
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return fmt.Errorf("commit %s transaction: %w", label, err)
 	}
+	committed = true
 	return nil
 }
 
@@ -520,12 +649,12 @@ func (s *Server) recordUnsupported(u UnsupportedQuery) {
 	if u.Command == "" {
 		u.Command = "COM_QUERY"
 	}
-	u.Suggestion = suggestedRule(u.SQL, s.cfg.Fallback.Unsupported)
+	u.Suggestion = s.suggestedRule(u)
 
 	s.mu.Lock()
 	s.unsupported = append(s.unsupported, u)
 	s.mu.Unlock()
-	s.logQuery(queryLogEvent{
+	s.logQuery(QueryEvent{
 		Event:         "query",
 		ConnectionID:  u.ConnectionID,
 		Command:       u.Command,
@@ -555,12 +684,17 @@ func (s *Server) logf(format string, args ...any) {
 	fmt.Fprintln(s.logWriter, message)
 }
 
-func (s *Server) logQuery(event queryLogEvent) {
-	if s.logWriter == nil {
-		return
-	}
+func (s *Server) logQuery(event QueryEvent) {
 	if event.Event == "" {
 		event.Event = "query"
+	}
+
+	s.mu.Lock()
+	s.queries = append(s.queries, event)
+	s.mu.Unlock()
+
+	if s.logWriter == nil {
+		return
 	}
 
 	s.logMu.Lock()

@@ -1,23 +1,33 @@
 package mysqlmock
 
 import (
+	"bytes"
+	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"go.yaml.in/yaml/v4"
 )
 
 // Config describes a mysqlmock server instance.
 type Config struct {
-	Version  int                         `yaml:"version"`
-	Server   ServerConfig                `yaml:"server"`
-	Backend  DatabaseConfig              `yaml:"database"`
-	Schema   []string                    `yaml:"schema"`
-	Seed     map[string][]map[string]any `yaml:"seed"`
-	Compat   CompatConfig                `yaml:"compat"`
-	Rules    []RuleConfig                `yaml:"rules"`
-	Fallback FallbackConfig              `yaml:"fallback"`
+	Version     int                         `yaml:"version"`
+	Server      ServerConfig                `yaml:"server"`
+	Backend     DatabaseConfig              `yaml:"database"`
+	SchemaFiles []string                    `yaml:"schema_files"`
+	Schema      []string                    `yaml:"schema"`
+	SeedFiles   []string                    `yaml:"seed_files"`
+	Seed        map[string][]map[string]any `yaml:"seed"`
+	Compat      CompatConfig                `yaml:"compat"`
+	Rules       []RuleConfig                `yaml:"rules"`
+	Fallback    FallbackConfig              `yaml:"fallback"`
+
+	schemaBaseDir string
 }
 
 // ServerConfig contains listener and MySQL compatibility settings.
@@ -43,6 +53,7 @@ type DatabaseConfig struct {
 
 // CompatConfig contains built-in MySQL compatibility values.
 type CompatConfig struct {
+	Profile   string            `yaml:"profile"`
 	Variables map[string]string `yaml:"variables"`
 }
 
@@ -76,6 +87,7 @@ type RuleRequestConfig struct {
 
 // RuleResponseConfig describes the response returned by a matching rule.
 type RuleResponseConfig struct {
+	Profile      string             `yaml:"profile"`
 	Type         string             `yaml:"type"`
 	Columns      []RuleColumnConfig `yaml:"columns"`
 	RowFormat    string             `yaml:"row_format"`
@@ -116,6 +128,7 @@ func DefaultConfig() Config {
 		},
 		Seed: map[string][]map[string]any{},
 		Compat: CompatConfig{
+			Profile: "default",
 			Variables: map[string]string{
 				"autocommit":               "1",
 				"character_set_client":     "utf8mb4",
@@ -143,23 +156,136 @@ func DefaultConfig() Config {
 
 // LoadConfigFile reads a YAML mysqlmock config file.
 func LoadConfigFile(path string) (Config, error) {
-	f, err := os.Open(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return Config{}, err
 	}
-	defer f.Close()
+	var topLevel map[string]any
+	if err := yaml.Unmarshal(data, &topLevel); err != nil {
+		return Config{}, err
+	}
+	if err := validateRequiredConfigFields(topLevel); err != nil {
+		return Config{}, err
+	}
 
 	cfg := DefaultConfig()
-	dec := yaml.NewDecoder(f)
+	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	if err := dec.Decode(&cfg); err != nil {
 		return Config{}, err
 	}
 	cfg.applyDefaults()
+	cfg.schemaBaseDir = filepath.Dir(path)
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil
+}
+
+func decodeSeedFile(path string, data []byte) (map[string][]map[string]any, error) {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".yaml", ".yml", "":
+		return decodeYAMLSeedFile(data)
+	case ".json":
+		return decodeJSONSeedFile(data)
+	case ".csv":
+		return decodeCSVSeedFile(path, data)
+	default:
+		return nil, fmt.Errorf("unsupported seed file extension: %s", filepath.Ext(path))
+	}
+}
+
+func decodeYAMLSeedFile(data []byte) (map[string][]map[string]any, error) {
+	var wrapped struct {
+		Seed map[string][]map[string]any `yaml:"seed" json:"seed"`
+	}
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(&wrapped); err == nil && wrapped.Seed != nil {
+		return wrapped.Seed, nil
+	}
+
+	var seed map[string][]map[string]any
+	dec = yaml.NewDecoder(bytes.NewReader(data))
+	if err := dec.Decode(&seed); err != nil {
+		return nil, err
+	}
+	if seed == nil {
+		seed = map[string][]map[string]any{}
+	}
+	return seed, nil
+}
+
+func decodeJSONSeedFile(data []byte) (map[string][]map[string]any, error) {
+	var wrapped struct {
+		Seed map[string][]map[string]any `yaml:"seed" json:"seed"`
+	}
+	if err := json.Unmarshal(data, &wrapped); err == nil && wrapped.Seed != nil {
+		return wrapped.Seed, nil
+	}
+
+	var seed map[string][]map[string]any
+	if err := json.Unmarshal(data, &seed); err != nil {
+		return nil, err
+	}
+	if seed == nil {
+		seed = map[string][]map[string]any{}
+	}
+	return seed, nil
+}
+
+func decodeCSVSeedFile(path string, data []byte) (map[string][]map[string]any, error) {
+	tableName := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	if tableName == "" {
+		return nil, errors.New("CSV seed file name must include a table name")
+	}
+
+	reader := csv.NewReader(bytes.NewReader(data))
+	header, err := reader.Read()
+	if err != nil {
+		return nil, err
+	}
+	if len(header) == 0 {
+		return nil, errors.New("CSV seed file header is empty")
+	}
+	header[0] = strings.TrimPrefix(header[0], "\ufeff")
+	for i, name := range header {
+		header[i] = strings.TrimSpace(name)
+		if header[i] == "" {
+			return nil, fmt.Errorf("CSV seed file has empty column name at position %d", i+1)
+		}
+	}
+
+	rows := []map[string]any{}
+	for {
+		record, err := reader.Read()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		row := map[string]any{}
+		for i, value := range record {
+			if value == `\N` {
+				row[header[i]] = nil
+				continue
+			}
+			row[header[i]] = value
+		}
+		rows = append(rows, row)
+	}
+	return map[string][]map[string]any{tableName: rows}, nil
+}
+
+func validateRequiredConfigFields(topLevel map[string]any) error {
+	for _, field := range []string{"version", "server", "database"} {
+		value, ok := topLevel[field]
+		if !ok || value == nil {
+			return fmt.Errorf("%s is required", field)
+		}
+	}
+	return nil
 }
 
 func (c *Config) applyDefaults() {
@@ -203,6 +329,11 @@ func (c *Config) applyDefaults() {
 	if c.Seed == nil {
 		c.Seed = map[string][]map[string]any{}
 	}
+	if c.Compat.Profile == "" {
+		c.Compat.Profile = def.Compat.Profile
+	} else {
+		c.Compat.Profile = normalizeCompatProfile(c.Compat.Profile)
+	}
 	if c.Compat.Variables == nil {
 		c.Compat.Variables = map[string]string{}
 	}
@@ -211,11 +342,13 @@ func (c *Config) applyDefaults() {
 			c.Compat.Variables[k] = v
 		}
 	}
+	applyCompatProfile(c.Compat.Profile, c.Compat.Variables)
 	c.Compat.Variables["version"] = c.Server.MySQLVersion
 	for i := range c.Rules {
 		if c.Rules[i].Request.Match == "" {
 			c.Rules[i].Request.Match = "exact"
 		}
+		applyRuleResponseProfile(&c.Rules[i].Response)
 		if c.Rules[i].Response.Type == "error" {
 			if c.Rules[i].Response.Code == 0 {
 				c.Rules[i].Response.Code = mysqlErrUnknown
@@ -240,6 +373,9 @@ func (c Config) Validate() error {
 	}
 	if c.Backend.Engine != "sqlite" {
 		return fmt.Errorf("unsupported database engine: %s", c.Backend.Engine)
+	}
+	if _, ok := lookupCompatProfile(c.Compat.Profile); !ok {
+		return fmt.Errorf("unsupported compat profile: %s", c.Compat.Profile)
 	}
 	switch c.Backend.Mode {
 	case "memory":
@@ -277,4 +413,52 @@ func (c Config) Validate() error {
 		}
 	}
 	return nil
+}
+
+type compatProfile struct {
+	Variables map[string]string
+}
+
+var compatProfiles = map[string]compatProfile{
+	"default": {},
+	"gorm": {
+		Variables: map[string]string{
+			"character_set_server":   "utf8mb4",
+			"collation_server":       "utf8mb4_0900_ai_ci",
+			"foreign_key_checks":     "1",
+			"lower_case_table_names": "0",
+			"sql_auto_is_null":       "0",
+			"system_time_zone":       "UTC",
+			"time_zone":              "SYSTEM",
+			"transaction_read_only":  "0",
+			"tx_isolation":           "READ-COMMITTED",
+			"tx_read_only":           "0",
+			"unique_checks":          "1",
+		},
+	},
+}
+
+func applyCompatProfile(name string, variables map[string]string) {
+	profile, ok := lookupCompatProfile(name)
+	if !ok {
+		return
+	}
+	for k, v := range profile.Variables {
+		if _, ok := variables[k]; !ok {
+			variables[k] = v
+		}
+	}
+}
+
+func lookupCompatProfile(name string) (compatProfile, bool) {
+	profile, ok := compatProfiles[normalizeCompatProfile(name)]
+	return profile, ok
+}
+
+func normalizeCompatProfile(name string) string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "" {
+		return "default"
+	}
+	return name
 }

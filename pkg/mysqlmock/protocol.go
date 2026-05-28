@@ -53,13 +53,20 @@ const (
 	fieldTypeTime      byte = 0x0b
 	fieldTypeDateTime  byte = 0x0c
 	fieldTypeYear      byte = 0x0d
+	fieldTypeNewDate   byte = 0x0e
 	fieldTypeVarChar   byte = 0x0f
 	fieldTypeBit       byte = 0x10
 	fieldTypeJSON      byte = 0xf5
 	fieldTypeNewDec    byte = 0xf6
+	fieldTypeEnum      byte = 0xf7
+	fieldTypeSet       byte = 0xf8
+	fieldTypeTinyBlob  byte = 0xf9
+	fieldTypeMedBlob   byte = 0xfa
+	fieldTypeLongBlob  byte = 0xfb
+	fieldTypeBlob      byte = 0xfc
 	fieldTypeVarString byte = 0xfd
 	fieldTypeString    byte = 0xfe
-	fieldTypeBlob      byte = 0xfc
+	fieldTypeGeometry  byte = 0xff
 
 	mysqlErrUnknown      uint16 = 1105
 	mysqlErrNoSuchTable  uint16 = 1146
@@ -74,6 +81,7 @@ type mysqlConn struct {
 	sqliteConn   *sql.Conn
 	server       *Server
 	connectionID uint32
+	user         string
 	clientCaps   uint32
 	statusFlags  uint16
 	currentDB    string
@@ -82,6 +90,9 @@ type mysqlConn struct {
 	characterSetConnection string
 	characterSetResults    string
 	collationConnection    string
+
+	lastInsertID     uint64
+	lastAffectedRows int64
 
 	nextStatementID uint32
 	statements      map[uint32]*preparedStatement
@@ -201,6 +212,7 @@ func (c *mysqlConn) readHandshakeResponse(payload []byte) error {
 	if userEnd < 0 {
 		return nil
 	}
+	c.user = string(payload[pos : pos+userEnd])
 	pos += userEnd + 1
 
 	if c.clientCaps&clientSecureConnection != 0 {
@@ -278,8 +290,10 @@ func (c *mysqlConn) handleQuery(ctx context.Context, sqlText string) error {
 
 	switch v := resp.(type) {
 	case okResult:
+		c.recordResult(v)
 		return c.writeOK(1, v)
 	case resultSet:
+		c.recordResult(v)
 		return c.writeResultSet(1, v)
 	default:
 		return c.writeErr(1, errPacket(mysqlErrUnknown, "HY000", "Unsupported query response"))
@@ -309,6 +323,27 @@ func (c *mysqlConn) executeQuery(ctx context.Context, command, sqlText string, a
 	case upper == "SELECT VERSION()" || upper == "SELECT VERSION":
 		c.logQuery(command, "compat", sqlText, normalized)
 		return oneRow("VERSION()", c.server.cfg.Server.MySQLVersion), nil
+	case upper == "SELECT DATABASE()":
+		c.logQuery(command, "compat", sqlText, normalized)
+		return oneRow("DATABASE()", c.currentDB), nil
+	case upper == "SELECT SCHEMA()":
+		c.logQuery(command, "compat", sqlText, normalized)
+		return oneRow("SCHEMA()", c.currentDB), nil
+	case upper == "SELECT USER()":
+		c.logQuery(command, "compat", sqlText, normalized)
+		return oneRow("USER()", c.currentUser()), nil
+	case upper == "SELECT CURRENT_USER()" || upper == "SELECT CURRENT_USER":
+		c.logQuery(command, "compat", sqlText, normalized)
+		return oneRow("CURRENT_USER()", c.currentUser()), nil
+	case upper == "SELECT CONNECTION_ID()":
+		c.logQuery(command, "compat", sqlText, normalized)
+		return oneRow("CONNECTION_ID()", c.connectionID), nil
+	case upper == "SELECT LAST_INSERT_ID()":
+		c.logQuery(command, "compat", sqlText, normalized)
+		return oneRow("LAST_INSERT_ID()", c.lastInsertID), nil
+	case upper == "SELECT ROW_COUNT()":
+		c.logQuery(command, "compat", sqlText, normalized)
+		return oneRow("ROW_COUNT()", c.lastAffectedRows), nil
 	case upper == "SELECT @@VERSION" || upper == "SELECT @@SESSION.VERSION" || upper == "SELECT @@GLOBAL.VERSION":
 		c.logQuery(command, "compat", sqlText, normalized)
 		return oneRow("@@version", c.server.cfg.Server.MySQLVersion), nil
@@ -320,6 +355,9 @@ func (c *mysqlConn) executeQuery(ctx context.Context, command, sqlText string, a
 	case upper == "SHOW TABLES":
 		c.logQuery(command, "compat", sqlText, normalized)
 		return c.showTables(ctx)
+	case isInformationSchemaQuery(upper):
+		c.logQuery(command, "compat", sqlText, normalized)
+		return c.queryInformationSchema(ctx, trimmed, args...)
 	case upper == "BEGIN" || upper == "START TRANSACTION":
 		c.logQuery(command, "sqlite", sqlText, normalized)
 		return c.execSQLite(ctx, "BEGIN")
@@ -346,7 +384,12 @@ func (c *mysqlConn) executeQuery(ctx context.Context, command, sqlText string, a
 	}
 	if isWriteQuery(upper) {
 		c.logQuery(command, "sqlite", sqlText, normalized)
-		return c.execSQLite(ctx, translateSQL(trimmed), args...)
+		if strings.HasPrefix(upper, "INSERT ") {
+			if resp, handled, err := c.execMySQLUpsert(ctx, trimmed, args...); handled || err != nil {
+				return resp, err
+			}
+		}
+		return c.execSQLiteStatements(ctx, translateSQLStatements(trimmed), args...)
 	}
 
 	c.recordUnsupported(command, sqlText, normalized, "unsupported")
@@ -496,6 +539,43 @@ func (c *mysqlConn) execSQLite(ctx context.Context, query string, args ...any) (
 	affected, _ := res.RowsAffected()
 	lastID, _ := res.LastInsertId()
 	return okResult{AffectedRows: uint64NonNegative(affected), LastInsertID: uint64NonNegative(lastID)}, nil
+}
+
+func (c *mysqlConn) execSQLiteStatements(ctx context.Context, queries []string, args ...any) (okResult, error) {
+	if len(queries) == 0 {
+		return okResult{}, nil
+	}
+	if len(queries) == 1 {
+		return c.execSQLite(ctx, queries[0], args...)
+	}
+	if len(args) > 0 {
+		return okResult{}, errPacket(mysqlErrUnknown, "HY000", "Unsupported parameterized multi-statement translation")
+	}
+
+	var result okResult
+	for _, query := range queries {
+		if strings.TrimSpace(query) == "" {
+			continue
+		}
+		next, err := c.execSQLite(ctx, query)
+		if err != nil {
+			return okResult{}, err
+		}
+		result = next
+	}
+	return result, nil
+}
+
+func (c *mysqlConn) recordResult(resp any) {
+	switch v := resp.(type) {
+	case okResult:
+		c.lastAffectedRows = int64(v.AffectedRows)
+		if v.LastInsertID != 0 {
+			c.lastInsertID = v.LastInsertID
+		}
+	case resultSet:
+		c.lastAffectedRows = -1
+	}
 }
 
 func (c *mysqlConn) querySQLite(ctx context.Context, query string, args ...any) (resultSet, error) {
@@ -650,6 +730,14 @@ func (c *mysqlConn) writePacket(seq byte, payload []byte) error {
 	}
 	_, err := c.netConn.Write(payload)
 	return err
+}
+
+func (c *mysqlConn) currentUser() string {
+	user := c.user
+	if user == "" {
+		user = "mysqlmock"
+	}
+	return user + "@%"
 }
 
 func oneRow(name string, value any) resultSet {
@@ -828,7 +916,15 @@ func isWriteQuery(upper string) bool {
 	return strings.HasPrefix(upper, "INSERT ") ||
 		strings.HasPrefix(upper, "UPDATE ") ||
 		strings.HasPrefix(upper, "DELETE ") ||
-		strings.HasPrefix(upper, "REPLACE ")
+		strings.HasPrefix(upper, "REPLACE ") ||
+		strings.HasPrefix(upper, "CREATE TABLE ") ||
+		strings.HasPrefix(upper, "CREATE TEMPORARY TABLE ") ||
+		strings.HasPrefix(upper, "CREATE TEMP TABLE ") ||
+		strings.HasPrefix(upper, "CREATE INDEX ") ||
+		strings.HasPrefix(upper, "CREATE UNIQUE INDEX ") ||
+		strings.HasPrefix(upper, "ALTER TABLE ") ||
+		strings.HasPrefix(upper, "DROP TABLE ") ||
+		strings.HasPrefix(upper, "DROP INDEX ")
 }
 
 func normalizeSQL(sqlText string) string {
@@ -850,17 +946,475 @@ func unquoteSQLWord(value string) string {
 }
 
 func translateSQL(sqlText string) string {
-	replacer := strings.NewReplacer(
-		"CURRENT_TIMESTAMP()", "CURRENT_TIMESTAMP",
-		"current_timestamp()", "CURRENT_TIMESTAMP",
-		"NOW()", "CURRENT_TIMESTAMP",
-		"now()", "CURRENT_TIMESTAMP",
-	)
-	return replacer.Replace(sqlText)
+	if stripped, ok := stripMySQLLockingClause(sqlText); ok {
+		sqlText = stripped
+	}
+
+	if translated, ok := translateMySQLAlterTableAddIndex(sqlText); ok {
+		return translated
+	}
+
+	var out strings.Builder
+	out.Grow(len(sqlText))
+	stripDDLMode := stripsMySQLDDLOptions(sqlText)
+
+	for i := 0; i < len(sqlText); {
+		if copyEnd, ok := quotedSQLSpan(sqlText, i); ok {
+			out.WriteString(sqlText[i:copyEnd])
+			i = copyEnd
+			continue
+		}
+		if copyEnd, ok := sqlCommentSpan(sqlText, i); ok {
+			if replacement, handled := translateTiDBDDLComment(sqlText[i:copyEnd]); stripDDLMode && handled {
+				out.WriteString(replacement)
+				i = copyEnd
+				continue
+			}
+			out.WriteString(sqlText[i:copyEnd])
+			i = copyEnd
+			continue
+		}
+		if isSQLIdentifierStart(sqlText[i]) {
+			start := i
+			i++
+			for i < len(sqlText) && isSQLIdentifierPart(sqlText[i]) {
+				i++
+			}
+			ident := sqlText[start:i]
+			upper := strings.ToUpper(ident)
+			switch upper {
+			case "TRUE":
+				out.WriteByte('1')
+			case "FALSE":
+				out.WriteByte('0')
+			case "AUTO_INCREMENT":
+				if next := consumeMySQLAssignedOptionValue(sqlText, i); stripDDLMode && next >= 0 {
+					i = next
+				} else {
+					out.WriteString("AUTOINCREMENT")
+				}
+			case "AUTO_RANDOM":
+				if stripDDLMode {
+					if next := consumeOptionalParenthesizedCall(sqlText, i); next >= 0 {
+						i = next
+					}
+					out.WriteString("AUTOINCREMENT")
+				} else {
+					out.WriteString(ident)
+				}
+			case "UNSIGNED":
+				if !stripDDLMode {
+					out.WriteString(ident)
+				}
+			case "CLUSTERED", "NONCLUSTERED":
+				if !stripDDLMode {
+					out.WriteString(ident)
+				}
+			case "AUTO_RANDOM_BASE":
+				if next := consumeMySQLAssignedOptionValue(sqlText, i); stripDDLMode && next >= 0 {
+					i = next
+				} else {
+					out.WriteString(ident)
+				}
+			case "ENGINE", "CHARSET", "COLLATE", "COMMENT", "USING",
+				"AVG_ROW_LENGTH", "CHECKSUM", "DELAY_KEY_WRITE", "INSERT_METHOD",
+				"KEY_BLOCK_SIZE", "MAX_ROWS", "MIN_ROWS", "PACK_KEYS",
+				"ROW_FORMAT", "STATS_AUTO_RECALC", "STATS_PERSISTENT":
+				if next := consumeMySQLOptionValue(sqlText, i); stripDDLMode && next >= 0 {
+					i = next
+				} else {
+					out.WriteString(ident)
+				}
+			case "ON":
+				if next := consumeOnUpdateOption(sqlText, i); stripDDLMode && next >= 0 {
+					i = next
+				} else {
+					out.WriteString(ident)
+				}
+			case "CHARACTER":
+				if next := consumeCharacterSetOption(sqlText, i); stripDDLMode && next >= 0 {
+					i = next
+				} else {
+					out.WriteString(ident)
+				}
+			case "DEFAULT":
+				if next := consumeDefaultCharsetOption(sqlText, i); stripDDLMode && next >= 0 {
+					i = next
+				} else {
+					out.WriteString(ident)
+				}
+			case "NOW", "CURRENT_TIMESTAMP":
+				if next := consumeCurrentTimestampCall(sqlText, i); next >= 0 {
+					out.WriteString("CURRENT_TIMESTAMP")
+					i = next
+				} else {
+					out.WriteString(ident)
+				}
+			default:
+				out.WriteString(ident)
+			}
+			continue
+		}
+		out.WriteByte(sqlText[i])
+		i++
+	}
+	return out.String()
+}
+
+func stripsMySQLDDLOptions(sqlText string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(sqlText))
+	return strings.HasPrefix(upper, "CREATE TABLE ") ||
+		strings.HasPrefix(upper, "CREATE TEMPORARY TABLE ") ||
+		strings.HasPrefix(upper, "CREATE TEMP TABLE ") ||
+		strings.HasPrefix(upper, "CREATE INDEX ") ||
+		strings.HasPrefix(upper, "CREATE UNIQUE INDEX ")
+}
+
+func translateMySQLAlterTableAddIndex(sqlText string) (string, bool) {
+	pos := skipSQLSpaces(sqlText, 0)
+	if !consumeKeyword(sqlText, &pos, "ALTER") || !consumeKeyword(sqlText, &pos, "TABLE") {
+		return "", false
+	}
+	tableName, pos, ok := readSQLNameToken(sqlText, pos)
+	if !ok || !consumeKeyword(sqlText, &pos, "ADD") {
+		return "", false
+	}
+
+	unique := consumeKeyword(sqlText, &pos, "UNIQUE")
+	if !consumeKeyword(sqlText, &pos, "INDEX") && !consumeKeyword(sqlText, &pos, "KEY") {
+		return "", false
+	}
+	if next, ok := consumeSQLNamedOption(sqlText, pos, "USING"); ok {
+		pos = next
+	}
+
+	indexName, pos, ok := readSQLNameToken(sqlText, pos)
+	if !ok {
+		return "", false
+	}
+	if next, ok := consumeSQLNamedOption(sqlText, pos, "USING"); ok {
+		pos = next
+	}
+
+	columnsStart := skipSQLSpaces(sqlText, pos)
+	columnsEnd, ok := parenthesizedSQLSpan(sqlText, columnsStart)
+	if !ok {
+		return "", false
+	}
+	columns := sqlText[columnsStart:columnsEnd]
+	pos = columnsEnd
+	for {
+		next, ok := consumeSQLNamedOption(sqlText, pos, "USING")
+		if !ok {
+			break
+		}
+		pos = next
+	}
+	pos = skipSQLSpaces(sqlText, pos)
+	if pos < len(sqlText) && sqlText[pos] == ';' {
+		pos = skipSQLSpaces(sqlText, pos+1)
+	}
+	if pos != len(sqlText) {
+		return "", false
+	}
+
+	var out strings.Builder
+	out.WriteString("CREATE ")
+	if unique {
+		out.WriteString("UNIQUE ")
+	}
+	out.WriteString("INDEX ")
+	out.WriteString(indexName)
+	out.WriteString(" ON ")
+	out.WriteString(tableName)
+	out.WriteByte(' ')
+	out.WriteString(columns)
+	return out.String(), true
+}
+
+func consumeMySQLOptionValue(sqlText string, pos int) int {
+	i := skipSQLSpaces(sqlText, pos)
+	if i < len(sqlText) && sqlText[i] == '=' {
+		i = skipSQLSpaces(sqlText, i+1)
+	}
+	return consumeSQLValue(sqlText, i)
+}
+
+func consumeMySQLAssignedOptionValue(sqlText string, pos int) int {
+	i := skipSQLSpaces(sqlText, pos)
+	if i >= len(sqlText) || sqlText[i] != '=' {
+		return -1
+	}
+	return consumeSQLValue(sqlText, i+1)
+}
+
+func consumeCharacterSetOption(sqlText string, pos int) int {
+	word, next, ok := readSQLIdentifier(sqlText, skipSQLSpaces(sqlText, pos))
+	if !ok || !strings.EqualFold(word, "SET") {
+		return -1
+	}
+	return consumeMySQLOptionValue(sqlText, next)
+}
+
+func consumeDefaultCharsetOption(sqlText string, pos int) int {
+	word, next, ok := readSQLIdentifier(sqlText, skipSQLSpaces(sqlText, pos))
+	if !ok {
+		return -1
+	}
+	switch strings.ToUpper(word) {
+	case "CHARSET":
+		return consumeMySQLOptionValue(sqlText, next)
+	case "CHARACTER":
+		return consumeCharacterSetOption(sqlText, next)
+	default:
+		return -1
+	}
+}
+
+func consumeSQLNamedOption(sqlText string, pos int, name string) (int, bool) {
+	word, next, ok := readSQLIdentifier(sqlText, skipSQLSpaces(sqlText, pos))
+	if !ok || !strings.EqualFold(word, name) {
+		return pos, false
+	}
+	end := consumeMySQLOptionValue(sqlText, next)
+	if end < 0 {
+		return pos, false
+	}
+	return end, true
+}
+
+func consumeOnUpdateOption(sqlText string, pos int) int {
+	word, next, ok := readSQLIdentifier(sqlText, skipSQLSpaces(sqlText, pos))
+	if !ok || !strings.EqualFold(word, "UPDATE") {
+		return -1
+	}
+	return consumeSQLValue(sqlText, next)
+}
+
+func consumeSQLValue(sqlText string, pos int) int {
+	i := skipSQLSpaces(sqlText, pos)
+	if copyEnd, ok := quotedSQLSpan(sqlText, i); ok {
+		return copyEnd
+	}
+	if _, end, ok := readSQLIdentifier(sqlText, i); ok {
+		if callEnd := consumeEmptyCall(sqlText, end); callEnd >= 0 {
+			return callEnd
+		}
+		if callEnd := consumeOptionalNumericCall(sqlText, end); callEnd >= 0 {
+			return callEnd
+		}
+		return end
+	}
+	if i < len(sqlText) && ('0' <= sqlText[i] && sqlText[i] <= '9') {
+		i++
+		for i < len(sqlText) && (('0' <= sqlText[i] && sqlText[i] <= '9') || sqlText[i] == '.') {
+			i++
+		}
+		return i
+	}
+	return -1
+}
+
+func consumeCurrentTimestampCall(sqlText string, pos int) int {
+	if next := consumeEmptyCall(sqlText, pos); next >= 0 {
+		return next
+	}
+	return consumeOptionalNumericCall(sqlText, pos)
+}
+
+func consumeOptionalNumericCall(sqlText string, pos int) int {
+	i := skipSQLSpaces(sqlText, pos)
+	if i >= len(sqlText) || sqlText[i] != '(' {
+		return -1
+	}
+	i = skipSQLSpaces(sqlText, i+1)
+	start := i
+	for i < len(sqlText) && '0' <= sqlText[i] && sqlText[i] <= '9' {
+		i++
+	}
+	if i == start {
+		return -1
+	}
+	i = skipSQLSpaces(sqlText, i)
+	if i >= len(sqlText) || sqlText[i] != ')' {
+		return -1
+	}
+	return i + 1
+}
+
+func consumeKeyword(sqlText string, pos *int, keyword string) bool {
+	word, next, ok := readSQLIdentifier(sqlText, skipSQLSpaces(sqlText, *pos))
+	if !ok || !strings.EqualFold(word, keyword) {
+		return false
+	}
+	*pos = next
+	return true
+}
+
+func readSQLNameToken(sqlText string, pos int) (string, int, bool) {
+	pos = skipSQLSpaces(sqlText, pos)
+	if pos >= len(sqlText) {
+		return "", pos, false
+	}
+	if sqlText[pos] == '`' || sqlText[pos] == '"' {
+		end, ok := quotedSQLSpan(sqlText, pos)
+		if !ok {
+			return "", pos, false
+		}
+		return sqlText[pos:end], end, true
+	}
+	if _, end, ok := readSQLIdentifier(sqlText, pos); ok {
+		return sqlText[pos:end], end, true
+	}
+	return "", pos, false
+}
+
+func parenthesizedSQLSpan(sqlText string, pos int) (int, bool) {
+	if pos >= len(sqlText) || sqlText[pos] != '(' {
+		return pos, false
+	}
+	depth := 0
+	for i := pos; i < len(sqlText); {
+		if copyEnd, ok := quotedSQLSpan(sqlText, i); ok {
+			i = copyEnd
+			continue
+		}
+		if copyEnd, ok := sqlCommentSpan(sqlText, i); ok {
+			i = copyEnd
+			continue
+		}
+		switch sqlText[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return i + 1, true
+			}
+		}
+		i++
+	}
+	return len(sqlText), false
+}
+
+func readSQLIdentifier(sqlText string, pos int) (string, int, bool) {
+	if pos >= len(sqlText) || !isSQLIdentifierStart(sqlText[pos]) {
+		return "", pos, false
+	}
+	start := pos
+	pos++
+	for pos < len(sqlText) && isSQLIdentifierPart(sqlText[pos]) {
+		pos++
+	}
+	return sqlText[start:pos], pos, true
+}
+
+func skipSQLSpaces(sqlText string, pos int) int {
+	for pos < len(sqlText) && isSQLSpace(sqlText[pos]) {
+		pos++
+	}
+	return pos
+}
+
+func quotedSQLSpan(sqlText string, pos int) (int, bool) {
+	if pos >= len(sqlText) {
+		return pos, false
+	}
+	quote := sqlText[pos]
+	if quote != '\'' && quote != '"' && quote != '`' {
+		return pos, false
+	}
+	i := pos + 1
+	for i < len(sqlText) {
+		if sqlText[i] == '\\' && quote != '`' && i+1 < len(sqlText) {
+			i += 2
+			continue
+		}
+		if sqlText[i] == quote {
+			if quote != '`' && i+1 < len(sqlText) && sqlText[i+1] == quote {
+				i += 2
+				continue
+			}
+			return i + 1, true
+		}
+		i++
+	}
+	return len(sqlText), true
+}
+
+func sqlCommentSpan(sqlText string, pos int) (int, bool) {
+	if pos+1 < len(sqlText) && sqlText[pos] == '-' && sqlText[pos+1] == '-' {
+		i := pos + 2
+		for i < len(sqlText) && sqlText[i] != '\n' {
+			i++
+		}
+		if i < len(sqlText) {
+			i++
+		}
+		return i, true
+	}
+	if sqlText[pos] == '#' {
+		i := pos + 1
+		for i < len(sqlText) && sqlText[i] != '\n' {
+			i++
+		}
+		if i < len(sqlText) {
+			i++
+		}
+		return i, true
+	}
+	if pos+1 < len(sqlText) && sqlText[pos] == '/' && sqlText[pos+1] == '*' {
+		i := pos + 2
+		for i+1 < len(sqlText) && !(sqlText[i] == '*' && sqlText[i+1] == '/') {
+			i++
+		}
+		if i+1 < len(sqlText) {
+			i += 2
+		} else {
+			i = len(sqlText)
+		}
+		return i, true
+	}
+	return pos, false
+}
+
+func consumeEmptyCall(sqlText string, pos int) int {
+	i := pos
+	for i < len(sqlText) && isSQLSpace(sqlText[i]) {
+		i++
+	}
+	if i >= len(sqlText) || sqlText[i] != '(' {
+		return -1
+	}
+	i++
+	for i < len(sqlText) && isSQLSpace(sqlText[i]) {
+		i++
+	}
+	if i >= len(sqlText) || sqlText[i] != ')' {
+		return -1
+	}
+	return i + 1
+}
+
+func isSQLIdentifierStart(ch byte) bool {
+	return ch == '_' || ('A' <= ch && ch <= 'Z') || ('a' <= ch && ch <= 'z')
+}
+
+func isSQLIdentifierPart(ch byte) bool {
+	return isSQLIdentifierStart(ch) || ('0' <= ch && ch <= '9') || ch == '$'
+}
+
+func isSQLSpace(ch byte) bool {
+	switch ch {
+	case ' ', '\t', '\n', '\r', '\f':
+		return true
+	default:
+		return false
+	}
 }
 
 func (c *mysqlConn) logQuery(command, route, sqlText, normalizedSQL string) {
-	c.server.logQuery(queryLogEvent{
+	c.server.logQuery(QueryEvent{
 		Event:         "query",
 		ConnectionID:  c.connectionID,
 		Command:       command,
@@ -887,7 +1441,54 @@ func (s *Server) unsupportedError(sqlText string) *mysqlError {
 	return errPacket(cfg.Code, cfg.SQLState, cfg.Message+": "+sqlText)
 }
 
-func suggestedRule(sqlText string, unsupported UnsupportedConfig) string {
+func (s *Server) suggestedRule(u UnsupportedQuery) string {
+	if suggestion, ok := s.suggestVariableRule(u); ok {
+		return suggestion
+	}
+	return suggestedErrorRule(u.SQL, s.cfg.Fallback.Unsupported)
+}
+
+func (s *Server) suggestVariableRule(u UnsupportedQuery) (string, bool) {
+	expr, name, ok := unsupportedSelectVariable(u.NormalizedSQL)
+	if !ok {
+		return "", false
+	}
+	value := "TODO"
+	if compatValue, ok := s.cfg.Compat.Variables[name]; ok {
+		value = compatValue
+	}
+	return "Suggested rule:\n" +
+		"  - name: generated unsupported query\n" +
+		"    request:\n" +
+		"      match: exact\n" +
+		"      sql: " + strconv.Quote(u.NormalizedSQL) + "\n" +
+		"    response:\n" +
+		"      type: result_set\n" +
+		"      columns:\n" +
+		"        - name: " + strconv.Quote(expr) + "\n" +
+		"          type: VARCHAR\n" +
+		"      rows:\n" +
+		"        - [" + strconv.Quote(value) + "]", true
+}
+
+func unsupportedSelectVariable(normalizedSQL string) (expr, name string, ok bool) {
+	expr = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(normalizedSQL), "SELECT"))
+	expr = strings.TrimSuffix(expr, ";")
+	if !strings.HasPrefix(strings.TrimSpace(expr), "@@") {
+		return "", "", false
+	}
+	name = strings.TrimSpace(expr)
+	name = strings.TrimPrefix(name, "@@")
+	name = strings.ToLower(name)
+	name = strings.TrimPrefix(name, "session.")
+	name = strings.TrimPrefix(name, "global.")
+	if name == "" {
+		return "", "", false
+	}
+	return expr, name, true
+}
+
+func suggestedErrorRule(sqlText string, unsupported UnsupportedConfig) string {
 	unsupported = normalizedUnsupportedConfig(unsupported)
 	quoted := strconv.Quote(sqlText)
 	return "Suggested rule:\n" +

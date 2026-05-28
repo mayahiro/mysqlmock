@@ -234,6 +234,20 @@ func TestRuleValidation(t *testing.T) {
 	}
 }
 
+func TestUnsupportedTemplate(t *testing.T) {
+	got := mysqlmock.UnsupportedTemplate()
+	for _, want := range []string{
+		`sql: "SELECT @@example"`,
+		"type: result_set",
+		`name: "@@example"`,
+		`- ["TODO"]`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("UnsupportedTemplate() = %q, want it to contain %q", got, want)
+		}
+	}
+}
+
 func assertRuleValue(t *testing.T, ctx context.Context, db *sql.DB, query string, want int64) {
 	t.Helper()
 

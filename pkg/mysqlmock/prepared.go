@@ -102,8 +102,10 @@ func (c *mysqlConn) handleStmtExecute(ctx context.Context, payload []byte) error
 
 	switch v := resp.(type) {
 	case okResult:
+		c.recordResult(v)
 		return c.writeOK(1, v)
 	case resultSet:
+		c.recordResult(v)
 		if err := c.writeBinaryResultSet(1, v); err != nil {
 			return c.writeErr(1, errPacket(mysqlErrUnknown, "HY000", err.Error()))
 		}
@@ -257,19 +259,21 @@ func decodePreparedValue(data []byte, typ preparedParamType) (any, int, error) {
 			return nil, 0, ioShortBuffer()
 		}
 		return math.Float64frombits(binary.LittleEndian.Uint64(data[:8])), 8, nil
-	case fieldTypeDecimal, fieldTypeNewDec, fieldTypeVarChar, fieldTypeVarString, fieldTypeString:
+	case fieldTypeDecimal, fieldTypeNewDec, fieldTypeVarChar, fieldTypeVarString, fieldTypeString,
+		fieldTypeEnum, fieldTypeSet:
 		value, n, err := readLenEncBytes(data)
 		if err != nil {
 			return nil, 0, err
 		}
 		return string(value), n, nil
-	case fieldTypeBlob, fieldTypeBit, fieldTypeJSON:
+	case fieldTypeBlob, fieldTypeTinyBlob, fieldTypeMedBlob, fieldTypeLongBlob,
+		fieldTypeBit, fieldTypeJSON, fieldTypeGeometry:
 		value, n, err := readLenEncBytes(data)
 		if err != nil {
 			return nil, 0, err
 		}
 		return append([]byte(nil), value...), n, nil
-	case fieldTypeDate, fieldTypeDateTime, fieldTypeTimestamp:
+	case fieldTypeDate, fieldTypeNewDate, fieldTypeDateTime, fieldTypeTimestamp:
 		value, n, err := decodeBinaryDateTime(data)
 		if err != nil {
 			return nil, 0, err
@@ -346,10 +350,12 @@ func appendBinaryValue(buf []byte, typ byte, value any) ([]byte, error) {
 			return nil, err
 		}
 		return binary.LittleEndian.AppendUint64(buf, math.Float64bits(n)), nil
-	case fieldTypeDate, fieldTypeDateTime, fieldTypeTimestamp:
+	case fieldTypeDate, fieldTypeNewDate, fieldTypeDateTime, fieldTypeTimestamp:
 		return appendBinaryDateTime(buf, value)
 	case fieldTypeDecimal, fieldTypeNewDec, fieldTypeVarChar, fieldTypeVarString, fieldTypeString,
-		fieldTypeBlob, fieldTypeBit, fieldTypeJSON:
+		fieldTypeEnum, fieldTypeSet,
+		fieldTypeBlob, fieldTypeTinyBlob, fieldTypeMedBlob, fieldTypeLongBlob,
+		fieldTypeBit, fieldTypeJSON, fieldTypeGeometry:
 		return appendLenEncBytes(buf, []byte(textValue(value))), nil
 	default:
 		return appendLenEncBytes(buf, []byte(textValue(value))), nil

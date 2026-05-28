@@ -11,6 +11,43 @@ import (
 
 var errRuleDisconnect = errors.New("rule requested disconnect")
 
+type ruleResponseProfile struct {
+	Type     string
+	Code     uint16
+	SQLState string
+	Message  string
+}
+
+var ruleResponseProfiles = map[string]ruleResponseProfile{
+	"deadlock": {
+		Type:     "error",
+		Code:     1213,
+		SQLState: "40001",
+		Message:  "Deadlock found when trying to get lock; try restarting transaction",
+	},
+	"lock_wait_timeout": {
+		Type:     "error",
+		Code:     1205,
+		SQLState: "HY000",
+		Message:  "Lock wait timeout exceeded; try restarting transaction",
+	},
+	"duplicate_key": {
+		Type:     "error",
+		Code:     mysqlErrDupEntry,
+		SQLState: "23000",
+		Message:  "Duplicate entry for key 'mysqlmock'",
+	},
+	"foreign_key_violation": {
+		Type:     "error",
+		Code:     mysqlErrNoReferenced,
+		SQLState: "23000",
+		Message:  "Cannot add or update a child row: a foreign key constraint fails",
+	},
+	"disconnect": {
+		Type: "disconnect",
+	},
+}
+
 func (s *Server) executeRule(ctx context.Context, sqlText string, args []any) (any, bool, error) {
 	rule, ok, err := s.matchRule(sqlText, args)
 	if err != nil || !ok {
@@ -67,6 +104,34 @@ func (s *Server) matchRule(sqlText string, args []any) (RuleConfig, bool, error)
 		return rule, true, nil
 	}
 	return RuleConfig{}, false, nil
+}
+
+func applyRuleResponseProfile(resp *RuleResponseConfig) {
+	profile, ok := lookupRuleResponseProfile(resp.Profile)
+	if !ok {
+		return
+	}
+	if resp.Type == "" {
+		resp.Type = profile.Type
+	}
+	if resp.Code == 0 {
+		resp.Code = profile.Code
+	}
+	if resp.SQLState == "" {
+		resp.SQLState = profile.SQLState
+	}
+	if resp.Message == "" {
+		resp.Message = profile.Message
+	}
+}
+
+func lookupRuleResponseProfile(name string) (ruleResponseProfile, bool) {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "" {
+		return ruleResponseProfile{}, false
+	}
+	profile, ok := ruleResponseProfiles[name]
+	return profile, ok
 }
 
 func ruleMatches(req RuleRequestConfig, sqlText string, args []any) (bool, error) {
@@ -220,22 +285,49 @@ func ruleColumnFieldType(typeName string) (byte, bool) {
 		return fieldTypeDecimal, true
 	case "DATE":
 		return fieldTypeDate, true
+	case "NEWDATE":
+		return fieldTypeNewDate, true
 	case "TIME":
 		return fieldTypeTime, true
 	case "DATETIME":
 		return fieldTypeDateTime, true
 	case "TIMESTAMP":
 		return fieldTypeTimestamp, true
+	case "TINYBLOB":
+		return fieldTypeTinyBlob, true
+	case "MEDIUMBLOB":
+		return fieldTypeMedBlob, true
+	case "LONGBLOB":
+		return fieldTypeLongBlob, true
 	case "BLOB", "BINARY", "VARBINARY":
 		return fieldTypeBlob, true
 	case "JSON":
 		return fieldTypeJSON, true
+	case "ENUM":
+		return fieldTypeEnum, true
+	case "SET":
+		return fieldTypeSet, true
+	case "GEOMETRY":
+		return fieldTypeGeometry, true
 	default:
 		return 0, false
 	}
 }
 
 func validateRuleConfig(rule RuleConfig) error {
+	responseType := rule.Response.Type
+	if profile, ok := lookupRuleResponseProfile(rule.Response.Profile); rule.Response.Profile != "" {
+		if !ok {
+			return fmt.Errorf("unsupported response.profile: %s", rule.Response.Profile)
+		}
+		if responseType != "" && responseType != profile.Type {
+			return fmt.Errorf("response.profile %s requires response.type %s", rule.Response.Profile, profile.Type)
+		}
+		if responseType == "" {
+			responseType = profile.Type
+		}
+	}
+
 	match := rule.Request.Match
 	if match == "" {
 		match = "exact"
@@ -261,7 +353,7 @@ func validateRuleConfig(rule RuleConfig) error {
 		return errors.New("response.after_ms must be non-negative")
 	}
 
-	switch rule.Response.Type {
+	switch responseType {
 	case "ok":
 	case "result_set":
 		if len(rule.Response.Columns) == 0 {
@@ -278,7 +370,7 @@ func validateRuleConfig(rule RuleConfig) error {
 	case "error":
 	case "disconnect":
 	default:
-		return fmt.Errorf("unsupported response.type: %s", rule.Response.Type)
+		return fmt.Errorf("unsupported response.type: %s", responseType)
 	}
 	return nil
 }
