@@ -1,10 +1,15 @@
 # mysqlmock
 
-`mysqlmock` は、Go の Repository 層テスト向けの軽量な MySQL protocol test server です
+`mysqlmock` は、DB-backed code に触れる Go test 向けの軽量な MySQL protocol test server です
 MySQL client driver から接続でき、よく使う MySQL query を処理し、状態を持つ CRUD は SQLite backend で実行します
 
 Docker や外部 MySQL server を起動せずに、MySQL client 接続を使うテストを速く実行するためのツールです
 本番 DB の代替ではなく、MySQL 完全互換も目標にしていません
+
+Dockerized MySQL より速い database-backed test が欲しいが、query expectation mock より現実に近い coverage も欲しい場合に mysqlmock を使います
+Service test でも Repository を mock に差し替えず、MySQL client behavior を通した検証ができます
+一方で、migration、locking、isolation、optimizer behavior、MySQL-specific edge case などの完全な DB semantics は real database test に残します
+Repository test だけでなく、MySQL を起動せずに real Repository implementation を通したい Service-level test にも使えます
 
 ## 現在のスコープ
 

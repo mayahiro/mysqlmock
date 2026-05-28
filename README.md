@@ -1,12 +1,23 @@
 # mysqlmock
 
-`mysqlmock` is a lightweight MySQL-protocol test server for Go repository
-tests. It accepts connections from MySQL client drivers, routes common MySQL
-queries, and executes stateful CRUD operations against a SQLite backend.
+`mysqlmock` is a lightweight MySQL-protocol test server for Go tests that touch
+database-backed code. It accepts connections from MySQL client drivers, routes
+common MySQL queries, and executes stateful CRUD operations against a SQLite
+backend.
 
 It is designed for fast tests that need a real MySQL client connection without
 starting Docker or an external MySQL server. It is not a production database and
 does not aim for full MySQL compatibility.
+
+Use mysqlmock when you want faster database-backed tests than Dockerized MySQL,
+but more realistic coverage than query expectation mocks. It lets service tests
+keep using real repositories and MySQL client behavior without starting an
+external database. Full database semantics such as migrations, locking,
+isolation, optimizer behavior, and MySQL-specific edge cases should still remain
+covered by real database tests.
+This makes mysqlmock useful not only for repository tests, but also for
+service-level tests that should exercise real repository implementations without
+starting MySQL.
 
 ## Status and Scope
 
