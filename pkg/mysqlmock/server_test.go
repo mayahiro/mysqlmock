@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -279,6 +280,79 @@ func TestNotNullConstraintViolationMapsToMySQLError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "Error 1048") || !strings.Contains(err.Error(), "Column cannot be null") {
 		t.Fatalf("unexpected not null error: %v", err)
+	}
+}
+
+func TestWriteValueValidationMapsToMySQLErrors(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cfg := mysqlmock.DefaultConfig()
+	cfg.Schema = []string{`
+CREATE TABLE strict_values (
+  id INTEGER PRIMARY KEY AUTO_INCREMENT,
+  short_name VARCHAR(3) NOT NULL,
+  count_value INTEGER NOT NULL,
+  created_at DATETIME NOT NULL,
+  checked_value INTEGER NOT NULL CHECK (checked_value > 0)
+);`}
+	server := mysqlmock.Start(t, mysqlmock.WithConfig(cfg))
+
+	db, err := sql.Open("mysql", server.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	cases := []struct {
+		name    string
+		query   string
+		args    []any
+		wantErr string
+	}{
+		{
+			name:    "data too long",
+			query:   "INSERT INTO strict_values (short_name, count_value, created_at, checked_value) VALUES (?, ?, ?, ?)",
+			args:    []any{"toolong", 1, "2026-05-28 10:11:12", 1},
+			wantErr: "Error 1406 (22001): Data too long for column 'short_name' at row 1",
+		},
+		{
+			name:    "incorrect integer",
+			query:   "INSERT INTO strict_values (short_name, count_value, created_at, checked_value) VALUES (?, ?, ?, ?)",
+			args:    []any{"ok", "abc", "2026-05-28 10:11:12", 1},
+			wantErr: "Error 1366 (HY000): Incorrect integer value: 'abc' for column 'count_value' at row 1",
+		},
+		{
+			name:    "incorrect datetime",
+			query:   "INSERT INTO strict_values (short_name, count_value, created_at, checked_value) VALUES (?, ?, ?, ?)",
+			args:    []any{"ok", 1, "not-a-date", 1},
+			wantErr: "Error 1292 (22007): Incorrect datetime value: 'not-a-date' for column 'created_at' at row 1",
+		},
+		{
+			name:    "check constraint",
+			query:   "INSERT INTO strict_values (short_name, count_value, created_at, checked_value) VALUES (?, ?, ?, ?)",
+			args:    []any{"ok", 1, "2026-05-28 10:11:12", 0},
+			wantErr: "Error 3819 (HY000): Check constraint failed",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := db.ExecContext(ctx, tc.query, tc.args...); err == nil {
+				t.Fatal("expected MySQL-like write error")
+			} else if !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error = %v, want %q", err, tc.wantErr)
+			}
+		})
+	}
+
+	if _, err := db.ExecContext(ctx, "INSERT INTO strict_values (short_name, count_value, created_at, checked_value) VALUES (?, ?, ?, ?)", "ok", 1, "2026-05-28 10:11:12", 1); err != nil {
+		t.Fatalf("valid strict value insert: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "UPDATE strict_values SET short_name = ? WHERE id = ?", "long", 1); err == nil {
+		t.Fatal("expected update data too long error")
+	} else if !strings.Contains(err.Error(), "Error 1406 (22001): Data too long for column 'short_name' at row 1") {
+		t.Fatalf("update error = %v, want data too long", err)
 	}
 }
 
@@ -851,6 +925,72 @@ seed:
 	}
 }
 
+func TestSeedFileConfigsLoadTypedCSVWithTableOverride(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	dir := t.TempDir()
+	fixturePath, err := filepath.Abs("testdata/typed_seed.csv")
+	if err != nil {
+		t.Fatalf("resolve typed seed fixture: %v", err)
+	}
+
+	configPath := filepath.Join(dir, "mysqlmock.yaml")
+	config := []byte(fmt.Sprintf(`
+version: 1
+server:
+  auth:
+    mode: allow_any
+database:
+  engine: sqlite
+  mode: memory
+schema:
+  - |
+    CREATE TABLE typed_seed_users (
+      id INTEGER PRIMARY KEY AUTO_INCREMENT,
+      name TEXT NOT NULL,
+      active BOOLEAN NOT NULL,
+      login_count INTEGER NOT NULL,
+      score REAL NOT NULL,
+      created_at DATETIME NOT NULL,
+      note TEXT NULL
+    );
+seed_file_configs:
+  - path: %q
+    table: typed_seed_users
+    format: csv
+    null_values: ["NULL", "\\N"]
+    infer_types: true
+`, fixturePath))
+	if err := os.WriteFile(configPath, config, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := mysqlmock.CheckConfigFile(ctx, configPath); err != nil {
+		t.Fatalf("check config with seed file configs: %v", err)
+	}
+
+	server := mysqlmock.Start(t, mysqlmock.ConfigFile(configPath))
+	db, err := sql.Open("mysql", server.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	var name string
+	var active bool
+	var loginCount int
+	var score float64
+	var createdAt time.Time
+	var note sql.NullString
+	if err := db.QueryRowContext(ctx, "SELECT name, active, login_count, score, created_at, note FROM typed_seed_users").Scan(&name, &active, &loginCount, &score, &createdAt, &note); err != nil {
+		t.Fatalf("select typed seed user: %v", err)
+	}
+	if name != "Typed Alice" || !active || loginCount != 42 || score != 3.5 || createdAt.Format("2006-01-02 15:04:05") != "2026-05-28 10:11:12" || note.Valid {
+		t.Fatalf("typed seed row = name:%q active:%v login:%d score:%f created:%s note:%#v", name, active, loginCount, score, createdAt, note)
+	}
+}
+
 func TestLoadConfigFileRequiresTopLevelFields(t *testing.T) {
 	cases := []struct {
 		name    string
@@ -1413,6 +1553,77 @@ ON DUPLICATE KEY UPDATE label = VALUES(label)
 	}
 }
 
+func TestOnDuplicateKeyUpdateHandlesActiveRecordAliasSyntax(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cfg := mysqlmock.DefaultConfig()
+	cfg.Schema = []string{`
+CREATE TABLE ar_alias_upserts (
+  id INTEGER PRIMARY KEY AUTO_INCREMENT,
+  email VARCHAR(255) NOT NULL UNIQUE,
+  name VARCHAR(255) NOT NULL,
+  login_count INTEGER NOT NULL DEFAULT 0,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);`}
+	server := mysqlmock.Start(t, mysqlmock.WithConfig(cfg))
+	db, err := sql.Open("mysql", server.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	if _, err := db.ExecContext(ctx, "INSERT INTO ar_alias_upserts (email, name, login_count, updated_at) VALUES (?, ?, ?, ?)", "alice@example.com", "Alice", 1, "2026-05-28 10:00:00"); err != nil {
+		t.Fatalf("seed alias upsert row: %v", err)
+	}
+
+	result, err := db.ExecContext(ctx, `
+INSERT INTO `+"`ar_alias_upserts`"+` (`+"`email`"+`, `+"`name`"+`, `+"`login_count`"+`, `+"`updated_at`"+`)
+VALUES (?, ?, ?, ?) AS `+"`ar_alias_upserts_values`"+`
+ON DUPLICATE KEY UPDATE
+  `+"`name`"+` = `+"`ar_alias_upserts_values`"+`.`+"`name`"+`,
+  `+"`login_count`"+` = `+"`ar_alias_upserts`"+`.`+"`login_count`"+` + `+"`ar_alias_upserts_values`"+`.`+"`login_count`"+`,
+  `+"`updated_at`"+` = CASE WHEN `+"`ar_alias_upserts`"+`.`+"`name`"+` <=> `+"`ar_alias_upserts_values`"+`.`+"`name`"+` THEN `+"`ar_alias_upserts`"+`.`+"`updated_at`"+` ELSE CURRENT_TIMESTAMP END
+`, "alice@example.com", "Alice Updated", 2, "2026-05-28 11:00:00")
+	if err != nil {
+		t.Fatalf("ActiveRecord alias upsert: %v", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		t.Fatalf("alias upsert rows affected: %v", err)
+	}
+	if affected != 2 {
+		t.Fatalf("alias upsert rows affected = %d, want 2", affected)
+	}
+
+	var name string
+	var loginCount int
+	var updatedAt string
+	if err := db.QueryRowContext(ctx, "SELECT name, login_count, updated_at FROM ar_alias_upserts WHERE email = ?", "alice@example.com").Scan(&name, &loginCount, &updatedAt); err != nil {
+		t.Fatalf("select alias upsert row: %v", err)
+	}
+	if name != "Alice Updated" || loginCount != 3 || updatedAt == "2026-05-28 10:00:00" {
+		t.Fatalf("alias upsert row = name:%q login_count:%d updated_at:%q, want updated values", name, loginCount, updatedAt)
+	}
+
+	skipResult, err := db.ExecContext(ctx, `
+INSERT INTO `+"`ar_alias_upserts`"+` (`+"`email`"+`, `+"`name`"+`, `+"`login_count`"+`)
+VALUES (?, ?, ?) AS `+"`ar_alias_upserts_values`"+`
+ON DUPLICATE KEY UPDATE `+"`email`"+` = `+"`ar_alias_upserts`"+`.`+"`email`"+`
+`, "alice@example.com", "Ignored", 99)
+	if err != nil {
+		t.Fatalf("ActiveRecord alias skip duplicate upsert: %v", err)
+	}
+	skipAffected, err := skipResult.RowsAffected()
+	if err != nil {
+		t.Fatalf("alias skip rows affected: %v", err)
+	}
+	if skipAffected != 0 {
+		t.Fatalf("alias skip rows affected = %d, want 0", skipAffected)
+	}
+}
+
 func TestOnDuplicateKeyUpdateHandlesDefaultValues(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -1512,6 +1723,223 @@ ORDER BY code
 	mysqlmock.AssertNoUnsupported(t, server)
 }
 
+func TestInsertIgnoreSkipsDuplicateRows(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cfg := mysqlmock.DefaultConfig()
+	cfg.Schema = []string{`
+CREATE TABLE ignore_users (
+  id INTEGER PRIMARY KEY AUTO_INCREMENT,
+  email VARCHAR(255) NOT NULL UNIQUE,
+  name VARCHAR(255) NOT NULL
+);`}
+	cfg.Seed = map[string][]map[string]any{
+		"ignore_users": {
+			{"email": "existing@example.com", "name": "Existing"},
+		},
+	}
+	server := mysqlmock.Start(t, mysqlmock.WithConfig(cfg))
+	db, err := sql.Open("mysql", server.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	result, err := db.ExecContext(ctx, `
+INSERT IGNORE INTO ignore_users (email, name)
+VALUES (?, ?), (?, ?)
+`, "existing@example.com", "Ignored", "new@example.com", "New")
+	if err != nil {
+		t.Fatalf("insert ignore users: %v", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		t.Fatalf("insert ignore rows affected: %v", err)
+	}
+	if affected != 1 {
+		t.Fatalf("insert ignore rows affected = %d, want 1", affected)
+	}
+	lastID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatalf("insert ignore last insert id: %v", err)
+	}
+	if lastID == 0 {
+		t.Fatal("insert ignore last insert id = 0, want inserted row id")
+	}
+
+	stmt, err := db.PrepareContext(ctx, `
+INSERT IGNORE INTO ignore_users (email, name)
+VALUES (?, ?), (?, ?)
+`)
+	if err != nil {
+		t.Fatalf("prepare insert ignore: %v", err)
+	}
+	defer stmt.Close()
+	preparedResult, err := stmt.ExecContext(ctx, "new@example.com", "Ignored Again", "prepared@example.com", "Prepared")
+	if err != nil {
+		t.Fatalf("prepared insert ignore users: %v", err)
+	}
+	preparedAffected, err := preparedResult.RowsAffected()
+	if err != nil {
+		t.Fatalf("prepared insert ignore rows affected: %v", err)
+	}
+	if preparedAffected != 1 {
+		t.Fatalf("prepared insert ignore rows affected = %d, want 1", preparedAffected)
+	}
+
+	rows, err := db.QueryContext(ctx, "SELECT email, name FROM ignore_users ORDER BY email")
+	if err != nil {
+		t.Fatalf("select ignore users: %v", err)
+	}
+	defer rows.Close()
+	got := map[string]string{}
+	for rows.Next() {
+		var email string
+		var name string
+		if err := rows.Scan(&email, &name); err != nil {
+			t.Fatalf("scan ignore user: %v", err)
+		}
+		got[email] = name
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read ignore users: %v", err)
+	}
+	want := map[string]string{
+		"existing@example.com": "Existing",
+		"new@example.com":      "New",
+		"prepared@example.com": "Prepared",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("ignore users = %#v, want %#v", got, want)
+	}
+	mysqlmock.AssertNoUnsupported(t, server)
+}
+
+func TestReplaceIntoReplacesDuplicateRows(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cfg := mysqlmock.DefaultConfig()
+	cfg.Schema = []string{`
+CREATE TABLE replace_users (
+  id INTEGER PRIMARY KEY AUTO_INCREMENT,
+  email VARCHAR(255) NOT NULL UNIQUE,
+  name VARCHAR(255) NOT NULL
+);`}
+	cfg.Seed = map[string][]map[string]any{
+		"replace_users": {
+			{"email": "existing@example.com", "name": "Existing"},
+		},
+	}
+	server := mysqlmock.Start(t, mysqlmock.WithConfig(cfg))
+	db, err := sql.Open("mysql", server.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	result, err := db.ExecContext(ctx, `
+REPLACE INTO replace_users (email, name)
+VALUES (?, ?), (?, ?)
+`, "existing@example.com", "Replaced", "new@example.com", "New")
+	if err != nil {
+		t.Fatalf("replace users: %v", err)
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		t.Fatalf("replace rows affected: %v", err)
+	}
+	if affected != 3 {
+		t.Fatalf("replace rows affected = %d, want 3", affected)
+	}
+	lastID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatalf("replace last insert id: %v", err)
+	}
+	if lastID == 0 {
+		t.Fatal("replace last insert id = 0, want inserted row id")
+	}
+
+	stmt, err := db.PrepareContext(ctx, `
+REPLACE INTO replace_users (email, name)
+VALUES (?, ?)
+`)
+	if err != nil {
+		t.Fatalf("prepare replace: %v", err)
+	}
+	defer stmt.Close()
+	preparedResult, err := stmt.ExecContext(ctx, "new@example.com", "Prepared Replaced")
+	if err != nil {
+		t.Fatalf("prepared replace user: %v", err)
+	}
+	preparedAffected, err := preparedResult.RowsAffected()
+	if err != nil {
+		t.Fatalf("prepared replace rows affected: %v", err)
+	}
+	if preparedAffected != 2 {
+		t.Fatalf("prepared replace rows affected = %d, want 2", preparedAffected)
+	}
+
+	rows, err := db.QueryContext(ctx, "SELECT email, name FROM replace_users ORDER BY email")
+	if err != nil {
+		t.Fatalf("select replace users: %v", err)
+	}
+	defer rows.Close()
+	got := map[string]string{}
+	for rows.Next() {
+		var email string
+		var name string
+		if err := rows.Scan(&email, &name); err != nil {
+			t.Fatalf("scan replace user: %v", err)
+		}
+		got[email] = name
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read replace users: %v", err)
+	}
+	want := map[string]string{
+		"existing@example.com": "Replaced",
+		"new@example.com":      "Prepared Replaced",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("replace users = %#v, want %#v", got, want)
+	}
+	mysqlmock.AssertNoUnsupported(t, server)
+}
+
+func TestUnsupportedInsertIgnoreSuggestion(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cfg := mysqlmock.DefaultConfig()
+	cfg.Schema = []string{`
+CREATE TABLE ignore_select_users (
+  id INTEGER PRIMARY KEY AUTO_INCREMENT,
+  email VARCHAR(255) NOT NULL UNIQUE
+);`}
+	server := mysqlmock.Start(t, mysqlmock.WithConfig(cfg))
+	db, err := sql.Open("mysql", server.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	if _, err := db.ExecContext(ctx, "INSERT IGNORE INTO ignore_select_users SELECT 1, 'unsupported@example.com'"); err == nil {
+		t.Fatal("expected unsupported INSERT IGNORE SELECT error")
+	}
+	unsupported := server.Unsupported()
+	if len(unsupported) != 1 {
+		t.Fatalf("unsupported count = %d, want 1: %#v", len(unsupported), unsupported)
+	}
+	if unsupported[0].Suggestion == "" || !strings.Contains(unsupported[0].Suggestion, "INSERT IGNORE INTO ignore_select_users SELECT") {
+		t.Fatalf("unsupported suggestion = %q, want INSERT IGNORE rule suggestion", unsupported[0].Suggestion)
+	}
+}
+
 func TestBunStyleSQLCompatibility(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -1597,6 +2025,626 @@ WHERE u.id IN (?, ?)
 		t.Fatalf("bun note = %#v, want NULL", gotNote)
 	}
 	mysqlmock.AssertNoUnsupported(t, server)
+}
+
+func TestMySQLFunctionCompatibility(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cfg := mysqlmock.DefaultConfig()
+	cfg.Schema = []string{`
+CREATE TABLE function_users (
+  id INTEGER PRIMARY KEY AUTO_INCREMENT,
+  first_name TEXT NOT NULL,
+  last_name TEXT NOT NULL,
+  created_at DATETIME NOT NULL,
+  payload TEXT NOT NULL,
+  score TEXT NOT NULL,
+  nickname TEXT NULL
+);`}
+	cfg.Seed = map[string][]map[string]any{
+		"function_users": {
+			{
+				"first_name": "Ada",
+				"last_name":  "Lovelace",
+				"created_at": "2026-05-28 10:11:12",
+				"payload":    `{"role":"admin","level":7}`,
+				"score":      "42",
+				"nickname":   nil,
+			},
+		},
+	}
+	server := mysqlmock.Start(t, mysqlmock.WithConfig(cfg))
+	db, err := sql.Open("mysql", server.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	var fullName string
+	var formatted string
+	var score int
+	var nickname string
+	var roleJSON string
+	var role string
+	if err := db.QueryRowContext(ctx, `
+SELECT
+  CONCAT(first_name, ' ', last_name),
+  DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s'),
+  CAST(score AS SIGNED),
+  COALESCE(nickname, IFNULL(NULL, 'none')),
+  JSON_EXTRACT(payload, '$.role'),
+  JSON_UNQUOTE(JSON_EXTRACT(payload, '$.role'))
+FROM function_users
+`).Scan(&fullName, &formatted, &score, &nickname, &roleJSON, &role); err != nil {
+		t.Fatalf("select MySQL functions: %v", err)
+	}
+	if fullName != "Ada Lovelace" || formatted != "2026-05-28 10:11:12" || score != 42 || nickname != "none" || roleJSON != `"admin"` || role != "admin" {
+		t.Fatalf("function row = name:%q formatted:%q score:%d nickname:%q role_json:%q role:%q", fullName, formatted, score, nickname, roleJSON, role)
+	}
+	mysqlmock.AssertNoUnsupported(t, server)
+}
+
+func TestActiveRecordStyleMySQLCompatibility(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cfg := mysqlmock.DefaultConfig()
+	cfg.Schema = []string{
+		`CREATE TABLE ar_users (
+		  id INTEGER PRIMARY KEY AUTO_INCREMENT,
+		  email VARCHAR(255) NOT NULL UNIQUE,
+		  name VARCHAR(255) NOT NULL DEFAULT 'anonymous',
+		  active TINYINT(1) NOT NULL DEFAULT 1,
+		  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+		);`,
+		`CREATE INDEX index_ar_users_on_name ON ar_users (name);`,
+		`CREATE INDEX index_ar_users_on_email_prefix ON ar_users (email(10));`,
+		`CREATE INDEX index_ar_users_on_lower_name ON ar_users ((lower(name)));`,
+		`CREATE INDEX index_ar_users_on_active_invisible ON ar_users (active) INVISIBLE;`,
+		`CREATE TABLE schema_migrations (
+		  version VARCHAR(255) NOT NULL PRIMARY KEY
+		);`,
+		`CREATE TABLE ar_internal_metadata (
+		  ` + "`key`" + ` VARCHAR(255) NOT NULL PRIMARY KEY,
+		  value VARCHAR(255),
+		  created_at DATETIME NOT NULL,
+		  updated_at DATETIME NOT NULL
+		);`,
+		`CREATE TABLE ar_parent_records (
+		  id INTEGER PRIMARY KEY AUTO_INCREMENT
+		);`,
+		`CREATE TABLE ar_child_records (
+		  id INTEGER PRIMARY KEY AUTO_INCREMENT,
+		  parent_id INTEGER NOT NULL,
+		  FOREIGN KEY (parent_id) REFERENCES ar_parent_records(id)
+		);`,
+	}
+	server := mysqlmock.Start(t, mysqlmock.WithConfig(cfg))
+	db, err := sql.Open("mysql", server.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	if _, err := db.ExecContext(ctx, "SET @@SESSION.sql_mode = CONCAT(@@sql_mode, ',STRICT_ALL_TABLES'), @@SESSION.wait_timeout = '2147483'"); err != nil {
+		t.Fatalf("set ActiveRecord session variables: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "SET NAMES utf8mb4, @@SESSION.wait_timeout = '123'"); err != nil {
+		t.Fatalf("set names with ActiveRecord session variable: %v", err)
+	}
+	var waitTimeout string
+	if err := db.QueryRowContext(ctx, "SELECT @@wait_timeout").Scan(&waitTimeout); err != nil {
+		t.Fatalf("select wait_timeout: %v", err)
+	}
+	if waitTimeout != "123" {
+		t.Fatalf("wait_timeout = %q, want 123", waitTimeout)
+	}
+	if _, err := db.ExecContext(ctx, "SET FOREIGN_KEY_CHECKS = 0"); err != nil {
+		t.Fatalf("disable foreign key checks: %v", err)
+	}
+	var foreignKeyChecks string
+	if err := db.QueryRowContext(ctx, "SELECT @@FOREIGN_KEY_CHECKS").Scan(&foreignKeyChecks); err != nil {
+		t.Fatalf("select foreign_key_checks: %v", err)
+	}
+	if foreignKeyChecks != "0" {
+		t.Fatalf("foreign_key_checks = %q, want 0", foreignKeyChecks)
+	}
+	if _, err := db.ExecContext(ctx, "SET FOREIGN_KEY_CHECKS = 1"); err != nil {
+		t.Fatalf("enable foreign key checks: %v", err)
+	}
+
+	var charsetDatabase string
+	if err := db.QueryRowContext(ctx, "SELECT @@character_set_database").Scan(&charsetDatabase); err != nil {
+		t.Fatalf("select character_set_database: %v", err)
+	}
+	if charsetDatabase != "utf8mb4" {
+		t.Fatalf("character_set_database = %q, want utf8mb4", charsetDatabase)
+	}
+
+	var lockResult int
+	if err := db.QueryRowContext(ctx, "SELECT GET_LOCK('ar_schema_migrations', 0)").Scan(&lockResult); err != nil {
+		t.Fatalf("get advisory lock: %v", err)
+	}
+	if lockResult != 1 {
+		t.Fatalf("GET_LOCK result = %d, want 1", lockResult)
+	}
+	if err := db.QueryRowContext(ctx, "SELECT RELEASE_LOCK('ar_schema_migrations')").Scan(&lockResult); err != nil {
+		t.Fatalf("release advisory lock: %v", err)
+	}
+	if lockResult != 1 {
+		t.Fatalf("RELEASE_LOCK result = %d, want 1", lockResult)
+	}
+
+	fields, err := db.QueryContext(ctx, "SHOW FULL FIELDS FROM `ar_users`")
+	if err != nil {
+		t.Fatalf("show full fields: %v", err)
+	}
+	defer fields.Close()
+
+	type fieldRow struct {
+		field      string
+		typ        string
+		collation  sql.NullString
+		null       string
+		key        string
+		def        sql.NullString
+		extra      string
+		privileges string
+		comment    string
+	}
+	fieldByName := map[string]fieldRow{}
+	for fields.Next() {
+		var row fieldRow
+		if err := fields.Scan(&row.field, &row.typ, &row.collation, &row.null, &row.key, &row.def, &row.extra, &row.privileges, &row.comment); err != nil {
+			t.Fatalf("scan full field: %v", err)
+		}
+		fieldByName[row.field] = row
+	}
+	if err := fields.Err(); err != nil {
+		t.Fatalf("read full fields: %v", err)
+	}
+	if fieldByName["id"].key != "PRI" || fieldByName["id"].extra != "auto_increment" {
+		t.Fatalf("id field metadata = %#v, want primary auto_increment", fieldByName["id"])
+	}
+	if fieldByName["email"].key != "UNI" || fieldByName["email"].null != "NO" {
+		t.Fatalf("email field metadata = %#v, want unique not-null", fieldByName["email"])
+	}
+	if fieldByName["name"].key != "MUL" || !fieldByName["name"].def.Valid || fieldByName["name"].def.String != "'anonymous'" {
+		t.Fatalf("name field metadata = %#v, want indexed default", fieldByName["name"])
+	}
+
+	var likeField string
+	var likeType string
+	var likeCollation sql.NullString
+	var likeNull string
+	var likeKey string
+	var likeDefault sql.NullString
+	var likeExtra string
+	var likePrivileges string
+	var likeComment string
+	if err := db.QueryRowContext(ctx, "SHOW FULL FIELDS FROM `ar_users` LIKE 'email'").Scan(&likeField, &likeType, &likeCollation, &likeNull, &likeKey, &likeDefault, &likeExtra, &likePrivileges, &likeComment); err != nil {
+		t.Fatalf("show full fields like: %v", err)
+	}
+	if likeField != "email" || likeKey != "UNI" {
+		t.Fatalf("SHOW FULL FIELDS LIKE returned field=%q key=%q, want email/UNI", likeField, likeKey)
+	}
+
+	keyRows, err := db.QueryContext(ctx, "SHOW KEYS FROM `ar_users`")
+	if err != nil {
+		t.Fatalf("show keys: %v", err)
+	}
+	defer keyRows.Close()
+
+	keys := map[string][]string{}
+	subParts := map[string]int{}
+	visibleByKey := map[string]string{}
+	expressions := map[string]string{}
+	for keyRows.Next() {
+		var table string
+		var nonUnique int
+		var keyName string
+		var seqInIndex int
+		var columnName sql.NullString
+		var collation sql.NullString
+		var cardinality sql.NullString
+		var subPart sql.NullString
+		var packed sql.NullString
+		var nullValue sql.NullString
+		var indexType string
+		var comment string
+		var indexComment string
+		var visible string
+		var expression sql.NullString
+		if err := keyRows.Scan(&table, &nonUnique, &keyName, &seqInIndex, &columnName, &collation, &cardinality, &subPart, &packed, &nullValue, &indexType, &comment, &indexComment, &visible, &expression); err != nil {
+			t.Fatalf("scan key row: %v", err)
+		}
+		_ = table
+		_ = nonUnique
+		_ = seqInIndex
+		_ = collation
+		_ = cardinality
+		_ = packed
+		_ = nullValue
+		_ = comment
+		_ = indexComment
+		if indexType != "BTREE" || visible != "YES" {
+			if keyName != "index_ar_users_on_active_invisible" || visible != "NO" {
+				t.Fatalf("key row type=%q visible=%q, want BTREE/YES or invisible test index", indexType, visible)
+			}
+		}
+		if columnName.Valid {
+			keys[keyName] = append(keys[keyName], columnName.String)
+		}
+		if subPart.Valid {
+			value, err := strconv.Atoi(subPart.String)
+			if err != nil {
+				t.Fatalf("parse sub_part %q: %v", subPart.String, err)
+			}
+			subParts[keyName] = value
+		}
+		visibleByKey[keyName] = visible
+		if expression.Valid {
+			expressions[keyName] = expression.String
+		}
+	}
+	if err := keyRows.Err(); err != nil {
+		t.Fatalf("read key rows: %v", err)
+	}
+	if !reflect.DeepEqual(keys["PRIMARY"], []string{"id"}) {
+		t.Fatalf("primary key columns = %#v, want id", keys["PRIMARY"])
+	}
+	if !reflect.DeepEqual(keys["index_ar_users_on_name"], []string{"name"}) {
+		t.Fatalf("name index columns = %#v, want name", keys["index_ar_users_on_name"])
+	}
+	if subParts["index_ar_users_on_email_prefix"] != 10 {
+		t.Fatalf("email prefix sub_part = %d, want 10", subParts["index_ar_users_on_email_prefix"])
+	}
+	if expressions["index_ar_users_on_lower_name"] != "lower(name)" {
+		t.Fatalf("lower name expression = %q, want lower(name)", expressions["index_ar_users_on_lower_name"])
+	}
+	if visibleByKey["index_ar_users_on_active_invisible"] != "NO" {
+		t.Fatalf("invisible index visibility = %q, want NO", visibleByKey["index_ar_users_on_active_invisible"])
+	}
+
+	if _, err := db.ExecContext(ctx, "ALTER TABLE `ar_users` ALTER INDEX `index_ar_users_on_active_invisible` VISIBLE"); err != nil {
+		t.Fatalf("alter index visible: %v", err)
+	}
+	visibleByKey = map[string]string{}
+	visibleRows, err := db.QueryContext(ctx, "SHOW KEYS FROM `ar_users`")
+	if err != nil {
+		t.Fatalf("show keys after visibility change: %v", err)
+	}
+	for visibleRows.Next() {
+		var table string
+		var nonUnique int
+		var keyName string
+		var seqInIndex int
+		var columnName sql.NullString
+		var collation sql.NullString
+		var cardinality sql.NullString
+		var subPart sql.NullString
+		var packed sql.NullString
+		var nullValue sql.NullString
+		var indexType string
+		var comment string
+		var indexComment string
+		var visible string
+		var expression sql.NullString
+		if err := visibleRows.Scan(&table, &nonUnique, &keyName, &seqInIndex, &columnName, &collation, &cardinality, &subPart, &packed, &nullValue, &indexType, &comment, &indexComment, &visible, &expression); err != nil {
+			t.Fatalf("scan visible key row: %v", err)
+		}
+		visibleByKey[keyName] = visible
+	}
+	if err := visibleRows.Err(); err != nil {
+		t.Fatalf("read visible key rows: %v", err)
+	}
+	if err := visibleRows.Close(); err != nil {
+		t.Fatalf("close visible key rows: %v", err)
+	}
+	if visibleByKey["index_ar_users_on_active_invisible"] != "YES" {
+		t.Fatalf("index visibility after ALTER = %q, want YES", visibleByKey["index_ar_users_on_active_invisible"])
+	}
+
+	var tableName string
+	var createSQL string
+	if err := db.QueryRowContext(ctx, "SHOW CREATE TABLE `ar_users`").Scan(&tableName, &createSQL); err != nil {
+		t.Fatalf("show create table: %v", err)
+	}
+	if tableName != "ar_users" || !strings.Contains(strings.ToUpper(createSQL), "CREATE TABLE") {
+		t.Fatalf("SHOW CREATE TABLE = table:%q sql:%q, want ar_users CREATE TABLE", tableName, createSQL)
+	}
+	if !strings.Contains(createSQL, "ENGINE=InnoDB") || !strings.Contains(createSQL, "DEFAULT CHARSET=utf8mb4") {
+		t.Fatalf("SHOW CREATE TABLE sql = %q, want MySQL table options", createSQL)
+	}
+	if !strings.Contains(createSQL, "TINYINT(1)") || !strings.Contains(createSQL, "ON UPDATE CURRENT_TIMESTAMP") {
+		t.Fatalf("SHOW CREATE TABLE sql = %q, want configured MySQL schema text", createSQL)
+	}
+
+	if _, err := db.ExecContext(ctx, "INSERT INTO schema_migrations (version) VALUES (?)", "20260528000000"); err != nil {
+		t.Fatalf("insert schema migration: %v", err)
+	}
+	var version string
+	if err := db.QueryRowContext(ctx, "SELECT `schema_migrations`.`version` FROM `schema_migrations` ORDER BY `schema_migrations`.`version` ASC").Scan(&version); err != nil {
+		t.Fatalf("select schema migration version: %v", err)
+	}
+	if version != "20260528000000" {
+		t.Fatalf("schema migration version = %q, want 20260528000000", version)
+	}
+
+	if _, err := db.ExecContext(ctx, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"); err != nil {
+		t.Fatalf("set transaction isolation: %v", err)
+	}
+
+	var tableComment string
+	if err := db.QueryRowContext(ctx, `
+SELECT table_comment
+FROM information_schema.tables
+WHERE table_schema = DATABASE()
+  AND table_name = 'ar_users'
+`).Scan(&tableComment); err != nil {
+		t.Fatalf("select ActiveRecord table_comment metadata: %v", err)
+	}
+	if tableComment != "" {
+		t.Fatalf("table_comment = %q, want empty string", tableComment)
+	}
+
+	checkRows, err := db.QueryContext(ctx, `
+SELECT cc.constraint_name AS name, cc.check_clause AS expression
+FROM information_schema.check_constraints cc
+JOIN information_schema.table_constraints tc USING (constraint_schema, constraint_name)
+WHERE tc.table_schema = DATABASE()
+  AND tc.table_name = 'ar_users'
+  AND cc.constraint_schema = DATABASE()
+`)
+	if err != nil {
+		t.Fatalf("select ActiveRecord check constraint metadata: %v", err)
+	}
+	if checkRows.Next() {
+		t.Fatal("check constraint metadata returned rows, want none")
+	}
+	if err := checkRows.Err(); err != nil {
+		t.Fatalf("read check constraint metadata: %v", err)
+	}
+	if err := checkRows.Close(); err != nil {
+		t.Fatalf("close check constraint metadata: %v", err)
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin foreign_key_checks transaction: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, "SET FOREIGN_KEY_CHECKS = 0"); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("disable foreign key checks inside transaction: %v", err)
+	}
+	var txForeignKeyChecks string
+	if err := tx.QueryRowContext(ctx, "SELECT @@FOREIGN_KEY_CHECKS").Scan(&txForeignKeyChecks); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("select tx foreign_key_checks: %v", err)
+	}
+	if txForeignKeyChecks != "0" {
+		_ = tx.Rollback()
+		t.Fatalf("tx foreign_key_checks = %q, want 0", txForeignKeyChecks)
+	}
+	if _, err := tx.ExecContext(ctx, "INSERT INTO ar_child_records (parent_id) VALUES (?)", 999); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("insert with foreign_key_checks disabled inside transaction: %v", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("rollback foreign_key_checks transaction: %v", err)
+	}
+
+	mysqlmock.AssertNoUnsupported(t, server)
+}
+
+func TestActiveRecordAdvisoryLockCompatibility(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	server := mysqlmock.Start(t, mysqlmock.WithConfig(mysqlmock.DefaultConfig()))
+	db1, err := sql.Open("mysql", server.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db1.Close()
+	db1.SetMaxOpenConns(1)
+
+	db2, err := sql.Open("mysql", server.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+	db2.SetMaxOpenConns(1)
+
+	var got int
+	if err := db1.QueryRowContext(ctx, "SELECT GET_LOCK('ar_schema_migrations', 0)").Scan(&got); err != nil {
+		t.Fatalf("db1 get advisory lock: %v", err)
+	}
+	if got != 1 {
+		t.Fatalf("db1 GET_LOCK = %d, want 1", got)
+	}
+	if err := db2.QueryRowContext(ctx, "SELECT GET_LOCK('ar_schema_migrations', 0)").Scan(&got); err != nil {
+		t.Fatalf("db2 get advisory lock: %v", err)
+	}
+	if got != 0 {
+		t.Fatalf("db2 GET_LOCK while held = %d, want 0", got)
+	}
+	if err := db2.QueryRowContext(ctx, "SELECT RELEASE_LOCK('ar_schema_migrations')").Scan(&got); err != nil {
+		t.Fatalf("db2 release advisory lock: %v", err)
+	}
+	if got != 0 {
+		t.Fatalf("db2 RELEASE_LOCK for another connection = %d, want 0", got)
+	}
+	if err := db1.QueryRowContext(ctx, "SELECT RELEASE_LOCK('ar_schema_migrations')").Scan(&got); err != nil {
+		t.Fatalf("db1 release advisory lock: %v", err)
+	}
+	if got != 1 {
+		t.Fatalf("db1 RELEASE_LOCK = %d, want 1", got)
+	}
+	if err := db2.QueryRowContext(ctx, "SELECT GET_LOCK('ar_schema_migrations', 0)").Scan(&got); err != nil {
+		t.Fatalf("db2 get released advisory lock: %v", err)
+	}
+	if got != 1 {
+		t.Fatalf("db2 GET_LOCK after release = %d, want 1", got)
+	}
+
+	mysqlmock.AssertNoUnsupported(t, server)
+}
+
+func TestShowCreateTableInvalidatesConfiguredDDLAfterRuntimeAlter(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cfg := mysqlmock.DefaultConfig()
+	cfg.Schema = []string{`
+CREATE TABLE show_create_originals (
+  id INTEGER PRIMARY KEY AUTO_INCREMENT,
+  name VARCHAR(255) NOT NULL,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;`}
+	server := mysqlmock.Start(t, mysqlmock.WithConfig(cfg))
+	db, err := sql.Open("mysql", server.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	var tableName string
+	var createSQL string
+	if err := db.QueryRowContext(ctx, "SHOW CREATE TABLE `show_create_originals`").Scan(&tableName, &createSQL); err != nil {
+		t.Fatalf("show original create table: %v", err)
+	}
+	if !strings.Contains(createSQL, "ON UPDATE CURRENT_TIMESTAMP") || !strings.Contains(createSQL, "COLLATE=utf8mb4_bin") {
+		t.Fatalf("original SHOW CREATE TABLE = %q, want configured MySQL DDL", createSQL)
+	}
+
+	if _, err := db.ExecContext(ctx, "ALTER TABLE `show_create_originals` ADD COLUMN `nickname` VARCHAR(64) DEFAULT 'none'"); err != nil {
+		t.Fatalf("alter table add nickname: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, "SHOW CREATE TABLE `show_create_originals`").Scan(&tableName, &createSQL); err != nil {
+		t.Fatalf("show altered create table: %v", err)
+	}
+	if !strings.Contains(createSQL, "nickname") {
+		t.Fatalf("altered SHOW CREATE TABLE = %q, want runtime SQLite definition after invalidation", createSQL)
+	}
+	if strings.Contains(createSQL, "ON UPDATE CURRENT_TIMESTAMP") {
+		t.Fatalf("altered SHOW CREATE TABLE = %q, should not return stale configured DDL", createSQL)
+	}
+}
+
+func TestMySQLDDLCompatibility(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cfg := mysqlmock.DefaultConfig()
+	cfg.Schema = []string{`
+CREATE TABLE ddl_users (
+  id INTEGER PRIMARY KEY AUTO_INCREMENT,
+  email VARCHAR(255) NOT NULL UNIQUE,
+  name VARCHAR(255) NOT NULL
+);`}
+	server := mysqlmock.Start(t, mysqlmock.WithConfig(cfg))
+	db, err := sql.Open("mysql", server.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	if _, err := db.ExecContext(ctx, "ALTER TABLE ddl_users ADD COLUMN display_name VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT 'none'"); err != nil {
+		t.Fatalf("alter add column: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE ddl_users ADD INDEX idx_ddl_users_name (name) USING BTREE"); err != nil {
+		t.Fatalf("alter add index: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE ddl_users RENAME INDEX idx_ddl_users_name TO idx_ddl_users_name_new"); err != nil {
+		t.Fatalf("alter rename index: %v", err)
+	}
+	assertShowKeyColumns(t, ctx, db, "ddl_users", "idx_ddl_users_name_new", []string{"name"})
+
+	if _, err := db.ExecContext(ctx, "ALTER TABLE ddl_users DROP INDEX idx_ddl_users_name_new"); err != nil {
+		t.Fatalf("alter drop index: %v", err)
+	}
+	assertShowKeyColumns(t, ctx, db, "ddl_users", "idx_ddl_users_name_new", nil)
+
+	if _, err := db.ExecContext(ctx, "CREATE INDEX idx_ddl_users_display_name ON ddl_users (display_name)"); err != nil {
+		t.Fatalf("create display name index: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "DROP INDEX idx_ddl_users_display_name ON ddl_users"); err != nil {
+		t.Fatalf("drop index on table: %v", err)
+	}
+	assertShowKeyColumns(t, ctx, db, "ddl_users", "idx_ddl_users_display_name", nil)
+
+	if _, err := db.ExecContext(ctx, "ALTER TABLE ddl_users CHANGE COLUMN display_name nickname VARCHAR(20) NOT NULL"); err != nil {
+		t.Fatalf("alter change column: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE ddl_users MODIFY COLUMN nickname VARCHAR(40) NOT NULL"); err != nil {
+		t.Fatalf("alter modify column: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "INSERT INTO ddl_users (email, name, nickname) VALUES (?, ?, ?)", "ddl@example.com", "DDL", "Nick"); err != nil {
+		t.Fatalf("insert after ddl changes: %v", err)
+	}
+
+	if _, err := db.ExecContext(ctx, "RENAME TABLE ddl_users TO ddl_people"); err != nil {
+		t.Fatalf("rename table: %v", err)
+	}
+	var nickname string
+	if err := db.QueryRowContext(ctx, "SELECT nickname FROM ddl_people WHERE email = ?", "ddl@example.com").Scan(&nickname); err != nil {
+		t.Fatalf("select renamed table: %v", err)
+	}
+	if nickname != "Nick" {
+		t.Fatalf("renamed table nickname = %q, want Nick", nickname)
+	}
+	mysqlmock.AssertNoUnsupported(t, server)
+}
+
+func assertShowKeyColumns(t *testing.T, ctx context.Context, db *sql.DB, tableName, keyName string, want []string) {
+	t.Helper()
+
+	rows, err := db.QueryContext(ctx, "SHOW KEYS FROM "+tableName)
+	if err != nil {
+		t.Fatalf("show keys from %s: %v", tableName, err)
+	}
+	defer rows.Close()
+
+	got := []string{}
+	for rows.Next() {
+		var table string
+		var nonUnique int
+		var currentKey string
+		var seqInIndex int
+		var columnName string
+		var collation sql.NullString
+		var cardinality sql.NullString
+		var subPart sql.NullString
+		var packed sql.NullString
+		var nullValue sql.NullString
+		var indexType string
+		var comment string
+		var indexComment string
+		var visible string
+		var expression sql.NullString
+		if err := rows.Scan(&table, &nonUnique, &currentKey, &seqInIndex, &columnName, &collation, &cardinality, &subPart, &packed, &nullValue, &indexType, &comment, &indexComment, &visible, &expression); err != nil {
+			t.Fatalf("scan show keys: %v", err)
+		}
+		if currentKey == keyName {
+			got = append(got, columnName)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read show keys: %v", err)
+	}
+	if len(got) == 0 && len(want) == 0 {
+		return
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("SHOW KEYS %s columns = %#v, want %#v", keyName, got, want)
+	}
 }
 
 func TestMemoryDatabaseSharedFalseIsolatesConnections(t *testing.T) {
@@ -1697,6 +2745,17 @@ func TestServerResetReappliesSchemaSeedAndClearsRuntimeState(t *testing.T) {
 	}
 	if err := db.QueryRowContext(ctx, "SELECT 'reset_once'").Scan(new(string)); err == nil {
 		t.Fatal("expected once rule error after reset")
+	}
+	result, err := db.ExecContext(ctx, "INSERT INTO users (name, email) VALUES (?, ?)", "After Reset", "after-reset@example.com")
+	if err != nil {
+		t.Fatalf("insert after reset: %v", err)
+	}
+	lastID, err := result.LastInsertId()
+	if err != nil {
+		t.Fatalf("last insert id after reset: %v", err)
+	}
+	if lastID != 3 {
+		t.Fatalf("last insert id after reset = %d, want 3", lastID)
 	}
 }
 

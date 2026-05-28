@@ -9,7 +9,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"go.yaml.in/yaml/v4"
 )
@@ -22,12 +24,22 @@ type Config struct {
 	SchemaFiles []string                    `yaml:"schema_files"`
 	Schema      []string                    `yaml:"schema"`
 	SeedFiles   []string                    `yaml:"seed_files"`
+	SeedConfigs []SeedFileConfig            `yaml:"seed_file_configs"`
 	Seed        map[string][]map[string]any `yaml:"seed"`
 	Compat      CompatConfig                `yaml:"compat"`
 	Rules       []RuleConfig                `yaml:"rules"`
 	Fallback    FallbackConfig              `yaml:"fallback"`
 
 	schemaBaseDir string
+}
+
+// SeedFileConfig describes one external seed file with optional decoding settings.
+type SeedFileConfig struct {
+	Path       string   `yaml:"path"`
+	Format     string   `yaml:"format"`
+	Table      string   `yaml:"table"`
+	NullValues []string `yaml:"null_values"`
+	InferTypes bool     `yaml:"infer_types"`
 }
 
 // ServerConfig contains listener and MySQL compatibility settings.
@@ -133,8 +145,11 @@ func DefaultConfig() Config {
 				"autocommit":               "1",
 				"character_set_client":     "utf8mb4",
 				"character_set_connection": "utf8mb4",
+				"character_set_database":   "utf8mb4",
 				"character_set_results":    "utf8mb4",
 				"collation_connection":     "utf8mb4_general_ci",
+				"collation_database":       "utf8mb4_general_ci",
+				"foreign_key_checks":       "1",
 				"max_allowed_packet":       "67108864",
 				"sql_mode":                 "",
 				"transaction_isolation":    "READ-COMMITTED",
@@ -183,16 +198,29 @@ func LoadConfigFile(path string) (Config, error) {
 }
 
 func decodeSeedFile(path string, data []byte) (map[string][]map[string]any, error) {
-	switch strings.ToLower(filepath.Ext(path)) {
+	return decodeSeedFileConfig(SeedFileConfig{Path: path}, data)
+}
+
+func decodeSeedFileConfig(cfg SeedFileConfig, data []byte) (map[string][]map[string]any, error) {
+	path := cfg.Path
+	switch seedFileFormat(path, cfg.Format) {
 	case ".yaml", ".yml", "":
 		return decodeYAMLSeedFile(data)
 	case ".json":
 		return decodeJSONSeedFile(data)
 	case ".csv":
-		return decodeCSVSeedFile(path, data)
+		return decodeCSVSeedFile(cfg, data)
 	default:
-		return nil, fmt.Errorf("unsupported seed file extension: %s", filepath.Ext(path))
+		return nil, fmt.Errorf("unsupported seed file extension: %s", seedFileFormat(path, cfg.Format))
 	}
+}
+
+func seedFileFormat(path, format string) string {
+	format = strings.ToLower(strings.TrimSpace(format))
+	if format == "" {
+		return strings.ToLower(filepath.Ext(path))
+	}
+	return "." + strings.TrimPrefix(format, ".")
 }
 
 func decodeYAMLSeedFile(data []byte) (map[string][]map[string]any, error) {
@@ -234,8 +262,12 @@ func decodeJSONSeedFile(data []byte) (map[string][]map[string]any, error) {
 	return seed, nil
 }
 
-func decodeCSVSeedFile(path string, data []byte) (map[string][]map[string]any, error) {
-	tableName := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+func decodeCSVSeedFile(cfg SeedFileConfig, data []byte) (map[string][]map[string]any, error) {
+	path := cfg.Path
+	tableName := strings.TrimSpace(cfg.Table)
+	if tableName == "" {
+		tableName = strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	}
 	if tableName == "" {
 		return nil, errors.New("CSV seed file name must include a table name")
 	}
@@ -257,6 +289,7 @@ func decodeCSVSeedFile(path string, data []byte) (map[string][]map[string]any, e
 	}
 
 	rows := []map[string]any{}
+	nullValues := seedCSVNullValues(cfg.NullValues)
 	for {
 		record, err := reader.Read()
 		if errors.Is(err, io.EOF) {
@@ -267,15 +300,103 @@ func decodeCSVSeedFile(path string, data []byte) (map[string][]map[string]any, e
 		}
 		row := map[string]any{}
 		for i, value := range record {
-			if value == `\N` {
+			if nullValues[value] {
 				row[header[i]] = nil
 				continue
 			}
-			row[header[i]] = value
+			row[header[i]] = decodeCSVSeedValue(value, cfg.InferTypes)
 		}
 		rows = append(rows, row)
 	}
 	return map[string][]map[string]any{tableName: rows}, nil
+}
+
+func seedCSVNullValues(values []string) map[string]bool {
+	if len(values) == 0 {
+		values = []string{`\N`}
+	}
+	out := make(map[string]bool, len(values))
+	for _, value := range values {
+		out[value] = true
+	}
+	return out
+}
+
+func decodeCSVSeedValue(value string, inferTypes bool) any {
+	if !inferTypes {
+		return value
+	}
+	trimmed := strings.TrimSpace(value)
+	switch strings.ToLower(trimmed) {
+	case "true":
+		return true
+	case "false":
+		return false
+	}
+	if isIntegerLiteral(trimmed) {
+		if parsed, err := strconv.ParseInt(trimmed, 10, 64); err == nil {
+			return parsed
+		}
+	}
+	if isFloatLiteral(trimmed) {
+		if parsed, err := strconv.ParseFloat(trimmed, 64); err == nil {
+			return parsed
+		}
+	}
+	for _, layout := range []string{
+		time.RFC3339Nano,
+		"2006-01-02 15:04:05.999999",
+		"2006-01-02 15:04:05",
+		"2006-01-02",
+	} {
+		if parsed, err := time.Parse(layout, trimmed); err == nil {
+			return parsed
+		}
+	}
+	return value
+}
+
+func isIntegerLiteral(value string) bool {
+	if value == "" {
+		return false
+	}
+	if value[0] == '-' || value[0] == '+' {
+		value = value[1:]
+	}
+	if value == "" {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		if value[i] < '0' || value[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func isFloatLiteral(value string) bool {
+	if !strings.ContainsAny(value, ".eE") {
+		return false
+	}
+	if value == "" {
+		return false
+	}
+	if value[0] == '-' || value[0] == '+' {
+		value = value[1:]
+	}
+	digitSeen := false
+	for i := 0; i < len(value); i++ {
+		ch := value[i]
+		if '0' <= ch && ch <= '9' {
+			digitSeen = true
+			continue
+		}
+		if ch == '.' || ch == 'e' || ch == 'E' || ch == '-' || ch == '+' {
+			continue
+		}
+		return false
+	}
+	return digitSeen
 }
 
 func validateRequiredConfigFields(topLevel map[string]any) error {
@@ -406,6 +527,17 @@ func (c Config) Validate() error {
 	}
 	if unsupportedSQLState != fixedSQLState(unsupportedSQLState) {
 		return fmt.Errorf("fallback.unsupported.sql_state must be 5 characters: %s", c.Fallback.Unsupported.SQLState)
+	}
+	for i, seedFile := range c.SeedConfigs {
+		if strings.TrimSpace(seedFile.Path) == "" {
+			return fmt.Errorf("seed_file_configs[%d].path is required", i)
+		}
+		format := seedFileFormat(seedFile.Path, seedFile.Format)
+		switch format {
+		case ".yaml", ".yml", ".json", ".csv", "":
+		default:
+			return fmt.Errorf("seed_file_configs[%d].format is unsupported: %s", i, seedFile.Format)
+		}
 	}
 	for i, rule := range c.Rules {
 		if err := validateRuleConfig(rule); err != nil {

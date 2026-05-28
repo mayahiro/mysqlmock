@@ -68,12 +68,15 @@ const (
 	fieldTypeString    byte = 0xfe
 	fieldTypeGeometry  byte = 0xff
 
-	mysqlErrUnknown      uint16 = 1105
-	mysqlErrNoSuchTable  uint16 = 1146
-	mysqlErrDupEntry     uint16 = 1062
-	mysqlErrBadNull      uint16 = 1048
-	mysqlErrNoReferenced uint16 = 1452
-	mysqlErrCheck        uint16 = 3819
+	mysqlErrUnknown            uint16 = 1105
+	mysqlErrNoSuchTable        uint16 = 1146
+	mysqlErrDupEntry           uint16 = 1062
+	mysqlErrBadNull            uint16 = 1048
+	mysqlErrNoReferenced       uint16 = 1452
+	mysqlErrWrongValue         uint16 = 1292
+	mysqlErrWrongValueForField uint16 = 1366
+	mysqlErrDataTooLong        uint16 = 1406
+	mysqlErrCheck              uint16 = 3819
 )
 
 type mysqlConn struct {
@@ -90,6 +93,7 @@ type mysqlConn struct {
 	characterSetConnection string
 	characterSetResults    string
 	collationConnection    string
+	sessionVariables       map[string]string
 
 	lastInsertID     uint64
 	lastAffectedRows int64
@@ -316,13 +320,24 @@ func (c *mysqlConn) executeQuery(ctx context.Context, command, sqlText string, a
 	switch {
 	case strings.HasPrefix(upper, "SET NAMES "):
 		c.logQuery(command, "compat", sqlText, normalized)
-		return c.setNames(normalized), nil
+		resp := c.setNames(normalized)
+		c.setVariables(ctx, trimmed)
+		return resp, nil
 	case strings.HasPrefix(upper, "SET AUTOCOMMIT"):
 		c.logQuery(command, "compat", sqlText, normalized)
 		return c.setAutocommit(upper), nil
+	case strings.HasPrefix(upper, "SET TRANSACTION "):
+		c.logQuery(command, "compat", sqlText, normalized)
+		return okResult{}, nil
+	case strings.HasPrefix(upper, "SET "):
+		c.logQuery(command, "compat", sqlText, normalized)
+		return c.setVariables(ctx, trimmed), nil
 	case upper == "SELECT VERSION()" || upper == "SELECT VERSION":
 		c.logQuery(command, "compat", sqlText, normalized)
 		return oneRow("VERSION()", c.server.cfg.Server.MySQLVersion), nil
+	case isAdvisoryLockQuery(upper):
+		c.logQuery(command, "compat", sqlText, normalized)
+		return c.advisoryLockResult(trimmed), nil
 	case upper == "SELECT DATABASE()":
 		c.logQuery(command, "compat", sqlText, normalized)
 		return oneRow("DATABASE()", c.currentDB), nil
@@ -355,6 +370,15 @@ func (c *mysqlConn) executeQuery(ctx context.Context, command, sqlText string, a
 	case upper == "SHOW TABLES":
 		c.logQuery(command, "compat", sqlText, normalized)
 		return c.showTables(ctx)
+	case isShowFullFieldsQuery(upper):
+		c.logQuery(command, "compat", sqlText, normalized)
+		return c.showFullFields(ctx, trimmed)
+	case isShowCreateTableQuery(upper):
+		c.logQuery(command, "compat", sqlText, normalized)
+		return c.showCreateTable(ctx, trimmed)
+	case isShowKeysQuery(upper):
+		c.logQuery(command, "compat", sqlText, normalized)
+		return c.showKeys(ctx, trimmed)
 	case isInformationSchemaQuery(upper):
 		c.logQuery(command, "compat", sqlText, normalized)
 		return c.queryInformationSchema(ctx, trimmed, args...)
@@ -371,6 +395,12 @@ func (c *mysqlConn) executeQuery(ctx context.Context, command, sqlText string, a
 		resp, err := c.execSQLite(ctx, "ROLLBACK")
 		c.statusFlags &^= serverStatusInTrans
 		return resp, err
+	case upper == "ROLLBACK AND CHAIN":
+		c.logQuery(command, "sqlite", sqlText, normalized)
+		if _, err := c.execSQLite(ctx, "ROLLBACK"); err != nil {
+			return okResult{}, err
+		}
+		return c.execSQLite(ctx, "BEGIN")
 	case strings.HasPrefix(upper, "SAVEPOINT ") ||
 		strings.HasPrefix(upper, "RELEASE SAVEPOINT ") ||
 		strings.HasPrefix(upper, "ROLLBACK TO SAVEPOINT "):
@@ -384,12 +414,26 @@ func (c *mysqlConn) executeQuery(ctx context.Context, command, sqlText string, a
 	}
 	if isWriteQuery(upper) {
 		c.logQuery(command, "sqlite", sqlText, normalized)
+		if resp, handled, err := c.execMySQLDDLCompatibility(ctx, trimmed); handled || err != nil {
+			return resp, err
+		}
 		if strings.HasPrefix(upper, "INSERT ") {
 			if resp, handled, err := c.execMySQLUpsert(ctx, trimmed, args...); handled || err != nil {
 				return resp, err
 			}
 		}
-		return c.execSQLiteStatements(ctx, translateSQLStatements(trimmed), args...)
+		if strings.HasPrefix(upper, "INSERT ") || strings.HasPrefix(upper, "REPLACE ") {
+			if resp, handled, err := c.execMySQLInsertCompatibility(ctx, trimmed, args...); handled || err != nil {
+				return resp, err
+			}
+		}
+		resp, err := c.execSQLiteStatements(ctx, translateSQLStatements(trimmed), args...)
+		if err == nil {
+			c.server.recordMySQLIndexMetadata(trimmed)
+			c.server.recordMySQLTableDDL(trimmed)
+			c.server.invalidateMySQLTableDDLForStatement(trimmed)
+		}
+		return resp, err
 	}
 
 	c.recordUnsupported(command, sqlText, normalized, "unsupported")
@@ -434,6 +478,97 @@ func (c *mysqlConn) resetCharacterSetState() {
 	c.characterSetConnection = c.server.cfg.Compat.Variables["character_set_connection"]
 	c.characterSetResults = c.server.cfg.Compat.Variables["character_set_results"]
 	c.collationConnection = c.server.cfg.Compat.Variables["collation_connection"]
+}
+
+func (c *mysqlConn) setVariables(ctx context.Context, sqlText string) okResult {
+	if c.sessionVariables == nil {
+		c.sessionVariables = map[string]string{}
+	}
+	rest := strings.TrimSpace(sqlText[len("SET"):])
+	for _, assignment := range splitSQLTopLevelList(rest) {
+		name, value, ok := parseSetVariableAssignment(assignment)
+		if !ok {
+			continue
+		}
+		name = normalizeSystemVariableName(name)
+		if name == "" {
+			continue
+		}
+		value = c.normalizeSystemVariableValue(name, value)
+		c.sessionVariables[name] = value
+		if strings.EqualFold(name, "foreign_key_checks") {
+			pragma := "ON"
+			if value == "0" || strings.EqualFold(value, "OFF") {
+				pragma = "OFF"
+				if c.statusFlags&serverStatusInTrans != 0 {
+					_, _ = c.sqliteConn.ExecContext(ctx, "PRAGMA defer_foreign_keys = ON")
+				}
+			}
+			_, _ = c.sqliteConn.ExecContext(ctx, "PRAGMA foreign_keys = "+pragma)
+		}
+	}
+	return okResult{}
+}
+
+func parseSetVariableAssignment(assignment string) (name, value string, ok bool) {
+	assignment = strings.TrimSpace(assignment)
+	eq := topLevelEqualIndex(assignment)
+	if eq < 0 {
+		return "", "", false
+	}
+	name = strings.TrimSpace(assignment[:eq])
+	value = strings.TrimSpace(strings.TrimSuffix(assignment[eq+1:], ";"))
+	if name == "" || value == "" {
+		return "", "", false
+	}
+	return name, value, true
+}
+
+func topLevelEqualIndex(sqlText string) int {
+	depth := 0
+	for i := 0; i < len(sqlText); {
+		if end, ok := quotedSQLSpan(sqlText, i); ok {
+			i = end
+			continue
+		}
+		if end, ok := sqlCommentSpan(sqlText, i); ok {
+			i = end
+			continue
+		}
+		switch sqlText[i] {
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case '=':
+			if depth == 0 {
+				return i
+			}
+		}
+		i++
+	}
+	return -1
+}
+
+func normalizeSystemVariableName(name string) string {
+	name = strings.TrimSpace(name)
+	name = strings.TrimPrefix(name, "@@")
+	name = strings.TrimPrefix(strings.ToLower(name), "session.")
+	name = strings.TrimPrefix(name, "global.")
+	return name
+}
+
+func (c *mysqlConn) normalizeSystemVariableValue(name, value string) string {
+	value = strings.TrimSpace(strings.TrimSuffix(value, ";"))
+	if strings.EqualFold(value, "DEFAULT") {
+		if configured, ok := c.server.cfg.Compat.Variables[name]; ok {
+			return configured
+		}
+		return ""
+	}
+	return unquoteSQLWord(value)
 }
 
 func (c *mysqlConn) selectVariable(command, sqlText, normalizedSQL string) (resultSet, error) {
@@ -494,6 +629,9 @@ func (c *mysqlConn) compatVariable(name string) (string, bool) {
 	case "collation_connection":
 		return c.collationConnection, true
 	default:
+		if value, ok := c.sessionVariables[name]; ok {
+			return value, true
+		}
 		value, ok := c.server.cfg.Compat.Variables[name]
 		return value, ok
 	}
@@ -502,6 +640,9 @@ func (c *mysqlConn) compatVariable(name string) (string, bool) {
 func (c *mysqlConn) compatVariables() map[string]string {
 	variables := make(map[string]string, len(c.server.cfg.Compat.Variables))
 	for k, v := range c.server.cfg.Compat.Variables {
+		variables[k] = v
+	}
+	for k, v := range c.sessionVariables {
 		variables[k] = v
 	}
 	for _, name := range []string{
@@ -531,6 +672,9 @@ func (c *mysqlConn) showTables(ctx context.Context) (resultSet, error) {
 func (c *mysqlConn) execSQLite(ctx context.Context, query string, args ...any) (okResult, error) {
 	if strings.EqualFold(strings.TrimSpace(query), "BEGIN") {
 		c.statusFlags |= serverStatusInTrans
+	}
+	if err := c.validateMySQLWriteValues(ctx, query, args...); err != nil {
+		return okResult{}, err
 	}
 	res, err := c.sqliteConn.ExecContext(ctx, query, args...)
 	if err != nil {
@@ -892,6 +1036,8 @@ func mapSQLiteError(sqlText string, err error) *mysqlError {
 		return errPacket(mysqlErrNoReferenced, "23000", "Cannot add or update child row")
 	case strings.Contains(lower, "constraint failed"):
 		return errPacket(mysqlErrCheck, "HY000", "Check constraint failed")
+	case strings.Contains(lower, "datatype mismatch"):
+		return errPacket(mysqlErrWrongValueForField, "HY000", msg)
 	case strings.Contains(lower, "no such table"):
 		return errPacket(mysqlErrNoSuchTable, "42S02", msg)
 	case strings.Contains(lower, "syntax error"):
@@ -923,6 +1069,7 @@ func isWriteQuery(upper string) bool {
 		strings.HasPrefix(upper, "CREATE INDEX ") ||
 		strings.HasPrefix(upper, "CREATE UNIQUE INDEX ") ||
 		strings.HasPrefix(upper, "ALTER TABLE ") ||
+		strings.HasPrefix(upper, "RENAME TABLE ") ||
 		strings.HasPrefix(upper, "DROP TABLE ") ||
 		strings.HasPrefix(upper, "DROP INDEX ")
 }
@@ -949,8 +1096,13 @@ func translateSQL(sqlText string) string {
 	if stripped, ok := stripMySQLLockingClause(sqlText); ok {
 		sqlText = stripped
 	}
+	sqlText = translateMySQLOperators(sqlText)
+	sqlText = translateMySQLFunctionCalls(sqlText)
 
 	if translated, ok := translateMySQLAlterTableAddIndex(sqlText); ok {
+		return translated
+	}
+	if translated, ok := translateMySQLCreateIndex(sqlText); ok {
 		return translated
 	}
 
@@ -1031,6 +1183,10 @@ func translateSQL(sqlText string) string {
 				} else {
 					out.WriteString(ident)
 				}
+			case "VISIBLE", "INVISIBLE":
+				if !stripDDLMode {
+					out.WriteString(ident)
+				}
 			case "CHARACTER":
 				if next := consumeCharacterSetOption(sqlText, i); stripDDLMode && next >= 0 {
 					i = next
@@ -1066,6 +1222,7 @@ func stripsMySQLDDLOptions(sqlText string) bool {
 	return strings.HasPrefix(upper, "CREATE TABLE ") ||
 		strings.HasPrefix(upper, "CREATE TEMPORARY TABLE ") ||
 		strings.HasPrefix(upper, "CREATE TEMP TABLE ") ||
+		strings.HasPrefix(upper, "ALTER TABLE ") ||
 		strings.HasPrefix(upper, "CREATE INDEX ") ||
 		strings.HasPrefix(upper, "CREATE UNIQUE INDEX ")
 }
@@ -1104,6 +1261,10 @@ func translateMySQLAlterTableAddIndex(sqlText string) (string, bool) {
 	columns := sqlText[columnsStart:columnsEnd]
 	pos = columnsEnd
 	for {
+		if consumeKeyword(sqlText, &pos, "VISIBLE") || consumeKeyword(sqlText, &pos, "INVISIBLE") {
+			pos = skipSQLSpaces(sqlText, pos)
+			continue
+		}
 		next, ok := consumeSQLNamedOption(sqlText, pos, "USING")
 		if !ok {
 			break
@@ -1129,6 +1290,62 @@ func translateMySQLAlterTableAddIndex(sqlText string) (string, bool) {
 	out.WriteString(tableName)
 	out.WriteByte(' ')
 	out.WriteString(columns)
+	return out.String(), true
+}
+
+func translateMySQLCreateIndex(sqlText string) (string, bool) {
+	pos := skipSQLSpaces(sqlText, 0)
+	if !consumeKeyword(sqlText, &pos, "CREATE") {
+		return "", false
+	}
+	unique := consumeKeyword(sqlText, &pos, "UNIQUE")
+	if !consumeKeyword(sqlText, &pos, "INDEX") {
+		return "", false
+	}
+	indexName, pos, ok := readSQLNameToken(sqlText, pos)
+	if !ok || !consumeKeyword(sqlText, &pos, "ON") {
+		return "", false
+	}
+	tableName, pos, ok := readSQLQualifiedName(sqlText, pos)
+	if !ok {
+		return "", false
+	}
+	columnsStart := skipSQLSpaces(sqlText, pos)
+	columnsEnd, ok := parenthesizedSQLSpan(sqlText, columnsStart)
+	if !ok {
+		return "", false
+	}
+	pos = skipSQLSpaces(sqlText, columnsEnd)
+	for {
+		if consumeKeyword(sqlText, &pos, "VISIBLE") || consumeKeyword(sqlText, &pos, "INVISIBLE") {
+			pos = skipSQLSpaces(sqlText, pos)
+			continue
+		}
+		next, ok := consumeSQLNamedOption(sqlText, pos, "USING")
+		if !ok {
+			break
+		}
+		pos = next
+	}
+	pos = skipSQLSpaces(sqlText, pos)
+	if pos < len(sqlText) && sqlText[pos] == ';' {
+		pos = skipSQLSpaces(sqlText, pos+1)
+	}
+	if pos != len(sqlText) {
+		return "", false
+	}
+
+	var out strings.Builder
+	out.WriteString("CREATE ")
+	if unique {
+		out.WriteString("UNIQUE ")
+	}
+	out.WriteString("INDEX ")
+	out.WriteString(indexName)
+	out.WriteString(" ON ")
+	out.WriteString(tableName)
+	out.WriteByte(' ')
+	out.WriteString(translateMySQLIndexColumns(sqlText[columnsStart:columnsEnd]))
 	return out.String(), true
 }
 

@@ -36,6 +36,9 @@ func TestConfigSchemaJSON(t *testing.T) {
 	if properties["seed_files"] == nil {
 		t.Fatal("schema did not include seed_files")
 	}
+	if properties["seed_file_configs"] == nil {
+		t.Fatal("schema did not include seed_file_configs")
+	}
 
 	compat := properties["compat"].(map[string]any)
 	compatProperties := compat["properties"].(map[string]any)

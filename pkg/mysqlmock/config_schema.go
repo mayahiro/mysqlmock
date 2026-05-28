@@ -101,6 +101,35 @@ const configSchemaJSON = `{
         "type": "string"
       }
     },
+    "seed_file_configs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path"],
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "format": {
+            "type": "string",
+            "enum": ["yaml", "yml", "json", "csv"]
+          },
+          "table": {
+            "type": "string"
+          },
+          "null_values": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "infer_types": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
     "compat": {
       "type": "object",
       "additionalProperties": false,

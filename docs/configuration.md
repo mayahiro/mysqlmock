@@ -32,6 +32,7 @@ Missing nested values are filled from defaults.
 | `schema_files` | No | SQL dump files applied before inline `schema`. |
 | `seed` | No | Table rows inserted after schema setup. |
 | `seed_files` | No | YAML, JSON, or CSV seed files inserted before inline `seed`. |
+| `seed_file_configs` | No | External seed files with per-file CSV options. |
 | `compat` | No | Built-in MySQL compatibility variables and profiles. |
 | `rules` | No | SQL override and fault-injection rules. |
 | `fallback` | No | Behavior after rules and built-in compatibility handlers. |
@@ -138,8 +139,8 @@ before being applied. The translator handles common Repository-test DDL such as
 `AUTO_INCREMENT`, TiDB `AUTO_RANDOM`, TiDB clustered-index comments, `TRUE`,
 `FALSE`, `NOW()`, `CURRENT_TIMESTAMP(n)`, common table options,
 `AUTO_RANDOM_BASE`, table-level `PRIMARY KEY` / `UNIQUE KEY` / `KEY`
-definitions, and simple MySQL index DDL. It does not try to implement a full
-MySQL parser.
+definitions, simple MySQL index DDL, and common `ALTER TABLE` / `RENAME TABLE`
+variants. It does not try to implement a full MySQL parser.
 
 ## Seed Data
 
@@ -171,6 +172,21 @@ YAML and JSON seed files may either contain the same table map as `seed` or wrap
 it under a `seed` key. CSV seed files use the file name without `.csv` as the
 table name, the first row as column names, and `\N` as `NULL`.
 
+Use `seed_file_configs` when a seed file needs per-file settings:
+
+```yaml
+seed_file_configs:
+  - path: testdata/legacy_users.csv
+    format: csv
+    table: users
+    null_values: ["NULL", "\\N"]
+    infer_types: true
+```
+
+`table` overrides the CSV file-name table convention. `null_values` defaults to
+`["\\N"]`. `infer_types: true` converts simple booleans, integers, floats, and
+common datetime strings before inserting rows.
+
 Seed data is inserted after all schema statements. Table and column names are
 quoted when mysqlmock builds seed insert statements.
 
@@ -189,8 +205,11 @@ The `default` profile includes common variables such as:
 - `autocommit`
 - `character_set_client`
 - `character_set_connection`
+- `character_set_database`
 - `character_set_results`
 - `collation_connection`
+- `collation_database`
+- `foreign_key_checks`
 - `max_allowed_packet`
 - `sql_mode`
 - `transaction_isolation`
@@ -201,7 +220,6 @@ The `gorm` profile adds common ORM initialization variables, including:
 
 - `character_set_server`
 - `collation_server`
-- `foreign_key_checks`
 - `lower_case_table_names`
 - `sql_auto_is_null`
 - `system_time_zone`
@@ -231,8 +249,19 @@ the MySQL error returned when a query is not handled by rules, built-in
 compatibility handlers, or SQLite fallback.
 
 SQLite fallback includes focused repository-test compatibility for
-`INSERT ... ON DUPLICATE KEY UPDATE` with `VALUES(column)` and insert-side
-`DEFAULT` values.
+`INSERT ... ON DUPLICATE KEY UPDATE` with `VALUES(column)`, ActiveRecord-style
+row aliases, and insert-side `DEFAULT` values, `INSERT IGNORE`, and
+`REPLACE INTO`.
+
+For MySQL-compatible DDL that creates indexes, mysqlmock also keeps lightweight
+index metadata so `SHOW KEYS` can expose prefix length, expression, and
+visibility fields used by ORM schema introspection.
+
+When `SHOW CREATE TABLE` is requested, mysqlmock returns the original configured
+MySQL/TiDB `CREATE TABLE` statement while that table has not been changed at
+runtime. After table-altering DDL, the cached original DDL is invalidated and
+the response falls back to the current SQLite definition with MySQL-style table
+options.
 
 ## JSON Schema
 

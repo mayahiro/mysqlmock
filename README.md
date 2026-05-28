@@ -111,6 +111,12 @@ seed_files:
   - testdata/posts.json
   - testdata/tags.csv
 
+seed_file_configs:
+  - path: testdata/legacy_users.csv
+    table: users
+    null_values: ["NULL", "\\N"]
+    infer_types: true
+
 schema:
   - |
     CREATE TABLE users (
@@ -142,7 +148,8 @@ Repository-test SQL. `database.mode: memory` uses an in-memory SQLite backend.
 Use `schema_files` to load DDL from SQL dump files before inline `schema`
 statements.
 Use `seed_files` to load seed rows from YAML, JSON, or CSV files before inline
-`seed` rows.
+`seed` rows. Use `seed_file_configs` when a CSV file needs an explicit table
+name, custom NULL markers, or basic type inference.
 Set `database.shared: false` to initialize a separate in-memory database for
 each MySQL client connection. Set `database.mode: file` and `database.path` to
 persist the SQLite database across mysqlmock server restarts.
@@ -191,30 +198,53 @@ also be written as stable JSON for golden-file tests.
 
 See [docs/rules-and-diagnostics.md](docs/rules-and-diagnostics.md) for rule,
 logging, unsupported-query, and snapshot details.
+For repository tests, call `mysqlmock.AssertNoUnsupported(t, server)` after the
+workflow and use `server.Reset(ctx)` between cases to restore schema, seed data,
+auto-increment state, rules, and diagnostics.
 
 ## Compatibility Notes
 
 Built-in compatibility handlers cover common MySQL client and ORM setup queries,
 including `SET NAMES`, `SET autocommit`, `SELECT VERSION()`, `SELECT @@...`,
-`SHOW VARIABLES`, `SHOW TABLES`, and a small `information_schema` subset.
+`SHOW VARIABLES`, `SHOW TABLES`, ActiveRecord-style schema introspection
+queries, and a small `information_schema` subset.
 
 Built-in scalar compatibility functions include `DATABASE()`, `SCHEMA()`,
 `USER()`, `CURRENT_USER()`, `CONNECTION_ID()`, `LAST_INSERT_ID()`, and
 `ROW_COUNT()`.
 
 `information_schema.schemata`, `tables`, `columns`, `key_column_usage`,
-`statistics`, `table_constraints`, and `referential_constraints` are available
-as a small metadata subset derived from the SQLite schema.
+`statistics`, `table_constraints`, `referential_constraints`, and
+`check_constraints` are available as a small metadata subset derived from the
+SQLite schema.
+
+ActiveRecord-style schema introspection supports `SHOW FULL FIELDS`,
+`SHOW CREATE TABLE`, and `SHOW KEYS`. `SHOW CREATE TABLE` prefers the original
+configured MySQL/TiDB DDL while the table is unchanged, then falls back to the
+runtime SQLite definition after table-altering DDL. Advisory lock functions such
+as `GET_LOCK` and `RELEASE_LOCK` emulate simple connection-owned lock conflicts.
+`SHOW KEYS` includes prefix length, expression, and visibility metadata when
+the index was created through mysqlmock's MySQL-compatible DDL path.
+
+Write validation maps common repository-test failures to MySQL-like errors,
+including duplicate keys, foreign keys, NOT NULL, CHECK constraints, data too
+long for character columns, incorrect integer values, and incorrect datetime
+values.
 
 Schema and query fallback translate `TRUE`, `FALSE`, `NOW()`,
 `CURRENT_TIMESTAMP()`, `AUTO_INCREMENT`, TiDB `AUTO_RANDOM`, common MySQL and
 TiDB DDL options, table-level `PRIMARY KEY` / `UNIQUE KEY` / `KEY` definitions,
-and simple MySQL index DDL into SQLite-compatible SQL where possible.
+simple MySQL index DDL, and common `ALTER TABLE` / `RENAME TABLE` variants into
+SQLite-compatible SQL where possible.
+Common scalar functions used by ORM queries include `IFNULL`, `COALESCE`,
+`CONCAT`, `CAST`, `DATE_FORMAT`, `JSON_EXTRACT`, and `JSON_UNQUOTE`.
 
 The SQLite fallback also handles common MySQL repository-test syntax such as
-`INSERT ... ON DUPLICATE KEY UPDATE` with `VALUES(column)` and insert-side
-`DEFAULT` values. It also strips `FOR UPDATE` locking clauses, including
-`NOWAIT` and `SKIP LOCKED`. mysqlmock does not emulate real MySQL row locks.
+`INSERT ... ON DUPLICATE KEY UPDATE` with `VALUES(column)`, ActiveRecord-style
+row aliases, and insert-side `DEFAULT` values, `INSERT IGNORE`, and
+`REPLACE INTO`. It also strips
+`FOR UPDATE` locking clauses, including `NOWAIT` and `SKIP LOCKED`. mysqlmock
+does not emulate real MySQL row locks.
 
 ## CLI
 
@@ -254,19 +284,28 @@ make build
 ```
 
 Set `MYSQLMOCK_REAL_MYSQL_DSN` to run the optional compatibility scenario that
-compares a small CRUD, transaction, and duplicate-key workflow against a real
-MySQL database:
+compares CRUD, transaction, duplicate-key, upsert, `INSERT IGNORE`, and
+`REPLACE INTO` behavior against a real MySQL database:
 
 ```sh
 MYSQLMOCK_REAL_MYSQL_DSN='user:password@tcp(127.0.0.1:3306)/testdb?parseTime=true' \
   go test ./pkg/mysqlmock -run TestRealMySQLCompatibilityScenario
 ```
 
+Set `MYSQLMOCK_REAL_TIDB_DSN` to run the same scenario against TiDB:
+
+```sh
+MYSQLMOCK_REAL_TIDB_DSN='user:password@tcp(127.0.0.1:4000)/testdb?parseTime=true' \
+  go test ./pkg/mysqlmock -run TestRealTiDBCompatibilityScenario
+```
+
 Set `MYSQLMOCK_CLIENT_COMPAT_COMMANDS` to a JSON array of external client
 commands to run opt-in compatibility checks for other languages. Each command is
 run without a shell and receives `MYSQLMOCK_HOST`, `MYSQLMOCK_PORT`,
 `MYSQLMOCK_USER`, `MYSQLMOCK_PASSWORD`, `MYSQLMOCK_DATABASE`, `MYSQLMOCK_ADDR`,
-and `MYSQLMOCK_DSN` in its environment.
+and `MYSQLMOCK_DSN` in its environment. This hook is the recommended place to
+run a Rails or ActiveRecord smoke script when Ruby dependencies are available.
+See [examples/active_record_smoke](examples/active_record_smoke).
 
 ## Known Limitations
 

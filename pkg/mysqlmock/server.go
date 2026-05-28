@@ -85,10 +85,13 @@ type Server struct {
 	logFormat        string
 	logMu            sync.Mutex
 
-	mu           sync.Mutex
-	unsupported  []UnsupportedQuery
-	queries      []QueryEvent
-	ruleOnceUsed map[int]bool
+	mu            sync.Mutex
+	unsupported   []UnsupportedQuery
+	queries       []QueryEvent
+	ruleOnceUsed  map[int]bool
+	advisoryLocks map[string]uint32
+	indexMetadata map[string]mysqlIndexMetadata
+	tableDDL      map[string]string
 }
 
 // UnsupportedQuery records a query that mysqlmock could not execute.
@@ -153,10 +156,13 @@ func New(opts ...Option) (*Server, error) {
 	}
 
 	s := &Server{
-		cfg:       cfg,
-		done:      make(chan struct{}),
-		logWriter: options.logWriter,
-		logFormat: logFormat,
+		cfg:           cfg,
+		done:          make(chan struct{}),
+		logWriter:     options.logWriter,
+		logFormat:     logFormat,
+		advisoryLocks: map[string]uint32{},
+		indexMetadata: map[string]mysqlIndexMetadata{},
+		tableDDL:      map[string]string{},
 	}
 	s.nextConnectionID.Store(cfg.Server.ConnectionIDStart)
 	return s, nil
@@ -258,6 +264,10 @@ func (s *Server) Reset(ctx context.Context) error {
 	if s.keepConn == nil {
 		return errors.New("mysqlmock server not started")
 	}
+	s.mu.Lock()
+	s.indexMetadata = map[string]mysqlIndexMetadata{}
+	s.tableDDL = map[string]string{}
+	s.mu.Unlock()
 	if err := s.resetBackend(ctx, s.keepConn); err != nil {
 		return err
 	}
@@ -338,9 +348,11 @@ func (s *Server) handleNetConn(conn net.Conn) {
 		characterSetConnection: s.cfg.Compat.Variables["character_set_connection"],
 		characterSetResults:    s.cfg.Compat.Variables["character_set_results"],
 		collationConnection:    s.cfg.Compat.Variables["collation_connection"],
+		sessionVariables:       map[string]string{},
 		nextStatementID:        1,
 		statements:             map[uint32]*preparedStatement{},
 	}
+	defer s.releaseAdvisoryLocks(c.connectionID)
 	if err := c.serve(ctx); err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, errRuleDisconnect) {
 		s.logf("connection=%d error=%v", c.connectionID, err)
 	}
@@ -457,12 +469,23 @@ func (s *Server) applySchemaStatement(ctx context.Context, conn *sql.Conn, stmt 
 			return fmt.Errorf("apply schema: %w", err)
 		}
 	}
+	s.recordMySQLIndexMetadata(stmt)
+	s.recordMySQLTableDDL(stmt)
 	return nil
 }
 
 func (s *Server) applySeed(ctx context.Context, conn *sql.Conn, seed map[string][]map[string]any) error {
 	for _, path := range s.cfg.SeedFiles {
-		loaded, err := s.loadSeedFile(path)
+		loaded, err := s.loadSeedFileConfig(SeedFileConfig{Path: path})
+		if err != nil {
+			return err
+		}
+		if err := s.applySeedRows(ctx, conn, loaded); err != nil {
+			return err
+		}
+	}
+	for _, seedFile := range s.cfg.SeedConfigs {
+		loaded, err := s.loadSeedFileConfig(seedFile)
 		if err != nil {
 			return err
 		}
@@ -473,7 +496,8 @@ func (s *Server) applySeed(ctx context.Context, conn *sql.Conn, seed map[string]
 	return s.applySeedRows(ctx, conn, seed)
 }
 
-func (s *Server) loadSeedFile(path string) (map[string][]map[string]any, error) {
+func (s *Server) loadSeedFileConfig(cfg SeedFileConfig) (map[string][]map[string]any, error) {
+	path := cfg.Path
 	resolved := path
 	if !filepath.IsAbs(resolved) {
 		baseDir := s.cfg.schemaBaseDir
@@ -482,11 +506,12 @@ func (s *Server) loadSeedFile(path string) (map[string][]map[string]any, error) 
 		}
 		resolved = filepath.Join(baseDir, path)
 	}
+	cfg.Path = resolved
 	data, err := os.ReadFile(resolved)
 	if err != nil {
 		return nil, fmt.Errorf("read seed file %s: %w", path, err)
 	}
-	seed, err := decodeSeedFile(resolved, data)
+	seed, err := decodeSeedFileConfig(cfg, data)
 	if err != nil {
 		return nil, fmt.Errorf("read seed file %s: %w", path, err)
 	}
@@ -664,6 +689,44 @@ func (s *Server) recordUnsupported(u UnsupportedQuery) {
 		NormalizedSQL: u.NormalizedSQL,
 		Suggestion:    u.Suggestion,
 	})
+}
+
+func (s *Server) getAdvisoryLock(name string, connectionID uint32) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.advisoryLocks == nil {
+		s.advisoryLocks = map[string]uint32{}
+	}
+	holder, ok := s.advisoryLocks[name]
+	if !ok || holder == connectionID {
+		s.advisoryLocks[name] = connectionID
+		return 1
+	}
+	return 0
+}
+
+func (s *Server) releaseAdvisoryLock(name string, connectionID uint32) any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	holder, ok := s.advisoryLocks[name]
+	if !ok {
+		return nil
+	}
+	if holder != connectionID {
+		return 0
+	}
+	delete(s.advisoryLocks, name)
+	return 1
+}
+
+func (s *Server) releaseAdvisoryLocks(connectionID uint32) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for name, holder := range s.advisoryLocks {
+		if holder == connectionID {
+			delete(s.advisoryLocks, name)
+		}
+	}
 }
 
 func (s *Server) logf(format string, args ...any) {

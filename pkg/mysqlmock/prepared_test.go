@@ -250,7 +250,12 @@ func TestTranslateSQLConvertsMySQLIndexDDL(t *testing.T) {
 		{
 			name:  "create index using after columns",
 			input: "CREATE INDEX idx_users_name ON users (name) USING BTREE;",
-			want:  "CREATE INDEX idx_users_name ON users (name) ;",
+			want:  "CREATE INDEX idx_users_name ON users (name)",
+		},
+		{
+			name:  "create index prefix and invisible",
+			input: "CREATE INDEX idx_users_name_prefix ON users (name(10)) INVISIBLE;",
+			want:  "CREATE INDEX idx_users_name_prefix ON users (name)",
 		},
 		{
 			name:  "alter table add index",
@@ -261,6 +266,31 @@ func TestTranslateSQLConvertsMySQLIndexDDL(t *testing.T) {
 			name:  "alter table add unique key",
 			input: "ALTER TABLE `users` ADD UNIQUE KEY `idx_users_email` (`email`);",
 			want:  "CREATE UNIQUE INDEX `idx_users_email` ON `users` (`email`)",
+		},
+		{
+			name:  "concat function",
+			input: "SELECT CONCAT(first_name, ' ', last_name) FROM users",
+			want:  "SELECT (first_name) || (' ') || (last_name) FROM users",
+		},
+		{
+			name:  "date format function",
+			input: "SELECT DATE_FORMAT(created_at, '%Y-%m-%d %H:%i:%s') FROM users",
+			want:  "SELECT strftime('%Y-%m-%d %H:%M:%S', created_at) FROM users",
+		},
+		{
+			name:  "json extract function",
+			input: "SELECT JSON_EXTRACT(payload, '$.role') FROM users",
+			want:  "SELECT json_quote(json_extract(payload, '$.role')) FROM users",
+		},
+		{
+			name:  "json unquote extract function",
+			input: "SELECT JSON_UNQUOTE(JSON_EXTRACT(payload, '$.role')) FROM users",
+			want:  "SELECT json_extract(payload, '$.role') FROM users",
+		},
+		{
+			name:  "cast signed function",
+			input: "SELECT CAST(score AS SIGNED) FROM users",
+			want:  "SELECT CAST(score AS INTEGER) FROM users",
 		},
 	}
 

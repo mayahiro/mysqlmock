@@ -13,6 +13,7 @@ type mysqlUpsertStatement struct {
 	TableName  string
 	Columns    []string
 	Rows       []mysqlUpsertRow
+	ValueAlias string
 	UpdateSQL  string
 	UpdateArgs []any
 }
@@ -20,6 +21,14 @@ type mysqlUpsertStatement struct {
 type mysqlUpsertRow struct {
 	Exprs []string
 	Args  []any
+}
+
+type mysqlInsertStatement struct {
+	TableName string
+	Columns   []string
+	Rows      []mysqlUpsertRow
+	Ignore    bool
+	Replace   bool
 }
 
 type mysqlUniqueKey struct {
@@ -80,7 +89,7 @@ func (c *mysqlConn) execMySQLUpsert(ctx context.Context, sqlText string, args ..
 		if err != nil {
 			return okResult{}, true, err
 		}
-		updateSQL, updateArgs, err := buildSQLiteUpsertUpdate(stmt.TableName, stmt.Columns, values, stmt.UpdateSQL, stmt.UpdateArgs, rowID)
+		updateSQL, updateArgs, err := buildSQLiteUpsertUpdate(stmt.TableName, stmt.Columns, values, stmt.ValueAlias, stmt.UpdateSQL, stmt.UpdateArgs, rowID)
 		if err != nil {
 			return okResult{}, true, err
 		}
@@ -99,6 +108,87 @@ func (c *mysqlConn) execMySQLUpsert(ctx context.Context, sqlText string, args ..
 		}
 	}
 
+	return okResult{AffectedRows: affected, LastInsertID: lastInsertID}, true, nil
+}
+
+func (c *mysqlConn) execMySQLInsertCompatibility(ctx context.Context, sqlText string, args ...any) (okResult, bool, error) {
+	stmt, ok, err := parseMySQLInsertStatement(sqlText, args)
+	if err != nil || !ok {
+		return okResult{}, ok, err
+	}
+	if !stmt.Ignore && !stmt.Replace {
+		return okResult{}, false, nil
+	}
+	if len(stmt.Columns) == 0 {
+		columns, err := c.insertColumns(ctx, stmt.TableName)
+		if err != nil {
+			return okResult{}, true, err
+		}
+		stmt.Columns = columns
+	}
+	tableColumns, err := c.tableColumns(ctx, stmt.TableName)
+	if err != nil {
+		return okResult{}, true, err
+	}
+
+	if stmt.Ignore {
+		return c.execMySQLInsertIgnore(ctx, stmt, tableColumns)
+	}
+	return c.execMySQLReplace(ctx, stmt, tableColumns)
+}
+
+func (c *mysqlConn) execMySQLInsertIgnore(ctx context.Context, stmt mysqlInsertStatement, tableColumns []sqliteTableColumn) (okResult, bool, error) {
+	var affected uint64
+	var lastInsertID uint64
+	var warnings uint16
+	for _, row := range stmt.Rows {
+		values, err := c.evaluateUpsertRow(ctx, stmt.TableName, stmt.Columns, tableColumns, row)
+		if err != nil {
+			return okResult{}, true, err
+		}
+		result, err := c.execSQLite(ctx, buildSQLiteInsert(stmt.TableName, stmt.Columns), values...)
+		if err == nil {
+			affected++
+			if result.LastInsertID != 0 && lastInsertID == 0 {
+				lastInsertID = result.LastInsertID
+			}
+			continue
+		}
+		if !isSQLiteUniqueConstraint(err) {
+			return okResult{}, true, err
+		}
+		warnings++
+	}
+	return okResult{AffectedRows: affected, LastInsertID: lastInsertID, Warnings: warnings}, true, nil
+}
+
+func (c *mysqlConn) execMySQLReplace(ctx context.Context, stmt mysqlInsertStatement, tableColumns []sqliteTableColumn) (okResult, bool, error) {
+	var affected uint64
+	var lastInsertID uint64
+	for _, row := range stmt.Rows {
+		values, err := c.evaluateUpsertRow(ctx, stmt.TableName, stmt.Columns, tableColumns, row)
+		if err != nil {
+			return okResult{}, true, err
+		}
+		rowIDs, err := c.findConflictRowIDs(ctx, stmt.TableName, stmt.Columns, values)
+		if err != nil {
+			return okResult{}, true, err
+		}
+		for _, rowID := range rowIDs {
+			if _, err := c.execSQLite(ctx, fmt.Sprintf("DELETE FROM %s WHERE rowid = ?", quoteIdent(unquoteSQLWord(stmt.TableName))), rowID); err != nil {
+				return okResult{}, true, err
+			}
+			affected++
+		}
+		result, err := c.execSQLite(ctx, buildSQLiteInsert(stmt.TableName, stmt.Columns), values...)
+		if err != nil {
+			return okResult{}, true, err
+		}
+		affected++
+		if result.LastInsertID != 0 && lastInsertID == 0 {
+			lastInsertID = result.LastInsertID
+		}
+	}
 	return okResult{AffectedRows: affected, LastInsertID: lastInsertID}, true, nil
 }
 
@@ -152,6 +242,7 @@ func parseMySQLUpsertStatement(sqlText string, args []any) (mysqlUpsertStatement
 	}
 	rows := []mysqlUpsertRow{}
 	argPos := 0
+	valueAlias := ""
 	for {
 		pos = skipSQLSpaces(insertSQL, pos)
 		if pos >= len(insertSQL) {
@@ -178,6 +269,11 @@ func parseMySQLUpsertStatement(sqlText string, args []any) (mysqlUpsertStatement
 			pos++
 			continue
 		}
+		nextAlias, next, ok := consumeOptionalValuesAlias(insertSQL, pos)
+		if ok {
+			pos = next
+			valueAlias = nextAlias
+		}
 		if pos != len(insertSQL) {
 			return mysqlUpsertStatement{}, false, sqlCompatErrorf("Unsupported ON DUPLICATE KEY UPDATE values suffix")
 		}
@@ -192,9 +288,142 @@ func parseMySQLUpsertStatement(sqlText string, args []any) (mysqlUpsertStatement
 		TableName:  tableName,
 		Columns:    columns,
 		Rows:       rows,
+		ValueAlias: valueAlias,
 		UpdateSQL:  updateSQL,
 		UpdateArgs: updateArgs,
 	}, true, nil
+}
+
+func consumeOptionalValuesAlias(sqlText string, pos int) (string, int, bool) {
+	pos = skipSQLSpaces(sqlText, pos)
+	if pos < len(sqlText) && sqlText[pos] == ';' {
+		pos = skipSQLSpaces(sqlText, pos+1)
+	}
+	if pos >= len(sqlText) {
+		return "", pos, true
+	}
+	start := pos
+	if !consumeKeyword(sqlText, &pos, "AS") {
+		return "", start, false
+	}
+	name, next, ok := readSQLNameToken(sqlText, pos)
+	if !ok {
+		return "", start, false
+	}
+	pos = skipSQLSpaces(sqlText, next)
+	if end, ok := parenthesizedSQLSpan(sqlText, pos); ok {
+		pos = skipSQLSpaces(sqlText, end)
+	}
+	if pos < len(sqlText) && sqlText[pos] == ';' {
+		pos = skipSQLSpaces(sqlText, pos+1)
+	}
+	return unquoteSQLWord(name), pos, true
+}
+
+func parseMySQLInsertStatement(sqlText string, args []any) (mysqlInsertStatement, bool, error) {
+	pos := skipSQLSpaces(sqlText, 0)
+	replace := consumeKeyword(sqlText, &pos, "REPLACE")
+	if !replace && !consumeKeyword(sqlText, &pos, "INSERT") {
+		return mysqlInsertStatement{}, false, nil
+	}
+
+	ignore := false
+	for {
+		start := pos
+		switch {
+		case consumeKeyword(sqlText, &pos, "LOW_PRIORITY"):
+		case consumeKeyword(sqlText, &pos, "DELAYED"):
+		case consumeKeyword(sqlText, &pos, "HIGH_PRIORITY"):
+		case consumeKeyword(sqlText, &pos, "IGNORE"):
+			ignore = true
+		default:
+			pos = start
+			goto modifiersDone
+		}
+	}
+
+modifiersDone:
+	if replace {
+		_ = consumeKeyword(sqlText, &pos, "INTO")
+	} else if !consumeKeyword(sqlText, &pos, "INTO") {
+		return mysqlInsertStatement{}, false, nil
+	}
+	tableName, pos, ok := readSQLNameToken(sqlText, pos)
+	if !ok {
+		return mysqlInsertStatement{}, false, nil
+	}
+
+	columns := []string{}
+	next := skipSQLSpaces(sqlText, pos)
+	if next < len(sqlText) && sqlText[next] == '(' {
+		columnsEnd, ok := parenthesizedSQLSpan(sqlText, next)
+		if !ok {
+			return mysqlInsertStatement{}, false, nil
+		}
+		for _, item := range splitSQLTopLevelList(sqlText[next+1 : columnsEnd-1]) {
+			name := strings.TrimSpace(item)
+			if name == "" {
+				continue
+			}
+			columns = append(columns, unquoteSQLWord(name))
+		}
+		pos = columnsEnd
+	}
+
+	if !consumeKeyword(sqlText, &pos, "VALUES") && !consumeKeyword(sqlText, &pos, "VALUE") {
+		return mysqlInsertStatement{}, false, nil
+	}
+	rows, argPos, ok := parseMySQLValuesRows(sqlText, pos, args)
+	if !ok || argPos != len(args) {
+		return mysqlInsertStatement{}, false, nil
+	}
+	return mysqlInsertStatement{
+		TableName: tableName,
+		Columns:   columns,
+		Rows:      rows,
+		Ignore:    ignore,
+		Replace:   replace,
+	}, true, nil
+}
+
+func parseMySQLValuesRows(sqlText string, pos int, args []any) ([]mysqlUpsertRow, int, bool) {
+	rows := []mysqlUpsertRow{}
+	argPos := 0
+	for {
+		pos = skipSQLSpaces(sqlText, pos)
+		if pos >= len(sqlText) {
+			break
+		}
+		rowEnd, ok := parenthesizedSQLSpan(sqlText, pos)
+		if !ok {
+			return nil, 0, false
+		}
+		exprs := splitSQLTopLevelList(sqlText[pos+1 : rowEnd-1])
+		placeholderCount := 0
+		for _, expr := range exprs {
+			placeholderCount += countPlaceholders(expr)
+		}
+		if argPos+placeholderCount > len(args) {
+			return nil, 0, false
+		}
+		rowArgs := append([]any(nil), args[argPos:argPos+placeholderCount]...)
+		argPos += placeholderCount
+		rows = append(rows, mysqlUpsertRow{Exprs: exprs, Args: rowArgs})
+
+		pos = skipSQLSpaces(sqlText, rowEnd)
+		if pos < len(sqlText) && sqlText[pos] == ',' {
+			pos++
+			continue
+		}
+		if pos < len(sqlText) && sqlText[pos] == ';' {
+			pos = skipSQLSpaces(sqlText, pos+1)
+		}
+		if pos != len(sqlText) {
+			return nil, 0, false
+		}
+		break
+	}
+	return rows, argPos, true
 }
 
 func splitOnDuplicateKeyUpdate(sqlText string) (string, string, bool) {
@@ -330,7 +559,7 @@ func buildSQLiteInsert(tableName string, columns []string) string {
 	return fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s)", quoteIdent(unquoteSQLWord(tableName)), joinQuoted(columns), strings.Join(placeholders, ", "))
 }
 
-func buildSQLiteUpsertUpdate(tableName string, columns []string, values []any, updateSQL string, updateArgs []any, rowID int64) (string, []any, error) {
+func buildSQLiteUpsertUpdate(tableName string, columns []string, values []any, valueAlias, updateSQL string, updateArgs []any, rowID int64) (string, []any, error) {
 	valueByColumn := map[string]any{}
 	for i, column := range columns {
 		if i < len(values) {
@@ -342,10 +571,12 @@ func buildSQLiteUpsertUpdate(tableName string, columns []string, values []any, u
 	args := []any{}
 	updateArgPos := 0
 	for i := 0; i < len(updateSQL); {
-		if end, ok := quotedSQLSpan(updateSQL, i); ok {
-			out.WriteString(updateSQL[i:end])
-			i = end
-			continue
+		if updateSQL[i] == '\'' {
+			if end, ok := quotedSQLSpan(updateSQL, i); ok {
+				out.WriteString(updateSQL[i:end])
+				i = end
+				continue
+			}
 		}
 		if end, ok := sqlCommentSpan(updateSQL, i); ok {
 			out.WriteString(updateSQL[i:end])
@@ -362,25 +593,14 @@ func buildSQLiteUpsertUpdate(tableName string, columns []string, values []any, u
 			i++
 			continue
 		}
-		ident, end, ok := readSQLIdentifier(updateSQL, i)
-		if ok && strings.EqualFold(ident, "VALUES") {
-			callStart := skipSQLSpaces(updateSQL, end)
-			callEnd, ok := parenthesizedSQLSpan(updateSQL, callStart)
-			if ok {
-				column := strings.TrimSpace(updateSQL[callStart+1 : callEnd-1])
-				value, ok := valueByColumn[strings.ToLower(unquoteSQLWord(column))]
-				if !ok {
-					return "", nil, sqlCompatErrorf("ON DUPLICATE KEY UPDATE references unknown VALUES column: %s", column)
-				}
-				out.WriteByte('?')
-				args = append(args, value)
-				i = callEnd
-				continue
-			}
+		replacement, next, replacementArgs, ok, err := rewriteUpsertReference(updateSQL, i, tableName, valueAlias, valueByColumn)
+		if err != nil {
+			return "", nil, err
 		}
 		if ok {
-			out.WriteString(updateSQL[i:end])
-			i = end
+			out.WriteString(replacement)
+			args = append(args, replacementArgs...)
+			i = next
 			continue
 		}
 		out.WriteByte(updateSQL[i])
@@ -393,10 +613,64 @@ func buildSQLiteUpsertUpdate(tableName string, columns []string, values []any, u
 	return fmt.Sprintf("UPDATE %s SET %s WHERE rowid = ?", quoteIdent(unquoteSQLWord(tableName)), translateSQL(out.String())), args, nil
 }
 
+func rewriteUpsertReference(updateSQL string, pos int, tableName, valueAlias string, valueByColumn map[string]any) (string, int, []any, bool, error) {
+	name, end, ok := readSQLNameToken(updateSQL, pos)
+	if !ok {
+		return "", pos, nil, false, nil
+	}
+	unquotedName := unquoteSQLWord(name)
+	if strings.EqualFold(unquotedName, "VALUES") {
+		callStart := skipSQLSpaces(updateSQL, end)
+		callEnd, ok := parenthesizedSQLSpan(updateSQL, callStart)
+		if !ok {
+			return updateSQL[pos:end], end, nil, true, nil
+		}
+		column := strings.TrimSpace(updateSQL[callStart+1 : callEnd-1])
+		value, ok := valueByColumn[strings.ToLower(unquoteSQLWord(column))]
+		if !ok {
+			return "", pos, nil, false, sqlCompatErrorf("ON DUPLICATE KEY UPDATE references unknown VALUES column: %s", column)
+		}
+		return "?", callEnd, []any{value}, true, nil
+	}
+
+	dot := skipSQLSpaces(updateSQL, end)
+	if dot >= len(updateSQL) || updateSQL[dot] != '.' {
+		return updateSQL[pos:end], end, nil, true, nil
+	}
+	column, columnEnd, ok := readSQLNameToken(updateSQL, dot+1)
+	if !ok {
+		return updateSQL[pos:end], end, nil, true, nil
+	}
+	unquotedColumn := unquoteSQLWord(column)
+	switch {
+	case valueAlias != "" && strings.EqualFold(unquotedName, valueAlias):
+		value, ok := valueByColumn[strings.ToLower(unquotedColumn)]
+		if !ok {
+			return "", pos, nil, false, sqlCompatErrorf("ON DUPLICATE KEY UPDATE references unknown alias column: %s.%s", unquotedName, unquotedColumn)
+		}
+		return "?", columnEnd, []any{value}, true, nil
+	case strings.EqualFold(unquotedName, unquoteSQLWord(tableName)):
+		return quoteIdent(unquotedColumn), columnEnd, nil, true, nil
+	default:
+		return updateSQL[pos:columnEnd], columnEnd, nil, true, nil
+	}
+}
+
 func (c *mysqlConn) findConflictRowID(ctx context.Context, tableName string, columns []string, values []any) (int64, error) {
-	keys, err := c.uniqueKeys(ctx, tableName)
+	rowIDs, err := c.findConflictRowIDs(ctx, tableName, columns, values)
 	if err != nil {
 		return 0, err
+	}
+	if len(rowIDs) > 0 {
+		return rowIDs[0], nil
+	}
+	return 0, sqlCompatErrorf("ON DUPLICATE KEY UPDATE conflict row was not found")
+}
+
+func (c *mysqlConn) findConflictRowIDs(ctx context.Context, tableName string, columns []string, values []any) ([]int64, error) {
+	keys, err := c.uniqueKeys(ctx, tableName)
+	if err != nil {
+		return nil, err
 	}
 	valueByColumn := map[string]any{}
 	for i, column := range columns {
@@ -404,6 +678,8 @@ func (c *mysqlConn) findConflictRowID(ctx context.Context, tableName string, col
 			valueByColumn[strings.ToLower(unquoteSQLWord(column))] = values[i]
 		}
 	}
+	seen := map[int64]bool{}
+	rowIDs := []int64{}
 	for _, key := range keys {
 		where := []string{}
 		args := []any{}
@@ -420,17 +696,26 @@ func (c *mysqlConn) findConflictRowID(ctx context.Context, tableName string, col
 		if skip || len(where) == 0 {
 			continue
 		}
-		query := fmt.Sprintf("SELECT rowid FROM %s WHERE %s LIMIT 1", quoteIdent(unquoteSQLWord(tableName)), strings.Join(where, " AND "))
+		query := fmt.Sprintf("SELECT rowid FROM %s WHERE %s", quoteIdent(unquoteSQLWord(tableName)), strings.Join(where, " AND "))
 		rs, err := c.querySQLite(ctx, query, args...)
 		if err != nil {
-			return 0, err
+			return nil, err
 		}
-		if len(rs.Rows) == 0 {
-			continue
+		for _, row := range rs.Rows {
+			if len(row) == 0 {
+				continue
+			}
+			rowID, err := int64Value(row[0])
+			if err != nil {
+				return nil, err
+			}
+			if !seen[rowID] {
+				seen[rowID] = true
+				rowIDs = append(rowIDs, rowID)
+			}
 		}
-		return int64Value(rs.Rows[0][0])
 	}
-	return 0, sqlCompatErrorf("ON DUPLICATE KEY UPDATE conflict row was not found")
+	return rowIDs, nil
 }
 
 func (c *mysqlConn) uniqueKeys(ctx context.Context, tableName string) ([]mysqlUniqueKey, error) {
@@ -499,11 +784,13 @@ func (c *mysqlConn) indexColumns(ctx context.Context, indexName string) ([]strin
 	for rows.Next() {
 		var seqno int
 		var cid int
-		var name string
+		var name sql.NullString
 		if err := rows.Scan(&seqno, &cid, &name); err != nil {
 			return nil, err
 		}
-		columns = append(columns, name)
+		if name.Valid {
+			columns = append(columns, name.String)
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

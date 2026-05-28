@@ -31,6 +31,7 @@ database:
 | `schema_files` | No | inline `schema` の前に適用する SQL dump files |
 | `seed` | No | schema setup 後に insert する table rows |
 | `seed_files` | No | inline `seed` の前に insert する YAML、JSON、CSV seed files |
+| `seed_file_configs` | No | file ごとの CSV option を持つ external seed files |
 | `compat` | No | Built-in MySQL compatibility variables と profiles |
 | `rules` | No | SQL override と fault-injection rules |
 | `fallback` | No | rules と built-in compatibility handlers の後の挙動 |
@@ -127,7 +128,7 @@ mysqlmock は dump file を SQL statements に分割し、`DROP TABLE`、`CREATE
 可能であれば `mysqldump --no-data`、または TiDB Dumpling の `*-schema.sql` file を使ってください
 
 各 statement は、適用前に mysqlmock の小さな MySQL-to-SQLite translator を通ります
-translator は Repository test でよく出る `AUTO_INCREMENT`、TiDB `AUTO_RANDOM`、TiDB clustered-index comment、`TRUE`、`FALSE`、`NOW()`、`CURRENT_TIMESTAMP(n)`、common table options、`AUTO_RANDOM_BASE`、table-level `PRIMARY KEY` / `UNIQUE KEY` / `KEY` 定義、単純な MySQL index DDL を扱います
+translator は Repository test でよく出る `AUTO_INCREMENT`、TiDB `AUTO_RANDOM`、TiDB clustered-index comment、`TRUE`、`FALSE`、`NOW()`、`CURRENT_TIMESTAMP(n)`、common table options、`AUTO_RANDOM_BASE`、table-level `PRIMARY KEY` / `UNIQUE KEY` / `KEY` 定義、単純な MySQL index DDL、よく使う `ALTER TABLE` / `RENAME TABLE` variants を扱います
 完全な MySQL parser の実装は目標にしていません
 
 ## Seed Data
@@ -160,6 +161,21 @@ seed_files:
 YAML と JSON seed file は、`seed` と同じ table map をそのまま持つか、`seed` key 配下に包めます
 CSV seed file は `.csv` を除いた file name を table name として使い、1 行目を column name、`\N` を `NULL` として扱います
 
+file ごとの設定が必要な場合は `seed_file_configs` を使います
+
+```yaml
+seed_file_configs:
+  - path: testdata/legacy_users.csv
+    format: csv
+    table: users
+    null_values: ["NULL", "\\N"]
+    infer_types: true
+```
+
+`table` は CSV file name 由来の table name を上書きします
+`null_values` の default は `["\\N"]` です
+`infer_types: true` は simple boolean、integer、float、common datetime string を insert 前に変換します
+
 mysqlmock が seed insert statement を組み立てるとき、table name と column name は quote されます
 
 ## Compatibility Variables
@@ -177,8 +193,11 @@ compat:
 - `autocommit`
 - `character_set_client`
 - `character_set_connection`
+- `character_set_database`
 - `character_set_results`
 - `collation_connection`
+- `collation_database`
+- `foreign_key_checks`
 - `max_allowed_packet`
 - `sql_mode`
 - `transaction_isolation`
@@ -189,7 +208,6 @@ compat:
 
 - `character_set_server`
 - `collation_server`
-- `foreign_key_checks`
 - `lower_case_table_names`
 - `sql_auto_is_null`
 - `system_time_zone`
@@ -217,7 +235,12 @@ fallback:
 `fallback.type` は現在 `sqlite` のみ対応です
 `fallback.unsupported` は、rules、built-in compatibility handlers、SQLite fallback のいずれでも扱えなかった query に返す MySQL error を制御します
 
-SQLite fallback は Repository test 向けの限定的な互換性として、`VALUES(column)` と insert-side `DEFAULT` values を含む `INSERT ... ON DUPLICATE KEY UPDATE` を扱います
+SQLite fallback は Repository test 向けの限定的な互換性として、`VALUES(column)`、ActiveRecord-style row alias、insert-side `DEFAULT` values を含む `INSERT ... ON DUPLICATE KEY UPDATE`、`INSERT IGNORE`、`REPLACE INTO` を扱います
+
+MySQL-compatible DDL で index を作成した場合、mysqlmock は軽量な index metadata も保持し、ORM schema introspection が使う `SHOW KEYS` の prefix length、expression、visibility fields を返します
+
+`SHOW CREATE TABLE` が要求された場合、mysqlmock は対象 table が runtime で変更されていない間、設定で読み込んだ original MySQL/TiDB `CREATE TABLE` statement を返します
+table-altering DDL 後は cached original DDL を invalidation し、MySQL-style table option を付けた現在の SQLite definition に fallback します
 
 ## JSON Schema
 

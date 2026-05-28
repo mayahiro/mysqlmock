@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -100,4 +101,13 @@ func TestUserRepositoryWithMysqlmock(t *testing.T) {
 	if !errors.Is(err, sql.ErrNoRows) {
 		t.Fatalf("created user after reset error = %v, want sql.ErrNoRows", err)
 	}
+
+	snapshotDir := t.TempDir()
+	if err := mysqlmock.WriteQuerySnapshot(filepath.Join(snapshotDir, "queries.golden.json"), server.Queries()); err != nil {
+		t.Fatalf("write query snapshot: %v", err)
+	}
+	if err := mysqlmock.WriteUnsupportedSnapshot(filepath.Join(snapshotDir, "unsupported.golden.json"), server.Unsupported()); err != nil {
+		t.Fatalf("write unsupported snapshot: %v", err)
+	}
+	mysqlmock.AssertNoUnsupported(t, server)
 }

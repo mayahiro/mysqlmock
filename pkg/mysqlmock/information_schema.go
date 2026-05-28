@@ -27,7 +27,7 @@ func (c *mysqlConn) refreshInformationSchema(ctx context.Context) error {
 	if err := c.createInformationSchemaTables(ctx); err != nil {
 		return err
 	}
-	for _, table := range []string{"schemata", "tables", "columns", "key_column_usage", "statistics", "table_constraints", "referential_constraints"} {
+	for _, table := range []string{"schemata", "tables", "columns", "key_column_usage", "statistics", "table_constraints", "referential_constraints", "check_constraints"} {
 		if _, err := c.sqliteConn.ExecContext(ctx, `DELETE FROM "information_schema".`+quoteIdent(table)); err != nil {
 			return fmt.Errorf("clear information_schema.%s: %w", table, err)
 		}
@@ -110,7 +110,8 @@ func (c *mysqlConn) createInformationSchemaTables(ctx context.Context) error {
 			TABLE_SCHEMA TEXT,
 			TABLE_NAME TEXT,
 			TABLE_TYPE TEXT,
-			ENGINE TEXT
+			ENGINE TEXT,
+			TABLE_COMMENT TEXT
 		)`,
 		`CREATE TABLE IF NOT EXISTS "information_schema"."columns" (
 			TABLE_CATALOG TEXT,
@@ -147,7 +148,10 @@ func (c *mysqlConn) createInformationSchemaTables(ctx context.Context) error {
 			INDEX_NAME TEXT,
 			SEQ_IN_INDEX INTEGER,
 			COLUMN_NAME TEXT,
-			INDEX_TYPE TEXT
+			INDEX_TYPE TEXT,
+			SUB_PART INTEGER,
+			VISIBLE TEXT,
+			EXPRESSION TEXT
 		)`,
 		`CREATE TABLE IF NOT EXISTS "information_schema"."table_constraints" (
 			CONSTRAINT_CATALOG TEXT,
@@ -169,6 +173,12 @@ func (c *mysqlConn) createInformationSchemaTables(ctx context.Context) error {
 			DELETE_RULE TEXT,
 			TABLE_NAME TEXT,
 			REFERENCED_TABLE_NAME TEXT
+		)`,
+		`CREATE TABLE IF NOT EXISTS "information_schema"."check_constraints" (
+			CONSTRAINT_CATALOG TEXT,
+			CONSTRAINT_SCHEMA TEXT,
+			CONSTRAINT_NAME TEXT,
+			CHECK_CLAUSE TEXT
 		)`,
 	}
 	for _, stmt := range statements {
@@ -199,9 +209,9 @@ func (c *mysqlConn) insertInformationSchemaTable(ctx context.Context, tableName,
 	}
 	_, err := c.sqliteConn.ExecContext(ctx, `
 INSERT INTO "information_schema"."tables"
-  (TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE, ENGINE)
+  (TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, TABLE_TYPE, ENGINE, TABLE_COMMENT)
 VALUES
-  ('def', ?, ?, ?, 'SQLite')`,
+  ('def', ?, ?, ?, 'SQLite', '')`,
 		c.currentDB, tableName, tableType)
 	if err != nil {
 		return fmt.Errorf("insert information_schema.tables row for %s: %w", tableName, err)
@@ -300,6 +310,7 @@ func (c *mysqlConn) insertInformationSchemaIndexes(ctx context.Context, tableNam
 }
 
 func (c *mysqlConn) insertInformationSchemaIndexColumns(ctx context.Context, tableName, indexName string, unique int) error {
+	metadata, hasMetadata := c.server.lookupMySQLIndexMetadata(tableName, indexName)
 	rows, err := c.sqliteConn.QueryContext(ctx, "PRAGMA main.index_info("+quoteIdent(indexName)+")")
 	if err != nil {
 		return fmt.Errorf("list sqlite index columns for information_schema.%s.%s: %w", tableName, indexName, err)
@@ -309,17 +320,28 @@ func (c *mysqlConn) insertInformationSchemaIndexColumns(ctx context.Context, tab
 	for rows.Next() {
 		var seqno int
 		var cid int
-		var columnName string
+		var columnName sql.NullString
 		if err := rows.Scan(&seqno, &cid, &columnName); err != nil {
 			return fmt.Errorf("scan sqlite index column for information_schema.%s.%s: %w", tableName, indexName, err)
 		}
+		columnMetadata := mysqlIndexColumnMetadata{}
+		if hasMetadata && seqno < len(metadata.Columns) {
+			columnMetadata = metadata.Columns[seqno]
+		}
+		if !columnName.Valid && columnMetadata.Expression == "" {
+			continue
+		}
+		insertColumnName := columnName.String
+		if columnMetadata.ColumnName != "" {
+			insertColumnName = columnMetadata.ColumnName
+		}
 		position := seqno + 1
-		if unique != 0 {
-			if err := c.insertInformationSchemaKeyColumn(ctx, indexName, tableName, columnName, position, nil, "", ""); err != nil {
+		if unique != 0 && insertColumnName != "" {
+			if err := c.insertInformationSchemaKeyColumn(ctx, indexName, tableName, insertColumnName, position, nil, "", ""); err != nil {
 				return err
 			}
 		}
-		if err := c.insertInformationSchemaStatistic(ctx, tableName, indexName, boolInt(unique == 0), position, columnName); err != nil {
+		if err := c.insertInformationSchemaStatisticWithMetadata(ctx, tableName, indexName, boolInt(unique == 0), position, insertColumnName, columnMetadata.SubPart, metadata.Visible, columnMetadata.Expression); err != nil {
 			return err
 		}
 	}
@@ -446,13 +468,32 @@ func normalizeMatchOption(value string) string {
 }
 
 func (c *mysqlConn) insertInformationSchemaStatistic(ctx context.Context, tableName, indexName string, nonUnique, seqInIndex int, columnName string) error {
+	return c.insertInformationSchemaStatisticWithMetadata(ctx, tableName, indexName, nonUnique, seqInIndex, columnName, nil, "YES", "")
+}
+
+func (c *mysqlConn) insertInformationSchemaStatisticWithMetadata(ctx context.Context, tableName, indexName string, nonUnique, seqInIndex int, columnName string, subPart *int, visible, expression string) error {
+	var columnArg any
+	if columnName != "" {
+		columnArg = columnName
+	}
+	var subPartArg any
+	if subPart != nil {
+		subPartArg = *subPart
+	}
+	var expressionArg any
+	if expression != "" {
+		expressionArg = expression
+	}
+	if visible == "" {
+		visible = "YES"
+	}
 	_, err := c.sqliteConn.ExecContext(ctx, `
 INSERT INTO "information_schema"."statistics"
   (TABLE_CATALOG, TABLE_SCHEMA, TABLE_NAME, NON_UNIQUE, INDEX_SCHEMA,
-   INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME, INDEX_TYPE)
+   INDEX_NAME, SEQ_IN_INDEX, COLUMN_NAME, INDEX_TYPE, SUB_PART, VISIBLE, EXPRESSION)
 VALUES
-  ('def', ?, ?, ?, ?, ?, ?, ?, 'BTREE')`,
-		c.currentDB, tableName, nonUnique, c.currentDB, indexName, seqInIndex, columnName)
+  ('def', ?, ?, ?, ?, ?, ?, ?, 'BTREE', ?, ?, ?)`,
+		c.currentDB, tableName, nonUnique, c.currentDB, indexName, seqInIndex, columnArg, subPartArg, visible, expressionArg)
 	if err != nil {
 		return fmt.Errorf("insert information_schema.statistics row for %s.%s: %w", tableName, columnName, err)
 	}
