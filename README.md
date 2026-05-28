@@ -9,7 +9,7 @@ It is designed for fast tests that need a real MySQL client connection without
 starting Docker or an external MySQL server. It is not a production database and
 does not aim for full MySQL compatibility.
 
-Use mysqlmock when you want faster database-backed tests than Dockerized MySQL,
+Use mysqlmock when you want faster database-backed tests than containerized MySQL,
 but more realistic coverage than query expectation mocks. It lets service tests
 keep using real repositories and MySQL client behavior without starting an
 external database. Full database semantics such as migrations, locking,
