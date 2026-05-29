@@ -1315,7 +1315,7 @@ WHERE TABLE_SCHEMA = DATABASE()
 	}
 
 	nilID, err := db.ExecContext(ctx, `
-INSERT INTO composite_links (tenant_id, id, code, locale)
+INSERT INTO `+"`composite_links`"+` (tenant_id, id, code, locale)
 VALUES (?, ?, ?, ?)
 `, 7, nil, "sports", "ja")
 	if err != nil {
@@ -1330,7 +1330,7 @@ VALUES (?, ?, ?, ?)
 	}
 
 	missingID, err := db.ExecContext(ctx, `
-INSERT INTO composite_links (tenant_id, code, locale)
+INSERT INTO `+"`app_db`.`composite_links`"+` (tenant_id, code, locale)
 VALUES (?, ?, ?)
 `, 7, "weather", "ja")
 	if err != nil {
@@ -1345,7 +1345,7 @@ VALUES (?, ?, ?)
 	}
 
 	defaultID, err := db.ExecContext(ctx, `
-INSERT INTO composite_links (tenant_id, id, code, locale)
+INSERT INTO `+"`composite_links`"+` (tenant_id, id, code, locale)
 VALUES (?, DEFAULT, ?, ?)
 `, 7, "finance", "ja")
 	if err != nil {

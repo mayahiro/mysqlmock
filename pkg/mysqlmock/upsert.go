@@ -310,7 +310,7 @@ func parseMySQLUpsertStatementTemplate(sqlText string) (mysqlUpsertStatementTemp
 	if !consumeKeyword(insertSQL, &pos, "INTO") {
 		return mysqlUpsertStatementTemplate{}, false, nil
 	}
-	tableName, pos, ok := readSQLNameToken(insertSQL, pos)
+	tableName, pos, ok := readSQLQualifiedName(insertSQL, pos)
 	if !ok {
 		return mysqlUpsertStatementTemplate{}, false, sqlCompatErrorf("Unsupported ON DUPLICATE KEY UPDATE insert target")
 	}
@@ -460,7 +460,7 @@ modifiersDone:
 	} else if !consumeKeyword(sqlText, &pos, "INTO") {
 		return mysqlInsertStatementTemplate{}, false, nil
 	}
-	tableName, pos, ok := readSQLNameToken(sqlText, pos)
+	tableName, pos, ok := readSQLQualifiedName(sqlText, pos)
 	if !ok {
 		return mysqlInsertStatementTemplate{}, false, nil
 	}

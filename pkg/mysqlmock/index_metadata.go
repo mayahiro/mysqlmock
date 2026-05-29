@@ -52,8 +52,9 @@ func (s *Server) lookupMySQLColumnMetadata(tableName, columnName string) (mysqlC
 func (s *Server) lookupMySQLAutoIncrementColumn(tableName string) (mysqlColumnMetadata, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	key := tableMetadataKey(tableName)
 	for _, metadata := range s.columnMetadata {
-		if metadata.AutoIncrement && strings.EqualFold(metadata.TableName, tableName) {
+		if metadata.AutoIncrement && tableMetadataKey(metadata.TableName) == key {
 			return metadata, true
 		}
 	}
