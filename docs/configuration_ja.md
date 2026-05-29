@@ -129,6 +129,7 @@ mysqlmock は dump file を SQL statements に分割し、`DROP TABLE`、`CREATE
 
 各 statement は、適用前に mysqlmock の小さな MySQL-to-SQLite translator を通ります
 translator は Repository test でよく出る `AUTO_INCREMENT`、TiDB `AUTO_RANDOM`、TiDB clustered-index comment、`TRUE`、`FALSE`、`NOW()`、`CURRENT_TIMESTAMP(n)`、common table options、`AUTO_RANDOM_BASE`、table-level `PRIMARY KEY` / `UNIQUE KEY` / `KEY` 定義、単純な MySQL index DDL、よく使う `ALTER TABLE` / `RENAME TABLE` variants を扱います
+`AUTO_INCREMENT` column が複合 primary key に含まれる場合、mysqlmock は複合 key を維持して `AUTO_INCREMENT` を削除します。SQLite が rowid を自動採番できるのは単一の `INTEGER PRIMARY KEY` のみなので、この column は seed data または test insert で明示してください
 MySQL-visible index name は table scoped として扱い、SQLite 内部では private index name に変換するため、schema dump 内の複数 table で同じ index name を使えます
 完全な MySQL parser の実装は目標にしていません
 

@@ -141,6 +141,10 @@ before being applied. The translator handles common Repository-test DDL such as
 `AUTO_RANDOM_BASE`, table-level `PRIMARY KEY` / `UNIQUE KEY` / `KEY`
 definitions, simple MySQL index DDL, and common `ALTER TABLE` / `RENAME TABLE`
 variants. It does not try to implement a full MySQL parser.
+If an `AUTO_INCREMENT` column is part of a composite primary key, mysqlmock
+keeps the composite key and removes `AUTO_INCREMENT`; SQLite can only
+auto-assign rowid values for a single `INTEGER PRIMARY KEY`, so that column must
+be set explicitly by seed data or test inserts.
 MySQL-visible index names are treated as table-scoped, and mysqlmock maps them
 to private SQLite index names internally so the same index name can be used on
 multiple tables in a schema dump.

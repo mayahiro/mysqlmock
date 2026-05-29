@@ -65,6 +65,8 @@ func translateCreateTableStatements(sqlText string) ([]string, bool) {
 		}
 		if autoIncrementPrimaryColumn != "" && createTableColumnName(item) == autoIncrementPrimaryColumn {
 			item = translateAutoIncrementPrimaryKeyColumn(item)
+		} else if containsSQLIdentifier(item, "AUTO_INCREMENT") && !isInlinePrimaryKeyColumnItem(item) {
+			item = removeSQLIdentifierCall(item, "AUTO_INCREMENT")
 		}
 		translatedItems = append(translatedItems, translateCreateTableColumnItem(item))
 	}
@@ -77,9 +79,12 @@ func translateCreateTableStatements(sqlText string) ([]string, bool) {
 
 func translateCreateTableColumnItem(item string) string {
 	item = expandTiDBDDLComments(item)
+	if containsSQLIdentifier(item, "AUTO_INCREMENT") && isInlinePrimaryKeyColumnItem(item) {
+		item = replaceIntegerColumnType(item)
+	}
 	if containsSQLIdentifier(item, "AUTO_RANDOM") {
 		item = removeSQLIdentifierCall(item, "AUTO_RANDOM")
-		item = replaceAutoRandomIntegerType(item)
+		item = replaceIntegerColumnType(item)
 		item = ensurePrimaryKeyAutoincrement(item)
 	}
 	return translateSQL(item)
@@ -213,10 +218,42 @@ func extractColumnDefault(sqlText string) (string, bool) {
 	return "", false
 }
 
+func isInlinePrimaryKeyColumnItem(item string) bool {
+	_, pos, ok := readSQLNameToken(item, 0)
+	if !ok {
+		return false
+	}
+	for i := pos; i < len(item); {
+		if end, ok := quotedSQLSpan(item, i); ok {
+			i = end
+			continue
+		}
+		if end, ok := sqlCommentSpan(item, i); ok {
+			i = end
+			continue
+		}
+		word, end, ok := readSQLIdentifier(item, i)
+		if !ok {
+			i++
+			continue
+		}
+		if strings.EqualFold(word, "PRIMARY") {
+			next := end
+			if consumeKeyword(item, &next, "KEY") {
+				return true
+			}
+		}
+		i = end
+	}
+	return false
+}
+
 func translatePrimaryKeyTableConstraint(item string) (string, bool) {
 	pos := skipSQLSpaces(item, 0)
+	constraintPrefix := ""
 	if consumeKeyword(item, &pos, "CONSTRAINT") {
-		if _, next, ok := readSQLNameToken(item, pos); ok {
+		if name, next, ok := readSQLNameToken(item, pos); ok {
+			constraintPrefix = "CONSTRAINT " + name + " "
 			pos = next
 		} else {
 			return "", false
@@ -233,7 +270,7 @@ func translatePrimaryKeyTableConstraint(item string) (string, bool) {
 	if !ok {
 		return "", false
 	}
-	return translateSQL(item[:columnsEnd]), true
+	return translateSQL(constraintPrefix + "PRIMARY KEY " + translateMySQLIndexColumns(item[columnsStart:columnsEnd])), true
 }
 
 func translateCreateTableIndex(item, tableName string) (string, bool) {
@@ -495,14 +532,14 @@ func removeSQLIdentifierCall(sqlText, name string) string {
 	return out.String()
 }
 
-func replaceAutoRandomIntegerType(item string) string {
+func replaceIntegerColumnType(item string) string {
 	_, pos, ok := readSQLNameToken(item, 0)
 	if !ok {
 		return item
 	}
 	typeStart := skipSQLSpaces(item, pos)
 	typeName, typeEnd, ok := readSQLIdentifier(item, typeStart)
-	if !ok || !strings.EqualFold(typeName, "BIGINT") {
+	if !ok || !isMySQLIntegerType(typeName) {
 		return item
 	}
 	return item[:typeStart] + "INTEGER" + item[typeEnd:]

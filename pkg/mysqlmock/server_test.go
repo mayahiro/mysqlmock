@@ -827,6 +827,86 @@ seed:
 	}
 }
 
+func TestSchemaFileAppliesCompositePrimaryKey(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	dir := t.TempDir()
+	dumpPath := filepath.Join(dir, "schema.sql")
+	dump := []byte(`
+CREATE TABLE ` + "`composite_links`" + ` (
+  ` + "`tenant_id`" + ` bigint unsigned NOT NULL,
+  ` + "`id`" + ` bigint NOT NULL AUTO_INCREMENT,
+  ` + "`code`" + ` varchar(255) NOT NULL,
+  ` + "`locale`" + ` varchar(16) NOT NULL,
+  PRIMARY KEY USING BTREE (` + "`id`" + `, ` + "`tenant_id`" + `, ` + "`code`" + `(191), ` + "`locale`" + `)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+`)
+	if err := os.WriteFile(dumpPath, dump, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	configPath := filepath.Join(dir, "mysqlmock.yaml")
+	config := []byte(`
+version: 1
+server:
+  auth:
+    mode: allow_any
+database:
+  engine: sqlite
+  mode: memory
+schema_files:
+  - schema.sql
+seed:
+  composite_links:
+    - tenant_id: 7
+      id: 1
+      code: "news"
+      locale: "ja"
+`)
+	if err := os.WriteFile(configPath, config, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := mysqlmock.CheckConfigFile(ctx, configPath); err != nil {
+		t.Fatalf("check config with composite primary key schema: %v", err)
+	}
+
+	server := mysqlmock.Start(t, mysqlmock.ConfigFile(configPath))
+	db, err := sql.Open("mysql", server.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	var pkColumns int
+	var maxOrdinal int
+	if err := db.QueryRowContext(ctx, `
+SELECT COUNT(*), MAX(ORDINAL_POSITION)
+FROM information_schema.key_column_usage
+WHERE TABLE_SCHEMA = DATABASE()
+  AND TABLE_NAME = 'composite_links'
+  AND CONSTRAINT_NAME = 'PRIMARY'
+`).Scan(&pkColumns, &maxOrdinal); err != nil {
+		t.Fatalf("query composite primary key metadata: %v", err)
+	}
+	if pkColumns != 4 || maxOrdinal != 4 {
+		t.Fatalf("composite primary key metadata = count:%d max ordinal:%d, want 4/4", pkColumns, maxOrdinal)
+	}
+
+	_, err = db.ExecContext(ctx, `
+INSERT INTO composite_links (tenant_id, id, code, locale)
+VALUES (?, ?, ?, ?)
+`, 7, 1, "news", "ja")
+	if err == nil {
+		t.Fatal("expected composite primary key violation")
+	}
+	if !strings.Contains(err.Error(), "Duplicate entry") {
+		t.Fatalf("unexpected composite primary key error: %v", err)
+	}
+}
+
 func TestSeedFilesLoadYAMLJSONAndCSVRelativeToConfigFile(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

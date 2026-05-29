@@ -374,6 +374,61 @@ CREATE TABLE users (
 	}
 }
 
+func TestTranslateSQLStatementsConvertsInlineAutoIncrementPrimaryKey(t *testing.T) {
+	input := `
+CREATE TABLE users (
+  id bigint NOT NULL PRIMARY KEY AUTO_INCREMENT,
+  email varchar(255) NOT NULL
+) ENGINE=InnoDB AUTO_INCREMENT=100 DEFAULT CHARSET=utf8mb4;
+`
+	got := translateSQLStatements(input)
+	if len(got) != 1 {
+		t.Fatalf("translateSQLStatements() returned %d statements, want 1: %#v", len(got), got)
+	}
+	if !strings.Contains(got[0], "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT") {
+		t.Fatalf("create table translation = %q, want inline auto-increment primary key column", got[0])
+	}
+	if strings.Contains(got[0], "AUTO_INCREMENT") {
+		t.Fatalf("create table translation = %q, want AUTO_INCREMENT removed", got[0])
+	}
+}
+
+func TestTranslateSQLStatementsConvertsCompositePrimaryKey(t *testing.T) {
+	input := `
+CREATE TABLE links (
+  tenant_id bigint unsigned NOT NULL,
+  id bigint NOT NULL AUTO_INCREMENT,
+  code varchar(255) NOT NULL,
+  locale varchar(16) NOT NULL,
+  PRIMARY KEY USING BTREE (id, tenant_id, code(191), locale)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+`
+	got := translateSQLStatements(input)
+	if len(got) != 1 {
+		t.Fatalf("translateSQLStatements() returned %d statements, want 1: %#v", len(got), got)
+	}
+	for _, want := range []string{
+		"tenant_id bigint  NOT NULL",
+		"id bigint NOT NULL",
+		"code varchar(255) NOT NULL",
+		"PRIMARY KEY (id, tenant_id, code, locale)",
+	} {
+		if !strings.Contains(got[0], want) {
+			t.Fatalf("create table translation = %q, want it to contain %q", got[0], want)
+		}
+	}
+	for _, unwanted := range []string{
+		"AUTO_INCREMENT",
+		"USING BTREE",
+		"code(191)",
+		"UNSIGNED",
+	} {
+		if strings.Contains(strings.ToUpper(got[0]), strings.ToUpper(unwanted)) {
+			t.Fatalf("create table translation = %q, want it to omit %q", got[0], unwanted)
+		}
+	}
+}
+
 func TestTranslateSQLStripsLockingClause(t *testing.T) {
 	tests := []struct {
 		name  string

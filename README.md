@@ -261,6 +261,10 @@ Schema and query fallback translate `TRUE`, `FALSE`, `NOW()`,
 TiDB DDL options, table-level `PRIMARY KEY` / `UNIQUE KEY` / `KEY` definitions,
 simple MySQL index DDL, and common `ALTER TABLE` / `RENAME TABLE` variants into
 SQLite-compatible SQL where possible.
+When an `AUTO_INCREMENT` column belongs to a composite primary key, mysqlmock
+keeps the composite key and strips `AUTO_INCREMENT`; SQLite only supports
+automatic rowid assignment for a single `INTEGER PRIMARY KEY`, so inserts must
+provide that key value explicitly.
 MySQL-visible index names remain table-scoped; mysqlmock maps them to private
 SQLite index names internally to avoid SQLite's schema-wide index namespace.
 Common scalar functions used by ORM queries include `IFNULL`, `COALESCE`,
