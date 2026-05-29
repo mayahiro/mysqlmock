@@ -45,6 +45,16 @@ type sqliteTableColumn struct {
 	PK         int
 }
 
+type cachedTableColumns struct {
+	SchemaVersion uint64
+	Columns       []sqliteTableColumn
+}
+
+type cachedUniqueKeys struct {
+	SchemaVersion uint64
+	Keys          []mysqlUniqueKey
+}
+
 func (c *mysqlConn) execMySQLUpsert(ctx context.Context, sqlText string, args ...any) (okResult, bool, error) {
 	stmt, ok, err := parseMySQLUpsertStatement(sqlText, args)
 	if err != nil || !ok {
@@ -719,6 +729,16 @@ func (c *mysqlConn) findConflictRowIDs(ctx context.Context, tableName string, co
 }
 
 func (c *mysqlConn) uniqueKeys(ctx context.Context, tableName string) ([]mysqlUniqueKey, error) {
+	version := c.server.currentSchemaVersion()
+	cacheKey := normalizedTableCacheKey(tableName)
+	c.server.metadataMu.Lock()
+	if cached, ok := c.server.uniqueKeys[cacheKey]; ok && cached.SchemaVersion == version {
+		keys := cloneMySQLUniqueKeys(cached.Keys)
+		c.server.metadataMu.Unlock()
+		return keys, nil
+	}
+	c.server.metadataMu.Unlock()
+
 	columns, err := c.tableColumns(ctx, tableName)
 	if err != nil {
 		return nil, err
@@ -770,6 +790,15 @@ func (c *mysqlConn) uniqueKeys(ctx context.Context, tableName string) ([]mysqlUn
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	c.server.metadataMu.Lock()
+	if c.server.uniqueKeys == nil {
+		c.server.uniqueKeys = map[string]cachedUniqueKeys{}
+	}
+	c.server.uniqueKeys[cacheKey] = cachedUniqueKeys{
+		SchemaVersion: version,
+		Keys:          cloneMySQLUniqueKeys(keys),
+	}
+	c.server.metadataMu.Unlock()
 	return keys, nil
 }
 
@@ -799,6 +828,16 @@ func (c *mysqlConn) indexColumns(ctx context.Context, indexName string) ([]strin
 }
 
 func (c *mysqlConn) tableColumns(ctx context.Context, tableName string) ([]sqliteTableColumn, error) {
+	version := c.server.currentSchemaVersion()
+	cacheKey := normalizedTableCacheKey(tableName)
+	c.server.metadataMu.Lock()
+	if cached, ok := c.server.tableColumns[cacheKey]; ok && cached.SchemaVersion == version {
+		columns := cloneSQLiteTableColumns(cached.Columns)
+		c.server.metadataMu.Unlock()
+		return columns, nil
+	}
+	c.server.metadataMu.Unlock()
+
 	rows, err := c.sqliteConn.QueryContext(ctx, "PRAGMA main.table_info("+quoteIdent(unquoteSQLWord(tableName))+")")
 	if err != nil {
 		return nil, err
@@ -824,7 +863,37 @@ func (c *mysqlConn) tableColumns(ctx context.Context, tableName string) ([]sqlit
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	c.server.metadataMu.Lock()
+	if c.server.tableColumns == nil {
+		c.server.tableColumns = map[string]cachedTableColumns{}
+	}
+	c.server.tableColumns[cacheKey] = cachedTableColumns{
+		SchemaVersion: version,
+		Columns:       cloneSQLiteTableColumns(columns),
+	}
+	c.server.metadataMu.Unlock()
 	return columns, nil
+}
+
+func normalizedTableCacheKey(tableName string) string {
+	return strings.ToLower(unquoteSQLWord(tableName))
+}
+
+func cloneSQLiteTableColumns(columns []sqliteTableColumn) []sqliteTableColumn {
+	out := make([]sqliteTableColumn, len(columns))
+	copy(out, columns)
+	return out
+}
+
+func cloneMySQLUniqueKeys(keys []mysqlUniqueKey) []mysqlUniqueKey {
+	out := make([]mysqlUniqueKey, len(keys))
+	for i, key := range keys {
+		out[i] = mysqlUniqueKey{
+			Name:    key.Name,
+			Columns: append([]string(nil), key.Columns...),
+		}
+	}
+	return out
 }
 
 func (c *mysqlConn) insertColumns(ctx context.Context, tableName string) ([]string, error) {

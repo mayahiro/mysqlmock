@@ -31,6 +31,11 @@ type serverOptions struct {
 	logFormat  string
 }
 
+type preparedSchemaStatement struct {
+	Original   string
+	Translated []string
+}
+
 // ConfigFile loads server configuration from a YAML file.
 func ConfigFile(path string) Option {
 	return func(opts *serverOptions) {
@@ -80,12 +85,15 @@ type Server struct {
 	closeOnce sync.Once
 	wg        sync.WaitGroup
 
-	nextConnectionID atomic.Uint32
-	schemaVersion    atomic.Uint64
-	logWriter        io.Writer
-	logFormat        string
-	logMu            sync.Mutex
-	translationMu    sync.Mutex
+	nextConnectionID  atomic.Uint32
+	schemaVersion     atomic.Uint64
+	baseSchemaVersion atomic.Uint64
+	logWriter         io.Writer
+	logFormat         string
+	logMu             sync.Mutex
+	translationMu     sync.Mutex
+	preparedMu        sync.Mutex
+	metadataMu        sync.Mutex
 
 	mu            sync.Mutex
 	unsupported   []UnsupportedQuery
@@ -95,6 +103,11 @@ type Server struct {
 	indexMetadata map[string]mysqlIndexMetadata
 	tableDDL      map[string]string
 	translation   sqlTranslationCache
+
+	preparedSchema []preparedSchemaStatement
+	preparedSeed   []map[string][]map[string]any
+	tableColumns   map[string]cachedTableColumns
+	uniqueKeys     map[string]cachedUniqueKeys
 }
 
 // UnsupportedQuery records a query that mysqlmock could not execute.
@@ -166,6 +179,8 @@ func New(opts ...Option) (*Server, error) {
 		advisoryLocks: map[string]uint32{},
 		indexMetadata: map[string]mysqlIndexMetadata{},
 		tableDDL:      map[string]string{},
+		tableColumns:  map[string]cachedTableColumns{},
+		uniqueKeys:    map[string]cachedUniqueKeys{},
 	}
 	s.nextConnectionID.Store(cfg.Server.ConnectionIDStart)
 	return s, nil
@@ -268,21 +283,38 @@ func (s *Server) currentSchemaVersion() uint64 {
 
 func (s *Server) bumpSchemaVersion() {
 	s.schemaVersion.Add(1)
+	s.metadataMu.Lock()
+	s.tableColumns = map[string]cachedTableColumns{}
+	s.uniqueKeys = map[string]cachedUniqueKeys{}
+	s.metadataMu.Unlock()
 }
 
-// Reset drops all current SQLite objects, reapplies schema and seed data, and clears diagnostics.
+// Reset restores the configured schema and seed data and clears diagnostics.
+// It uses a data-only reset when the schema has not changed, and falls back to
+// rebuilding SQLite objects after schema-changing statements.
 func (s *Server) Reset(ctx context.Context) error {
 	if s.keepConn == nil {
 		return errors.New("mysqlmock server not started")
 	}
-	s.mu.Lock()
-	s.indexMetadata = map[string]mysqlIndexMetadata{}
-	s.tableDDL = map[string]string{}
-	s.mu.Unlock()
-	if err := s.resetBackend(ctx, s.keepConn); err != nil {
+	canResetDataOnly, err := s.canResetBackendData(ctx, s.keepConn)
+	if err != nil {
 		return err
 	}
-	s.bumpSchemaVersion()
+	if s.currentSchemaVersion() == s.baseSchemaVersion.Load() && canResetDataOnly {
+		if err := s.resetBackendData(ctx, s.keepConn); err != nil {
+			return err
+		}
+	} else {
+		s.mu.Lock()
+		s.indexMetadata = map[string]mysqlIndexMetadata{}
+		s.tableDDL = map[string]string{}
+		s.mu.Unlock()
+		if err := s.resetBackendFull(ctx, s.keepConn); err != nil {
+			return err
+		}
+		s.bumpSchemaVersion()
+		s.baseSchemaVersion.Store(s.currentSchemaVersion())
+	}
 
 	s.mu.Lock()
 	s.unsupported = nil
@@ -343,7 +375,7 @@ func (s *Server) handleNetConn(conn net.Conn) {
 		return
 	}
 	if s.usesPrivateMemoryDB() {
-		if err := s.resetBackend(ctx, sqliteConn); err != nil {
+		if err := s.resetBackendFull(ctx, sqliteConn); err != nil {
 			s.logf("sqlite connection initialization error: %v", err)
 			return
 		}
@@ -393,11 +425,20 @@ func (s *Server) openBackend(ctx context.Context) error {
 	s.db = db
 	s.keepConn = keepConn
 
+	if _, err := s.preparedSchemaStatements(); err != nil {
+		_ = s.closeBackend()
+		return err
+	}
+	if _, err := s.preparedSeedBlocks(); err != nil {
+		_ = s.closeBackend()
+		return err
+	}
+
 	if err := withSQLiteTransaction(ctx, keepConn, "initial setup", func() error {
 		if err := s.applySchema(ctx, keepConn); err != nil {
 			return err
 		}
-		if err := s.applySeed(ctx, keepConn, s.cfg.Seed); err != nil {
+		if err := s.applySeed(ctx, keepConn); err != nil {
 			return err
 		}
 		return nil
@@ -405,6 +446,7 @@ func (s *Server) openBackend(ctx context.Context) error {
 		_ = s.closeBackend()
 		return err
 	}
+	s.baseSchemaVersion.Store(s.currentSchemaVersion())
 	return nil
 }
 
@@ -438,26 +480,57 @@ func (s *Server) usesPrivateMemoryDB() bool {
 }
 
 func (s *Server) applySchema(ctx context.Context, conn *sql.Conn) error {
+	statements, err := s.preparedSchemaStatements()
+	if err != nil {
+		return err
+	}
+	for _, stmt := range statements {
+		if err := s.applyPreparedSchemaStatement(ctx, conn, stmt); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) preparedSchemaStatements() ([]preparedSchemaStatement, error) {
+	s.preparedMu.Lock()
+	defer s.preparedMu.Unlock()
+	if s.preparedSchema != nil {
+		return s.preparedSchema, nil
+	}
+
+	prepared := []preparedSchemaStatement{}
 	for _, path := range s.cfg.SchemaFiles {
 		statements, err := s.loadSchemaFileStatements(path)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		for _, stmt := range statements {
-			if err := s.applySchemaStatement(ctx, conn, stmt); err != nil {
-				return err
+			if strings.TrimSpace(stmt) == "" {
+				continue
 			}
+			prepared = append(prepared, prepareSchemaStatement(stmt))
 		}
 	}
 	for _, stmt := range s.cfg.Schema {
 		if strings.TrimSpace(stmt) == "" {
 			continue
 		}
-		if err := s.applySchemaStatement(ctx, conn, stmt); err != nil {
-			return err
+		prepared = append(prepared, prepareSchemaStatement(stmt))
+	}
+	s.preparedSchema = prepared
+	return s.preparedSchema, nil
+}
+
+func prepareSchemaStatement(stmt string) preparedSchemaStatement {
+	translated := translateSQLStatements(stmt)
+	out := make([]string, 0, len(translated))
+	for _, item := range translated {
+		if strings.TrimSpace(item) != "" {
+			out = append(out, item)
 		}
 	}
-	return nil
+	return preparedSchemaStatement{Original: stmt, Translated: out}
 }
 
 func (s *Server) loadSchemaFileStatements(path string) ([]string, error) {
@@ -476,40 +549,57 @@ func (s *Server) loadSchemaFileStatements(path string) ([]string, error) {
 	return schemaStatementsFromDump(string(data)), nil
 }
 
-func (s *Server) applySchemaStatement(ctx context.Context, conn *sql.Conn, stmt string) error {
-	for _, translated := range translateSQLStatements(stmt) {
-		if strings.TrimSpace(translated) == "" {
-			continue
-		}
+func (s *Server) applyPreparedSchemaStatement(ctx context.Context, conn *sql.Conn, stmt preparedSchemaStatement) error {
+	for _, translated := range stmt.Translated {
 		if _, err := conn.ExecContext(ctx, translated); err != nil {
 			return fmt.Errorf("apply schema: %w", err)
 		}
 	}
-	s.recordMySQLIndexMetadata(stmt)
-	s.recordMySQLTableDDL(stmt)
+	s.recordMySQLIndexMetadata(stmt.Original)
+	s.recordMySQLTableDDL(stmt.Original)
 	return nil
 }
 
-func (s *Server) applySeed(ctx context.Context, conn *sql.Conn, seed map[string][]map[string]any) error {
+func (s *Server) applySeed(ctx context.Context, conn *sql.Conn) error {
+	blocks, err := s.preparedSeedBlocks()
+	if err != nil {
+		return err
+	}
+	for _, block := range blocks {
+		if err := s.applySeedRows(ctx, conn, block); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Server) preparedSeedBlocks() ([]map[string][]map[string]any, error) {
+	s.preparedMu.Lock()
+	defer s.preparedMu.Unlock()
+	if s.preparedSeed != nil {
+		return s.preparedSeed, nil
+	}
+
+	blocks := []map[string][]map[string]any{}
 	for _, path := range s.cfg.SeedFiles {
 		loaded, err := s.loadSeedFileConfig(SeedFileConfig{Path: path})
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if err := s.applySeedRows(ctx, conn, loaded); err != nil {
-			return err
-		}
+		blocks = append(blocks, loaded)
 	}
 	for _, seedFile := range s.cfg.SeedConfigs {
 		loaded, err := s.loadSeedFileConfig(seedFile)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if err := s.applySeedRows(ctx, conn, loaded); err != nil {
-			return err
-		}
+		blocks = append(blocks, loaded)
 	}
-	return s.applySeedRows(ctx, conn, seed)
+	if seed := s.cfg.Seed; len(seed) > 0 {
+		blocks = append(blocks, seed)
+	}
+	s.preparedSeed = blocks
+	return s.preparedSeed, nil
 }
 
 func (s *Server) loadSeedFileConfig(cfg SeedFileConfig) (map[string][]map[string]any, error) {
@@ -568,7 +658,7 @@ func (s *Server) applySeedRows(ctx context.Context, conn *sql.Conn, seed map[str
 	return nil
 }
 
-func (s *Server) resetBackend(ctx context.Context, conn *sql.Conn) error {
+func (s *Server) resetBackendFull(ctx context.Context, conn *sql.Conn) error {
 	if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys = OFF"); err != nil {
 		return fmt.Errorf("disable foreign keys for reset: %w", err)
 	}
@@ -585,11 +675,49 @@ func (s *Server) resetBackend(ctx context.Context, conn *sql.Conn) error {
 		if err := s.applySchema(ctx, conn); err != nil {
 			return err
 		}
-		if err := s.applySeed(ctx, conn, s.cfg.Seed); err != nil {
+		if err := s.applySeed(ctx, conn); err != nil {
 			return err
 		}
 		return nil
 	})
+}
+
+func (s *Server) resetBackendData(ctx context.Context, conn *sql.Conn) error {
+	if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys = OFF"); err != nil {
+		return fmt.Errorf("disable foreign keys for reset: %w", err)
+	}
+	if err := withSQLiteTransaction(ctx, conn, "reset data", func() error {
+		if err := s.deleteSQLiteTableRows(ctx, conn); err != nil {
+			return err
+		}
+		return s.resetSQLiteSequences(ctx, conn)
+	}); err != nil {
+		_, _ = conn.ExecContext(ctx, "PRAGMA foreign_keys = ON")
+		return err
+	}
+	if _, err := conn.ExecContext(ctx, "PRAGMA foreign_keys = ON"); err != nil {
+		return fmt.Errorf("enable foreign keys for reset: %w", err)
+	}
+	return withSQLiteTransaction(ctx, conn, "reset seed", func() error {
+		return s.applySeed(ctx, conn)
+	})
+}
+
+func (s *Server) canResetBackendData(ctx context.Context, conn *sql.Conn) (bool, error) {
+	var triggerName string
+	err := conn.QueryRowContext(ctx, `
+SELECT name
+FROM sqlite_master
+WHERE type = 'trigger'
+  AND name NOT LIKE 'sqlite_%'
+LIMIT 1`).Scan(&triggerName)
+	if errors.Is(err, sql.ErrNoRows) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("lookup sqlite triggers for reset: %w", err)
+	}
+	return false, nil
 }
 
 func withSQLiteTransaction(ctx context.Context, conn *sql.Conn, label string, fn func() error) (err error) {
@@ -664,6 +792,56 @@ END, name`)
 		if _, err := conn.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("drop sqlite %s %s for reset: %w", obj.Type, obj.Name, err)
 		}
+	}
+	return nil
+}
+
+func (s *Server) deleteSQLiteTableRows(ctx context.Context, conn *sql.Conn) error {
+	rows, err := conn.QueryContext(ctx, `
+SELECT name
+FROM sqlite_master
+WHERE type = 'table'
+  AND name NOT LIKE 'sqlite_%'
+ORDER BY name`)
+	if err != nil {
+		return fmt.Errorf("list sqlite tables for reset: %w", err)
+	}
+	defer rows.Close()
+
+	tables := []string{}
+	for rows.Next() {
+		var table string
+		if err := rows.Scan(&table); err != nil {
+			return fmt.Errorf("scan sqlite table for reset: %w", err)
+		}
+		tables = append(tables, table)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("list sqlite tables for reset: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close sqlite table list for reset: %w", err)
+	}
+
+	for _, table := range tables {
+		if _, err := conn.ExecContext(ctx, "DELETE FROM "+quoteIdent(table)); err != nil {
+			return fmt.Errorf("delete sqlite table %s for reset: %w", table, err)
+		}
+	}
+	return nil
+}
+
+func (s *Server) resetSQLiteSequences(ctx context.Context, conn *sql.Conn) error {
+	var sequenceTable string
+	err := conn.QueryRowContext(ctx, `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_sequence'`).Scan(&sequenceTable)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("lookup sqlite_sequence for reset: %w", err)
+	}
+	if _, err := conn.ExecContext(ctx, "DELETE FROM sqlite_sequence"); err != nil {
+		return fmt.Errorf("reset sqlite_sequence: %w", err)
 	}
 	return nil
 }

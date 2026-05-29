@@ -2958,6 +2958,134 @@ func TestServerResetReappliesSchemaSeedAndClearsRuntimeState(t *testing.T) {
 	}
 }
 
+func TestServerResetUsesPreparedSchemaAndSeedCache(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	dir := t.TempDir()
+	schemaPath := filepath.Join(dir, "schema.sql")
+	if err := os.WriteFile(schemaPath, []byte(`
+CREATE TABLE cached_users (
+  id INTEGER PRIMARY KEY AUTO_INCREMENT,
+  email TEXT NOT NULL UNIQUE
+);
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	seedPath := filepath.Join(dir, "seed.yaml")
+	if err := os.WriteFile(seedPath, []byte(`
+seed:
+  cached_users:
+    - email: "seed@example.com"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, "mysqlmock.yaml")
+	if err := os.WriteFile(configPath, []byte(`
+version: 1
+server:
+  auth:
+    mode: allow_any
+database:
+  engine: sqlite
+  mode: memory
+schema_files:
+  - schema.sql
+seed_files:
+  - seed.yaml
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	server := mysqlmock.Start(t, mysqlmock.ConfigFile(configPath))
+	db, err := sql.Open("mysql", server.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	if err := os.Remove(schemaPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(seedPath); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.ExecContext(ctx, "INSERT INTO cached_users (email) VALUES (?)", "runtime@example.com"); err != nil {
+		t.Fatalf("insert runtime row: %v", err)
+	}
+	if err := server.Reset(ctx); err != nil {
+		t.Fatalf("fast reset with removed config files: %v", err)
+	}
+	assertTableCount(t, ctx, db, "cached_users", 1)
+
+	if _, err := db.ExecContext(ctx, "CREATE TABLE runtime_only (id INTEGER PRIMARY KEY AUTO_INCREMENT)"); err != nil {
+		t.Fatalf("create runtime table: %v", err)
+	}
+	if err := server.Reset(ctx); err != nil {
+		t.Fatalf("full reset with removed config files: %v", err)
+	}
+	assertTableCount(t, ctx, db, "cached_users", 1)
+	var tableName string
+	err = db.QueryRowContext(ctx, "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'runtime_only'").Scan(&tableName)
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("runtime table after full reset = %q, err=%v, want no rows", tableName, err)
+	}
+}
+
+func TestUpsertMetadataCacheInvalidatesAfterSchemaChange(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cfg := mysqlmock.DefaultConfig()
+	cfg.Schema = []string{`
+CREATE TABLE cache_upserts (
+  id INTEGER PRIMARY KEY AUTO_INCREMENT,
+  code TEXT NOT NULL,
+  count INTEGER NOT NULL DEFAULT 0
+);`}
+	cfg.Seed = map[string][]map[string]any{
+		"cache_upserts": {
+			{"id": 1, "code": "a", "count": 1},
+		},
+	}
+	server := mysqlmock.Start(t, mysqlmock.WithConfig(cfg))
+	db, err := sql.Open("mysql", server.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO cache_upserts (id, code, count)
+VALUES (1, 'a', 2)
+ON DUPLICATE KEY UPDATE count = VALUES(count)
+`); err != nil {
+		t.Fatalf("initial primary-key upsert: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CREATE UNIQUE INDEX uniq_cache_upserts_code ON cache_upserts (code)"); err != nil {
+		t.Fatalf("create unique index after cache warmup: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO cache_upserts (id, code, count)
+VALUES (2, 'a', 3)
+ON DUPLICATE KEY UPDATE count = VALUES(count)
+`); err != nil {
+		t.Fatalf("upsert after unique index schema change: %v", err)
+	}
+
+	var count int
+	if err := db.QueryRowContext(ctx, "SELECT count FROM cache_upserts WHERE id = 1").Scan(&count); err != nil {
+		t.Fatalf("select upserted count: %v", err)
+	}
+	if count != 3 {
+		t.Fatalf("upserted count = %d, want 3", count)
+	}
+	assertTableCount(t, ctx, db, "cache_upserts", 1)
+}
+
 func TestServerResetBeforeStart(t *testing.T) {
 	server, err := mysqlmock.New(mysqlmock.WithConfig(testConfig()))
 	if err != nil {
@@ -3305,13 +3433,23 @@ func assertShowVariable(t *testing.T, ctx context.Context, db *sql.DB, name, wan
 func assertUserCount(t *testing.T, ctx context.Context, db *sql.DB, want int) {
 	t.Helper()
 
+	assertTableCount(t, ctx, db, "users", want)
+}
+
+func assertTableCount(t *testing.T, ctx context.Context, db *sql.DB, table string, want int) {
+	t.Helper()
+
 	var got int
-	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM users").Scan(&got); err != nil {
-		t.Fatalf("select user count: %v", err)
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+quoteMySQLTestIdent(table)).Scan(&got); err != nil {
+		t.Fatalf("select %s count: %v", table, err)
 	}
 	if got != want {
-		t.Fatalf("user count = %d, want %d", got, want)
+		t.Fatalf("%s count = %d, want %d", table, got, want)
 	}
+}
+
+func quoteMySQLTestIdent(ident string) string {
+	return "`" + strings.ReplaceAll(ident, "`", "``") + "`"
 }
 
 func testConfig() mysqlmock.Config {
