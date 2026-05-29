@@ -2,6 +2,11 @@ package mysqlmock
 
 import "testing"
 
+var (
+	benchmarkTranslatedSQL        string
+	benchmarkTranslatedStatements []string
+)
+
 func TestTranslateSQLFastPathLeavesPlainSQLUnchanged(t *testing.T) {
 	input := "SELECT id, name FROM users WHERE email = ? ORDER BY id DESC LIMIT 1"
 	if got := translateSQL(input); got != input {
@@ -111,6 +116,88 @@ func TestServerTranslateSQLStatementsCachedEvictsOneEntryAtLimit(t *testing.T) {
 	}
 }
 
+func BenchmarkServerTranslateSQLCache(b *testing.B) {
+	b.Run("sql_hit", func(b *testing.B) {
+		server := &Server{}
+		sqlText := "SELECT NOW()"
+		server.translateSQLCached(sqlText)
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			benchmarkTranslatedSQL = server.translateSQLCached(sqlText)
+		}
+	})
+
+	b.Run("sql_miss_without_eviction", func(b *testing.B) {
+		const batchSize = 1024
+		server := &Server{}
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			if i > 0 && i%batchSize == 0 {
+				b.StopTimer()
+				server = &Server{}
+				b.StartTimer()
+			}
+			benchmarkTranslatedSQL = server.translateSQLCached("SELECT TRUE /* miss " + stringForCacheTestInt(i%batchSize) + " */")
+		}
+	})
+
+	b.Run("sql_eviction", func(b *testing.B) {
+		server := &Server{}
+		for i := range sqlTranslationCacheLimit {
+			server.translateSQLCached("SELECT " + stringForCacheTestInt(i))
+		}
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			benchmarkTranslatedSQL = server.translateSQLCached("SELECT TRUE /* evict " + stringForCacheTestInt(i) + " */")
+		}
+	})
+
+	b.Run("sql_parallel_hit", func(b *testing.B) {
+		server := &Server{}
+		sqlText := "SELECT NOW()"
+		server.translateSQLCached(sqlText)
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				_ = server.translateSQLCached(sqlText)
+			}
+		})
+	})
+
+	b.Run("statements_hit", func(b *testing.B) {
+		server := &Server{}
+		sqlText := benchmarkCreateTableSQL()
+		server.translateSQLStatementsCached(sqlText)
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			benchmarkTranslatedStatements = server.translateSQLStatementsCached(sqlText)
+		}
+	})
+
+	b.Run("statements_eviction", func(b *testing.B) {
+		server := &Server{}
+		for i := range sqlTranslationCacheLimit {
+			server.translateSQLStatementsCached("SELECT " + stringForCacheTestInt(i))
+		}
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			benchmarkTranslatedStatements = server.translateSQLStatementsCached("SELECT FALSE /* evict " + stringForCacheTestInt(i) + " */")
+		}
+	})
+}
+
 func BenchmarkServerTranslateSQLCachedEviction(b *testing.B) {
 	server := &Server{}
 	for i := range sqlTranslationCacheLimit {
@@ -121,6 +208,18 @@ func BenchmarkServerTranslateSQLCachedEviction(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		server.translateSQLCached("SELECT TRUE /* " + stringForCacheTestInt(i) + " */")
 	}
+}
+
+func benchmarkCreateTableSQL() string {
+	return `
+CREATE TABLE users (
+  id INTEGER PRIMARY KEY AUTO_INCREMENT,
+  email VARCHAR(255) NOT NULL,
+  name VARCHAR(255),
+  UNIQUE KEY uniq_users_email (email),
+  KEY idx_users_name (name)
+) ENGINE=InnoDB;
+`
 }
 
 func stringForCacheTestInt(n int) string {

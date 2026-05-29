@@ -3,10 +3,13 @@ package mysqlmock
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"testing"
 
 	_ "modernc.org/sqlite"
 )
+
+var benchmarkInformationSchemaRows int
 
 func TestRefreshInformationSchemaTableOnlyLoadsTargetTable(t *testing.T) {
 	ctx := context.Background()
@@ -208,7 +211,7 @@ CREATE TABLE other_users (
 	assertInformationSchemaTableNames(t, ctx, conn, "statistics", []string{"target_users"})
 }
 
-func newInformationSchemaTestConn(t *testing.T, ctx context.Context) *mysqlConn {
+func newInformationSchemaTestConn(t testing.TB, ctx context.Context) *mysqlConn {
 	t.Helper()
 
 	db, err := sql.Open("sqlite", ":memory:")
@@ -325,4 +328,104 @@ func equalStringSlices(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+func BenchmarkInformationSchemaRefresh(b *testing.B) {
+	ctx := context.Background()
+	for _, tableCount := range []int{10, 100} {
+		b.Run("tables_"+stringForCacheTestInt(tableCount), func(b *testing.B) {
+			b.Run("target_table", func(b *testing.B) {
+				conn := newInformationSchemaBenchmarkConn(b, ctx, tableCount)
+				target := informationSchemaBenchmarkTableName(tableCount - 1)
+
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					conn.server.bumpSchemaVersion()
+					exists, err := conn.refreshInformationSchemaTable(ctx, target)
+					if err != nil {
+						b.Fatalf("refresh target table: %v", err)
+					}
+					if !exists {
+						b.Fatalf("target table %s was not found", target)
+					}
+				}
+				b.StopTimer()
+
+				rows, err := countInformationSchemaRows(ctx, conn, "columns")
+				if err != nil {
+					b.Fatalf("count information_schema.columns: %v", err)
+				}
+				benchmarkInformationSchemaRows = rows
+			})
+
+			b.Run("full_refresh", func(b *testing.B) {
+				conn := newInformationSchemaBenchmarkConn(b, ctx, tableCount)
+
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					conn.server.bumpSchemaVersion()
+					if err := conn.refreshInformationSchema(ctx); err != nil {
+						b.Fatalf("refresh full information_schema: %v", err)
+					}
+				}
+				b.StopTimer()
+
+				rows, err := countInformationSchemaRows(ctx, conn, "columns")
+				if err != nil {
+					b.Fatalf("count information_schema.columns: %v", err)
+				}
+				benchmarkInformationSchemaRows = rows
+			})
+		})
+	}
+}
+
+func newInformationSchemaBenchmarkConn(b *testing.B, ctx context.Context, tableCount int) *mysqlConn {
+	b.Helper()
+
+	conn := newInformationSchemaTestConn(b, ctx)
+	if err := setupInformationSchemaBenchmarkTables(ctx, conn, tableCount); err != nil {
+		b.Fatalf("setup benchmark tables: %v", err)
+	}
+	return conn
+}
+
+func setupInformationSchemaBenchmarkTables(ctx context.Context, conn *mysqlConn, tableCount int) error {
+	for i := 0; i < tableCount; i++ {
+		tableName := informationSchemaBenchmarkTableName(i)
+		createSQL := fmt.Sprintf(`
+CREATE TABLE %s (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id INTEGER NOT NULL,
+  email TEXT NOT NULL UNIQUE,
+  name TEXT,
+  created_at TEXT,
+  active INTEGER DEFAULT 1
+)`, quoteIdent(tableName))
+		if _, err := conn.sqliteConn.ExecContext(ctx, createSQL); err != nil {
+			return err
+		}
+		if _, err := conn.sqliteConn.ExecContext(
+			ctx,
+			fmt.Sprintf("CREATE INDEX %s ON %s (account_id, created_at)", quoteIdent("idx_"+tableName+"_account_created"), quoteIdent(tableName)),
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func informationSchemaBenchmarkTableName(index int) string {
+	return "info_bench_" + stringForCacheTestInt(index)
+}
+
+func countInformationSchemaRows(ctx context.Context, conn *mysqlConn, table string) (int, error) {
+	var count int
+	err := conn.sqliteConn.QueryRowContext(ctx, `SELECT COUNT(*) FROM "information_schema".`+quoteIdent(table)).Scan(&count)
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
 }

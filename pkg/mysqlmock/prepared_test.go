@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"net"
 	"reflect"
 	"strings"
@@ -13,6 +14,12 @@ import (
 	"time"
 
 	"github.com/go-sql-driver/mysql"
+)
+
+var (
+	benchmarkPreparedArgs          []any
+	benchmarkPreparedBinaryPayload []byte
+	benchmarkPreparedBinaryRows    [][]byte
 )
 
 func TestCountPlaceholdersIgnoresQuotedTextAndComments(t *testing.T) {
@@ -150,6 +157,178 @@ func TestBinaryRowEncodesPreparedResultValues(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("binaryRow() = %#v, want %#v", got, want)
 	}
+}
+
+func BenchmarkPreparedStatementDecodeEncode(b *testing.B) {
+	b.Run("decode_execute_args/new_types", func(b *testing.B) {
+		payload, types := benchmarkPreparedExecutePayload(true)
+		stmt := &preparedStatement{
+			ID:         1,
+			ParamCount: len(types),
+			LongData:   map[int][]byte{},
+		}
+
+		args, err := stmt.decodeExecuteArgs(payload)
+		if err != nil {
+			b.Fatalf("decode execute args: %v", err)
+		}
+		if len(args) != len(types) {
+			b.Fatalf("decoded arg count = %d, want %d", len(args), len(types))
+		}
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			benchmarkPreparedArgs, err = stmt.decodeExecuteArgs(payload)
+			if err != nil {
+				b.Fatalf("decode execute args: %v", err)
+			}
+		}
+	})
+
+	b.Run("decode_execute_args/reuse_types", func(b *testing.B) {
+		payload, types := benchmarkPreparedExecutePayload(false)
+		stmt := &preparedStatement{
+			ID:         1,
+			ParamCount: len(types),
+			ParamTypes: types,
+			LongData:   map[int][]byte{},
+		}
+
+		args, err := stmt.decodeExecuteArgs(payload)
+		if err != nil {
+			b.Fatalf("decode execute args: %v", err)
+		}
+		if len(args) != len(types) {
+			b.Fatalf("decoded arg count = %d, want %d", len(args), len(types))
+		}
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			benchmarkPreparedArgs, err = stmt.decodeExecuteArgs(payload)
+			if err != nil {
+				b.Fatalf("decode execute args: %v", err)
+			}
+		}
+	})
+
+	for _, columnCount := range []int{4, 8} {
+		b.Run("binary_row/cols_"+stringForCacheTestInt(columnCount), func(b *testing.B) {
+			columns, values := benchmarkPreparedBinaryRow(columnCount)
+			row, err := binaryRow(columns, values)
+			if err != nil {
+				b.Fatalf("binary row: %v", err)
+			}
+			if len(row) == 0 {
+				b.Fatal("binary row returned empty payload")
+			}
+
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				benchmarkPreparedBinaryPayload, err = binaryRow(columns, values)
+				if err != nil {
+					b.Fatalf("binary row: %v", err)
+				}
+			}
+		})
+	}
+
+	b.Run("binary_rows/materialized_1000x8", func(b *testing.B) {
+		columns, values := benchmarkPreparedBinaryRow(8)
+		rows := make([][]any, 1000)
+		for i := range rows {
+			rows[i] = append([]any(nil), values...)
+			rows[i][0] = int64(i + 1)
+			rows[i][1] = "prepared-name-" + stringForCacheTestInt(i+1)
+		}
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			out := make([][]byte, len(rows))
+			for j, row := range rows {
+				payload, err := binaryRow(columns, row)
+				if err != nil {
+					b.Fatalf("binary row %d: %v", j, err)
+				}
+				out[j] = payload
+			}
+			benchmarkPreparedBinaryRows = out
+		}
+	})
+}
+
+func benchmarkPreparedExecutePayload(includeTypes bool) ([]byte, []preparedParamType) {
+	types := []preparedParamType{
+		{FieldType: fieldTypeLongLong},
+		{FieldType: fieldTypeVarString},
+		{FieldType: fieldTypeBlob},
+		{FieldType: fieldTypeDouble},
+		{FieldType: fieldTypeDateTime},
+		{FieldType: fieldTypeTiny},
+		{FieldType: fieldTypeNull},
+		{FieldType: fieldTypeVarString},
+	}
+
+	payload := make([]byte, 0, 128)
+	payload = appendUint32(payload, 1)
+	payload = append(payload, 0x00)
+	payload = binary.LittleEndian.AppendUint32(payload, 1)
+	payload = append(payload, 1<<6)
+	if includeTypes {
+		payload = append(payload, 0x01)
+		for _, typ := range types {
+			payload = append(payload, typ.FieldType)
+			flag := byte(0)
+			if typ.Unsigned {
+				flag = 0x80
+			}
+			payload = append(payload, flag)
+		}
+	} else {
+		payload = append(payload, 0x00)
+	}
+	payload = binary.LittleEndian.AppendUint64(payload, 42)
+	payload = appendLenEncBytes(payload, []byte("prepared-name"))
+	payload = appendLenEncBytes(payload, []byte("prepared-bytes"))
+	payload = binary.LittleEndian.AppendUint64(payload, math.Float64bits(123.5))
+	payload = appendBinaryPreparedDateTime(payload, time.Date(2026, 5, 23, 12, 34, 56, 789000000, time.Local))
+	payload = append(payload, 1)
+	payload = appendLenEncBytes(payload, []byte("prepared-note"))
+	return payload, types
+}
+
+func appendBinaryPreparedDateTime(buf []byte, value time.Time) []byte {
+	buf = append(buf, 0x0b)
+	buf = appendUint16(buf, uint16(value.Year()))
+	buf = append(buf, byte(value.Month()), byte(value.Day()), byte(value.Hour()), byte(value.Minute()), byte(value.Second()))
+	return binary.LittleEndian.AppendUint32(buf, uint32(value.Nanosecond()/1000))
+}
+
+func benchmarkPreparedBinaryRow(columnCount int) ([]resultColumn, []any) {
+	columns := []resultColumn{
+		{Name: "id", Type: fieldTypeLongLong},
+		{Name: "name", Type: fieldTypeVarString},
+		{Name: "payload", Type: fieldTypeBlob},
+		{Name: "created_at", Type: fieldTypeDateTime},
+		{Name: "score", Type: fieldTypeDouble},
+		{Name: "active", Type: fieldTypeTiny},
+		{Name: "notes", Type: fieldTypeVarString},
+		{Name: "missing", Type: fieldTypeVarString},
+	}
+	values := []any{
+		int64(42),
+		"prepared-name",
+		[]byte("prepared-bytes"),
+		time.Date(2026, 5, 23, 12, 34, 56, 789000000, time.Local),
+		float64(123.5),
+		int64(1),
+		"prepared-note",
+		nil,
+	}
+	return columns[:columnCount], values[:columnCount]
 }
 
 func TestTranslateSQLConvertsMySQLTokensOutsideQuotedText(t *testing.T) {
