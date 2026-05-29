@@ -503,11 +503,14 @@ CREATE TABLE partitioned_zerofill_values (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
 PARTITION BY HASH(id) PARTITIONS 4;
 `)
-	if len(metadata) != 1 {
-		t.Fatalf("metadata length = %d, want 1: %#v", len(metadata), metadata)
+	if len(metadata) != 2 {
+		t.Fatalf("metadata length = %d, want 2: %#v", len(metadata), metadata)
 	}
-	if metadata[0].TableName != "partitioned_zerofill_values" || metadata[0].ColumnName != "zero_padding" || metadata[0].ZeroFillWidth != 5 {
-		t.Fatalf("metadata = %#v, want zero_padding width 5", metadata[0])
+	if metadata[0].TableName != "partitioned_zerofill_values" || metadata[0].ColumnName != "id" || !metadata[0].AutoIncrement {
+		t.Fatalf("metadata = %#v, want id auto increment", metadata[0])
+	}
+	if metadata[1].TableName != "partitioned_zerofill_values" || metadata[1].ColumnName != "zero_padding" || metadata[1].ZeroFillWidth != 5 {
+		t.Fatalf("metadata = %#v, want zero_padding width 5", metadata[1])
 	}
 
 	tableName, ok := parseSimpleSelectTableName("SELECT zero_padding FROM partitioned_zerofill_values WHERE id = ?")

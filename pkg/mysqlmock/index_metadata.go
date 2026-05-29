@@ -25,11 +25,12 @@ type mysqlColumnMetadata struct {
 	TableName     string
 	ColumnName    string
 	ZeroFillWidth int
+	AutoIncrement bool
 }
 
 func (s *Server) recordMySQLColumnMetadata(sqlText string) {
 	for _, metadata := range parseMySQLColumnMetadata(sqlText) {
-		if metadata.TableName == "" || metadata.ColumnName == "" || metadata.ZeroFillWidth <= 0 {
+		if metadata.TableName == "" || metadata.ColumnName == "" || (metadata.ZeroFillWidth <= 0 && !metadata.AutoIncrement) {
 			continue
 		}
 		s.mu.Lock()
@@ -46,6 +47,17 @@ func (s *Server) lookupMySQLColumnMetadata(tableName, columnName string) (mysqlC
 	defer s.mu.Unlock()
 	metadata, ok := s.columnMetadata[columnMetadataKey(tableName, columnName)]
 	return metadata, ok
+}
+
+func (s *Server) lookupMySQLAutoIncrementColumn(tableName string) (mysqlColumnMetadata, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, metadata := range s.columnMetadata {
+		if metadata.AutoIncrement && strings.EqualFold(metadata.TableName, tableName) {
+			return metadata, true
+		}
+	}
+	return mysqlColumnMetadata{}, false
 }
 
 func (s *Server) renameMySQLTableColumnMetadata(oldName, newName string) {
@@ -340,12 +352,14 @@ func parseMySQLColumnMetadata(sqlText string) []mysqlColumnMetadata {
 		if !ok || isCreateTableConstraintItem(columnName) {
 			continue
 		}
-		if width := mysqlZeroFillWidth(item[pos:]); width > 0 {
-			metadata = append(metadata, mysqlColumnMetadata{
-				TableName:     tableName,
-				ColumnName:    unquoteSQLWord(columnName),
-				ZeroFillWidth: width,
-			})
+		columnMetadata := mysqlColumnMetadata{
+			TableName:     tableName,
+			ColumnName:    unquoteSQLWord(columnName),
+			ZeroFillWidth: mysqlZeroFillWidth(item[pos:]),
+			AutoIncrement: containsSQLIdentifier(item[pos:], "AUTO_INCREMENT"),
+		}
+		if columnMetadata.ZeroFillWidth > 0 || columnMetadata.AutoIncrement {
+			metadata = append(metadata, columnMetadata)
 		}
 	}
 	return metadata

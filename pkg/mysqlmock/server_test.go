@@ -1258,7 +1258,8 @@ CREATE TABLE ` + "`composite_links`" + ` (
   ` + "`code`" + ` varchar(255) NOT NULL,
   ` + "`locale`" + ` varchar(16) NOT NULL,
   PRIMARY KEY USING BTREE (` + "`id`" + `, ` + "`tenant_id`" + `, ` + "`code`" + `(191), ` + "`locale`" + `)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin
+PARTITION BY HASH(` + "`tenant_id`" + `) PARTITIONS 4;
 `)
 	if err := os.WriteFile(dumpPath, dump, 0o600); err != nil {
 		t.Fatal(err)
@@ -1278,7 +1279,7 @@ schema_files:
 seed:
   composite_links:
     - tenant_id: 7
-      id: 1
+      id: 100
       code: "news"
       locale: "ja"
 `)
@@ -1313,15 +1314,160 @@ WHERE TABLE_SCHEMA = DATABASE()
 		t.Fatalf("composite primary key metadata = count:%d max ordinal:%d, want 4/4", pkColumns, maxOrdinal)
 	}
 
+	nilID, err := db.ExecContext(ctx, `
+INSERT INTO composite_links (tenant_id, id, code, locale)
+VALUES (?, ?, ?, ?)
+`, 7, nil, "sports", "ja")
+	if err != nil {
+		t.Fatalf("insert composite primary key row with NULL auto increment id: %v", err)
+	}
+	insertedNilID, err := nilID.LastInsertId()
+	if err != nil {
+		t.Fatalf("last insert id for NULL composite auto increment: %v", err)
+	}
+	if insertedNilID != 101 {
+		t.Fatalf("NULL composite auto increment id = %d, want 101", insertedNilID)
+	}
+
+	missingID, err := db.ExecContext(ctx, `
+INSERT INTO composite_links (tenant_id, code, locale)
+VALUES (?, ?, ?)
+`, 7, "weather", "ja")
+	if err != nil {
+		t.Fatalf("insert composite primary key row with omitted auto increment id: %v", err)
+	}
+	insertedMissingID, err := missingID.LastInsertId()
+	if err != nil {
+		t.Fatalf("last insert id for omitted composite auto increment: %v", err)
+	}
+	if insertedMissingID != 102 {
+		t.Fatalf("omitted composite auto increment id = %d, want 102", insertedMissingID)
+	}
+
+	defaultID, err := db.ExecContext(ctx, `
+INSERT INTO composite_links (tenant_id, id, code, locale)
+VALUES (?, DEFAULT, ?, ?)
+`, 7, "finance", "ja")
+	if err != nil {
+		t.Fatalf("insert composite primary key row with DEFAULT auto increment id: %v", err)
+	}
+	insertedDefaultID, err := defaultID.LastInsertId()
+	if err != nil {
+		t.Fatalf("last insert id for DEFAULT composite auto increment: %v", err)
+	}
+	if insertedDefaultID != 103 {
+		t.Fatalf("DEFAULT composite auto increment id = %d, want 103", insertedDefaultID)
+	}
+
+	var storedID int64
+	if err := db.QueryRowContext(ctx, "SELECT id FROM composite_links WHERE code = ?", "finance").Scan(&storedID); err != nil {
+		t.Fatalf("select generated composite auto increment id: %v", err)
+	}
+	if storedID != 103 {
+		t.Fatalf("stored DEFAULT composite auto increment id = %d, want 103", storedID)
+	}
+
+	zeroID, err := db.ExecContext(ctx, `
+INSERT INTO composite_links (tenant_id, id, code, locale)
+VALUES (?, ?, ?, ?)
+`, 7, 0, "markets", "ja")
+	if err != nil {
+		t.Fatalf("insert composite primary key row with zero auto increment id: %v", err)
+	}
+	insertedZeroID, err := zeroID.LastInsertId()
+	if err != nil {
+		t.Fatalf("last insert id for zero composite auto increment: %v", err)
+	}
+	if insertedZeroID != 104 {
+		t.Fatalf("zero composite auto increment id = %d, want 104", insertedZeroID)
+	}
+
 	_, err = db.ExecContext(ctx, `
 INSERT INTO composite_links (tenant_id, id, code, locale)
 VALUES (?, ?, ?, ?)
-`, 7, 1, "news", "ja")
+`, 7, 100, "news", "ja")
 	if err == nil {
 		t.Fatal("expected composite primary key violation")
 	}
 	if !strings.Contains(err.Error(), "Duplicate entry") {
 		t.Fatalf("unexpected composite primary key error: %v", err)
+	}
+}
+
+func TestCompositeAutoIncrementRollbackDoesNotReuseValue(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cfg := mysqlmock.DefaultConfig()
+	cfg.Schema = []string{`
+CREATE TABLE composite_sequence_links (
+  tenant_id bigint NOT NULL,
+  id bigint NOT NULL AUTO_INCREMENT,
+  code varchar(255) NOT NULL,
+  PRIMARY KEY (id, tenant_id, code)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+`}
+	server := mysqlmock.Start(t, mysqlmock.WithConfig(cfg))
+	db, err := sql.Open("mysql", server.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO composite_sequence_links (tenant_id, id, code)
+VALUES (?, ?, ?)
+`, 7, 100, "seed"); err != nil {
+		t.Fatalf("insert explicit composite auto increment seed: %v", err)
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	rolledBack, err := tx.ExecContext(ctx, `
+INSERT INTO composite_sequence_links (tenant_id, id, code)
+VALUES (?, ?, ?)
+`, 7, nil, "rolled-back")
+	if err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("insert rolled back composite auto increment row: %v", err)
+	}
+	rolledBackID, err := rolledBack.LastInsertId()
+	if err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("rolled back composite auto increment last insert id: %v", err)
+	}
+	if rolledBackID != 101 {
+		_ = tx.Rollback()
+		t.Fatalf("rolled back composite auto increment id = %d, want 101", rolledBackID)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+
+	inserted, err := db.ExecContext(ctx, `
+INSERT INTO composite_sequence_links (tenant_id, id, code)
+VALUES (?, ?, ?)
+`, 7, nil, "after-rollback")
+	if err != nil {
+		t.Fatalf("insert composite auto increment after rollback: %v", err)
+	}
+	insertedID, err := inserted.LastInsertId()
+	if err != nil {
+		t.Fatalf("composite auto increment after rollback last insert id: %v", err)
+	}
+	if insertedID != 102 {
+		t.Fatalf("composite auto increment after rollback id = %d, want 102", insertedID)
+	}
+
+	var count int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM composite_sequence_links WHERE code = ?", "rolled-back").Scan(&count); err != nil {
+		t.Fatalf("count rolled back composite auto increment row: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("rolled back composite auto increment row count = %d, want 0", count)
 	}
 }
 

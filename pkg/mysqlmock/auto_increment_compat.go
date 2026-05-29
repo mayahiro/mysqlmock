@@ -4,9 +4,15 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"math"
 	"strings"
 )
+
+type mysqlAutoIncrementInsertValue struct {
+	Value     uint64
+	Generated bool
+}
 
 func (s *Server) recordMySQLAutoIncrementAllocation(tableName string, value uint64) {
 	if tableName == "" || value == 0 {
@@ -33,13 +39,25 @@ func (s *Server) mysqlAutoIncrementAllocations() map[string]uint64 {
 	return out
 }
 
-func (c *mysqlConn) recordMySQLAutoIncrementAllocation(query string, result okResult) {
+func (s *Server) mysqlAutoIncrementAllocation(tableName string) uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.autoIncrement[tableMetadataKey(tableName)]
+}
+
+func (c *mysqlConn) recordMySQLAutoIncrementAllocation(ctx context.Context, query string, result okResult) {
 	if result.LastInsertID == 0 {
 		return
 	}
 	tableName, ok := parseInsertTargetTable(query)
 	if !ok {
 		return
+	}
+	if _, ok := c.server.lookupMySQLAutoIncrementColumn(tableName); ok {
+		usesAutoIncrement, err := c.sqliteTableUsesAutoincrement(ctx, tableName)
+		if err != nil || !usesAutoIncrement {
+			return
+		}
 	}
 	c.server.recordMySQLAutoIncrementAllocation(tableName, result.LastInsertID)
 }
@@ -140,4 +158,105 @@ modifiersDone:
 		return "", false
 	}
 	return tableName, true
+}
+
+func (c *mysqlConn) needsMySQLAutoIncrementInsertCompatibility(tableColumns []sqliteTableColumn, tableName string) bool {
+	metadata, ok := c.server.lookupMySQLAutoIncrementColumn(tableName)
+	if !ok {
+		return false
+	}
+	return !sqliteTableColumnsUseRowIDAutoIncrement(tableColumns, metadata.ColumnName)
+}
+
+func (c *mysqlConn) applyMySQLAutoIncrementInsertValue(ctx context.Context, tableName string, tableColumns []sqliteTableColumn, columns *[]string, values *[]any) (mysqlAutoIncrementInsertValue, error) {
+	metadata, ok := c.server.lookupMySQLAutoIncrementColumn(tableName)
+	if !ok || sqliteTableColumnsUseRowIDAutoIncrement(tableColumns, metadata.ColumnName) {
+		return mysqlAutoIncrementInsertValue{}, nil
+	}
+	columnIndex := insertColumnIndex(*columns, metadata.ColumnName)
+	if columnIndex >= 0 {
+		if columnIndex >= len(*values) {
+			return mysqlAutoIncrementInsertValue{}, nil
+		}
+		value := (*values)[columnIndex]
+		if !shouldGenerateAutoIncrementValue(value) {
+			if explicit, ok := positiveAutoIncrementValue(value); ok {
+				return mysqlAutoIncrementInsertValue{Value: explicit}, nil
+			}
+			return mysqlAutoIncrementInsertValue{}, nil
+		}
+		next, err := c.nextMySQLAutoIncrementValue(ctx, tableName, metadata.ColumnName)
+		if err != nil {
+			return mysqlAutoIncrementInsertValue{}, err
+		}
+		(*values)[columnIndex] = int64(next)
+		return mysqlAutoIncrementInsertValue{Value: next, Generated: true}, nil
+	}
+
+	next, err := c.nextMySQLAutoIncrementValue(ctx, tableName, metadata.ColumnName)
+	if err != nil {
+		return mysqlAutoIncrementInsertValue{}, err
+	}
+	*columns = append(*columns, metadata.ColumnName)
+	*values = append(*values, int64(next))
+	return mysqlAutoIncrementInsertValue{Value: next, Generated: true}, nil
+}
+
+func (c *mysqlConn) nextMySQLAutoIncrementValue(ctx context.Context, tableName, columnName string) (uint64, error) {
+	query := fmt.Sprintf("SELECT MAX(%s) FROM %s", quoteIdent(unquoteSQLWord(columnName)), quoteIdent(unquoteSQLWord(tableName)))
+	var maxValue sql.NullInt64
+	if err := c.sqliteConn.QueryRowContext(ctx, query).Scan(&maxValue); err != nil {
+		return 0, err
+	}
+
+	var base uint64
+	if maxValue.Valid && maxValue.Int64 > 0 {
+		base = uint64(maxValue.Int64)
+	}
+	if allocated := c.server.mysqlAutoIncrementAllocation(tableName); allocated > base {
+		base = allocated
+	}
+	if base >= uint64(math.MaxInt64) {
+		return 0, sqlCompatErrorf("AUTO_INCREMENT value overflow for %s.%s", unquoteSQLWord(tableName), unquoteSQLWord(columnName))
+	}
+	return base + 1, nil
+}
+
+func sqliteTableColumnsUseRowIDAutoIncrement(tableColumns []sqliteTableColumn, columnName string) bool {
+	column, ok := findSQLiteTableColumn(tableColumns, columnName)
+	if !ok || column.PK != 1 || !strings.EqualFold(strings.TrimSpace(column.Type), "INTEGER") {
+		return false
+	}
+	pkColumns := 0
+	for _, tableColumn := range tableColumns {
+		if tableColumn.PK > 0 {
+			pkColumns++
+		}
+	}
+	return pkColumns == 1
+}
+
+func insertColumnIndex(columns []string, columnName string) int {
+	for i, column := range columns {
+		if strings.EqualFold(unquoteSQLWord(column), columnName) {
+			return i
+		}
+	}
+	return -1
+}
+
+func shouldGenerateAutoIncrementValue(value any) bool {
+	if value == nil {
+		return true
+	}
+	id, err := int64Value(value)
+	return err == nil && id == 0
+}
+
+func positiveAutoIncrementValue(value any) (uint64, bool) {
+	id, err := int64Value(value)
+	if err != nil || id <= 0 {
+		return 0, false
+	}
+	return uint64(id), true
 }

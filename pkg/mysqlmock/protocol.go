@@ -448,6 +448,7 @@ func (c *mysqlConn) executeQuery(ctx context.Context, command, sqlText string, a
 		resp, err := c.execSQLiteStatements(ctx, c.server.translateSQLStatementsCached(trimmed), args...)
 		if err == nil {
 			c.server.recordMySQLIndexMetadata(trimmed)
+			c.server.recordMySQLColumnMetadata(trimmed)
 			c.server.recordMySQLTableDDL(trimmed)
 			c.server.invalidateMySQLTableDDLForStatement(trimmed)
 		}
@@ -747,7 +748,7 @@ func (c *mysqlConn) execSQLite(ctx context.Context, query string, args ...any) (
 	affected, _ := res.RowsAffected()
 	lastID, _ := res.LastInsertId()
 	result := okResult{AffectedRows: uint64NonNegative(affected), LastInsertID: uint64NonNegative(lastID)}
-	c.recordMySQLAutoIncrementAllocation(query, result)
+	c.recordMySQLAutoIncrementAllocation(ctx, query, result)
 	return result, nil
 }
 

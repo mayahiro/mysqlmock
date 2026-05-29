@@ -102,10 +102,19 @@ func (c *mysqlConn) execMySQLUpsert(ctx context.Context, sqlText string, args ..
 			return okResult{}, true, err
 		}
 		insertColumns, insertValues := c.applyImplicitDefaultInsertValues(tableColumns, stmt.Columns, values)
+		autoIncrement, err := c.applyMySQLAutoIncrementInsertValue(ctx, stmt.TableName, tableColumns, &insertColumns, &insertValues)
+		if err != nil {
+			return okResult{}, true, err
+		}
 		result, err := c.execSQLite(ctx, buildSQLiteInsert(stmt.TableName, insertColumns), insertValues...)
 		if err == nil {
 			affected++
-			if result.LastInsertID != 0 && lastInsertID == 0 {
+			if autoIncrement.Value != 0 {
+				c.server.recordMySQLAutoIncrementAllocation(stmt.TableName, autoIncrement.Value)
+			}
+			if autoIncrement.Generated && autoIncrement.Value != 0 && lastInsertID == 0 {
+				lastInsertID = autoIncrement.Value
+			} else if result.LastInsertID != 0 && lastInsertID == 0 {
 				lastInsertID = result.LastInsertID
 			}
 			continue
@@ -161,7 +170,7 @@ func (c *mysqlConn) execMySQLInsertCompatibility(ctx context.Context, sqlText st
 		return okResult{}, true, err
 	}
 	if !stmt.Ignore && !stmt.Replace {
-		if c.server.cfg.Compat.ImplicitDefaults || insertStatementUsesDefaultValues(stmt) {
+		if c.server.cfg.Compat.ImplicitDefaults || insertStatementUsesDefaultValues(stmt) || c.needsMySQLAutoIncrementInsertCompatibility(tableColumns, stmt.TableName) {
 			return c.execMySQLPlainInsert(ctx, stmt, tableColumns)
 		}
 		return okResult{}, false, nil
@@ -182,12 +191,21 @@ func (c *mysqlConn) execMySQLPlainInsert(ctx context.Context, stmt mysqlInsertSt
 			return okResult{}, true, err
 		}
 		insertColumns, insertValues := c.applyImplicitDefaultInsertValues(tableColumns, stmt.Columns, values)
+		autoIncrement, err := c.applyMySQLAutoIncrementInsertValue(ctx, stmt.TableName, tableColumns, &insertColumns, &insertValues)
+		if err != nil {
+			return okResult{}, true, err
+		}
 		result, err := c.execSQLite(ctx, buildSQLiteInsert(stmt.TableName, insertColumns), insertValues...)
 		if err != nil {
 			return okResult{}, true, err
 		}
 		affected++
-		if result.LastInsertID != 0 && lastInsertID == 0 {
+		if autoIncrement.Value != 0 {
+			c.server.recordMySQLAutoIncrementAllocation(stmt.TableName, autoIncrement.Value)
+		}
+		if autoIncrement.Generated && autoIncrement.Value != 0 && lastInsertID == 0 {
+			lastInsertID = autoIncrement.Value
+		} else if result.LastInsertID != 0 && lastInsertID == 0 {
 			lastInsertID = result.LastInsertID
 		}
 	}
@@ -204,10 +222,19 @@ func (c *mysqlConn) execMySQLInsertIgnore(ctx context.Context, stmt mysqlInsertS
 			return okResult{}, true, err
 		}
 		insertColumns, insertValues := c.applyImplicitDefaultInsertValues(tableColumns, stmt.Columns, values)
+		autoIncrement, err := c.applyMySQLAutoIncrementInsertValue(ctx, stmt.TableName, tableColumns, &insertColumns, &insertValues)
+		if err != nil {
+			return okResult{}, true, err
+		}
 		result, err := c.execSQLite(ctx, buildSQLiteInsert(stmt.TableName, insertColumns), insertValues...)
 		if err == nil {
 			affected++
-			if result.LastInsertID != 0 && lastInsertID == 0 {
+			if autoIncrement.Value != 0 {
+				c.server.recordMySQLAutoIncrementAllocation(stmt.TableName, autoIncrement.Value)
+			}
+			if autoIncrement.Generated && autoIncrement.Value != 0 && lastInsertID == 0 {
+				lastInsertID = autoIncrement.Value
+			} else if result.LastInsertID != 0 && lastInsertID == 0 {
 				lastInsertID = result.LastInsertID
 			}
 			continue
@@ -229,6 +256,10 @@ func (c *mysqlConn) execMySQLReplace(ctx context.Context, stmt mysqlInsertStatem
 			return okResult{}, true, err
 		}
 		insertColumns, insertValues := c.applyImplicitDefaultInsertValues(tableColumns, stmt.Columns, values)
+		autoIncrement, err := c.applyMySQLAutoIncrementInsertValue(ctx, stmt.TableName, tableColumns, &insertColumns, &insertValues)
+		if err != nil {
+			return okResult{}, true, err
+		}
 		rowIDs, err := c.findConflictRowIDs(ctx, stmt.TableName, insertColumns, insertValues)
 		if err != nil {
 			return okResult{}, true, err
@@ -244,7 +275,12 @@ func (c *mysqlConn) execMySQLReplace(ctx context.Context, stmt mysqlInsertStatem
 			return okResult{}, true, err
 		}
 		affected++
-		if result.LastInsertID != 0 && lastInsertID == 0 {
+		if autoIncrement.Value != 0 {
+			c.server.recordMySQLAutoIncrementAllocation(stmt.TableName, autoIncrement.Value)
+		}
+		if autoIncrement.Generated && autoIncrement.Value != 0 && lastInsertID == 0 {
+			lastInsertID = autoIncrement.Value
+		} else if result.LastInsertID != 0 && lastInsertID == 0 {
 			lastInsertID = result.LastInsertID
 		}
 	}
@@ -701,6 +737,9 @@ func (c *mysqlConn) defaultColumnValue(ctx context.Context, tableName, columnNam
 	column, ok := findSQLiteTableColumn(tableColumns, columnName)
 	if !ok {
 		return nil, sqlCompatErrorf("ON DUPLICATE KEY UPDATE references unknown DEFAULT column: %s", columnName)
+	}
+	if metadata, ok := c.server.lookupMySQLAutoIncrementColumn(tableName); ok && strings.EqualFold(metadata.ColumnName, unquoteSQLWord(columnName)) {
+		return nil, nil
 	}
 	if column.HasDefault {
 		rs, err := c.querySQLite(ctx, "SELECT "+translateSQL(column.DefaultSQL))

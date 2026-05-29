@@ -275,9 +275,10 @@ accepted as no-op teardown statements.
 execution. Integer columns declared with `ZEROFILL` use the declared display
 width for simple result-set values.
 When an `AUTO_INCREMENT` column belongs to a composite primary key, mysqlmock
-keeps the composite key and strips `AUTO_INCREMENT`; SQLite only supports
-automatic rowid assignment for a single `INTEGER PRIMARY KEY`, so inserts must
-provide that key value explicitly.
+keeps the composite key and strips SQLite `AUTOINCREMENT`; SQLite only supports
+automatic rowid assignment for a single `INTEGER PRIMARY KEY`. mysqlmock keeps
+the original MySQL metadata and fills omitted, `NULL`, `0`, or `DEFAULT` values
+with MySQL-like sequence values on compatible `INSERT ... VALUES` statements.
 For single-column `AUTO_INCREMENT`, mysqlmock keeps consumed values from being
 reused after `ROLLBACK` or `ROLLBACK TO SAVEPOINT`, matching InnoDB more
 closely than SQLite's default rollback behavior.

@@ -145,9 +145,10 @@ before being applied. The translator handles common Repository-test DDL such as
 definitions, simple MySQL index DDL, and common `ALTER TABLE` / `RENAME TABLE`
 variants. It does not try to implement a full MySQL parser.
 If an `AUTO_INCREMENT` column is part of a composite primary key, mysqlmock
-keeps the composite key and removes `AUTO_INCREMENT`; SQLite can only
-auto-assign rowid values for a single `INTEGER PRIMARY KEY`, so that column must
-be set explicitly by seed data or test inserts.
+keeps the composite key and removes SQLite `AUTOINCREMENT`; SQLite can only
+auto-assign rowid values for a single `INTEGER PRIMARY KEY`. mysqlmock keeps the
+original MySQL metadata and fills omitted, `NULL`, `0`, or `DEFAULT` values with
+MySQL-like sequence values on compatible `INSERT ... VALUES` statements.
 For single-column `AUTO_INCREMENT`, mysqlmock keeps consumed values from being
 reused after `ROLLBACK` or `ROLLBACK TO SAVEPOINT`, matching InnoDB more
 closely than SQLite's default rollback behavior.

@@ -311,6 +311,7 @@ func (s *Server) Reset(ctx context.Context) error {
 	} else {
 		s.mu.Lock()
 		s.indexMetadata = map[string]mysqlIndexMetadata{}
+		s.columnMetadata = map[string]mysqlColumnMetadata{}
 		s.tableDDL = map[string]string{}
 		s.autoIncrement = map[string]uint64{}
 		s.mu.Unlock()
