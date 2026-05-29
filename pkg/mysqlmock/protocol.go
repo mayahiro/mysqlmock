@@ -315,6 +315,7 @@ func (c *mysqlConn) executeQuery(ctx context.Context, command, sqlText string, a
 	}
 	normalized := normalizeSQL(trimmed)
 	upper := strings.ToUpper(normalized)
+	versionColumn, isVersionQuery := selectVersionColumnName(trimmed)
 
 	if resp, matched, err := c.server.executeRule(ctx, sqlText, args); matched || err != nil {
 		c.logQuery(command, "rules", sqlText, normalized)
@@ -336,9 +337,9 @@ func (c *mysqlConn) executeQuery(ctx context.Context, command, sqlText string, a
 	case strings.HasPrefix(upper, "SET "):
 		c.logQuery(command, "compat", sqlText, normalized)
 		return c.setVariables(ctx, trimmed), nil
-	case upper == "SELECT VERSION()" || upper == "SELECT VERSION":
+	case isVersionQuery:
 		c.logQuery(command, "compat", sqlText, normalized)
-		return oneRow("VERSION()", c.server.cfg.Server.MySQLVersion), nil
+		return oneRow(versionColumn, c.server.cfg.Server.MySQLVersion), nil
 	case isAdvisoryLockQuery(upper):
 		c.logQuery(command, "compat", sqlText, normalized)
 		return c.advisoryLockResult(trimmed), nil
@@ -615,6 +616,49 @@ func (c *mysqlConn) showVariables() resultSet {
 		},
 		Rows: rows,
 	}
+}
+
+func selectVersionColumnName(sqlText string) (string, bool) {
+	sqlText = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(sqlText), ";"))
+	pos := 0
+	if !consumeKeyword(sqlText, &pos, "SELECT") {
+		return "", false
+	}
+	if !consumeKeyword(sqlText, &pos, "VERSION") {
+		return "", false
+	}
+	pos = skipSQLSpaces(sqlText, pos)
+	if pos < len(sqlText) && sqlText[pos] == '(' {
+		end, ok := parenthesizedSQLSpan(sqlText, pos)
+		if !ok || strings.TrimSpace(sqlText[pos+1:end-1]) != "" {
+			return "", false
+		}
+		pos = end
+	}
+	pos = skipSQLSpaces(sqlText, pos)
+	if pos >= len(sqlText) {
+		return "VERSION()", true
+	}
+	if consumeKeyword(sqlText, &pos, "AS") {
+		alias, next, ok := readSQLNameToken(sqlText, pos)
+		if !ok {
+			return "", false
+		}
+		pos = skipSQLSpaces(sqlText, next)
+		if pos != len(sqlText) {
+			return "", false
+		}
+		return unquoteSQLWord(alias), true
+	}
+	alias, next, ok := readSQLNameToken(sqlText, pos)
+	if !ok {
+		return "", false
+	}
+	pos = skipSQLSpaces(sqlText, next)
+	if pos != len(sqlText) {
+		return "", false
+	}
+	return unquoteSQLWord(alias), true
 }
 
 func (c *mysqlConn) compatVariable(name string) (string, bool) {

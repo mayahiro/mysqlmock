@@ -185,6 +185,58 @@ func TestServerWithGoSQLDriverMySQL(t *testing.T) {
 	}
 }
 
+func TestSelectVersionAlias(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	server := mysqlmock.Start(t, mysqlmock.WithConfig(testConfig()))
+
+	db, err := sql.Open("mysql", server.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	for _, tt := range []struct {
+		query      string
+		columnName string
+	}{
+		{query: "SELECT VERSION() AS x", columnName: "x"},
+		{query: "SELECT VERSION() version_alias", columnName: "version_alias"},
+		{query: "SELECT VERSION AS `mysql_version`", columnName: "mysql_version"},
+	} {
+		rows, err := db.QueryContext(ctx, tt.query)
+		if err != nil {
+			t.Fatalf("%s: %v", tt.query, err)
+		}
+		columns, err := rows.Columns()
+		if err != nil {
+			_ = rows.Close()
+			t.Fatalf("%s columns: %v", tt.query, err)
+		}
+		if len(columns) != 1 || columns[0] != tt.columnName {
+			_ = rows.Close()
+			t.Fatalf("%s columns = %#v, want %q", tt.query, columns, tt.columnName)
+		}
+		if !rows.Next() {
+			_ = rows.Close()
+			t.Fatalf("%s returned no rows", tt.query)
+		}
+		var version string
+		if err := rows.Scan(&version); err != nil {
+			_ = rows.Close()
+			t.Fatalf("%s scan: %v", tt.query, err)
+		}
+		if err := rows.Close(); err != nil {
+			t.Fatalf("%s close rows: %v", tt.query, err)
+		}
+		if version != "8.0.36-mock" {
+			t.Fatalf("%s returned version %q, want 8.0.36-mock", tt.query, version)
+		}
+	}
+}
+
 func TestForeignKeyConstraintViolationMapsToMySQLError(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
