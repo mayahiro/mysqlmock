@@ -39,6 +39,7 @@ func (c *mysqlConn) execMySQLDDLCompatibility(ctx context.Context, sqlText strin
 	}
 	if tableName, indexName, visible, ok := parseAlterTableAlterIndexVisibility(sqlText); ok {
 		c.server.setMySQLIndexVisibility(tableName, indexName, visible)
+		c.server.bumpSchemaVersion()
 		return okResult{}, true, nil
 	}
 	if tableName, oldName, newName, ok := parseAlterTableChangeColumn(sqlText); ok {

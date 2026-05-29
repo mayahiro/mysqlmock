@@ -100,6 +100,10 @@ type mysqlConn struct {
 
 	nextStatementID uint32
 	statements      map[uint32]*preparedStatement
+
+	informationSchemaFullLoaded  bool
+	informationSchemaFullVersion uint64
+	informationSchemaTableCache  map[string]informationSchemaTableCacheEntry
 }
 
 type resultColumn struct {
@@ -680,6 +684,9 @@ func (c *mysqlConn) execSQLite(ctx context.Context, query string, args ...any) (
 	if err != nil {
 		return okResult{}, err
 	}
+	if isSchemaChangingQuery(query) {
+		c.server.bumpSchemaVersion()
+	}
 	affected, _ := res.RowsAffected()
 	lastID, _ := res.LastInsertId()
 	return okResult{AffectedRows: uint64NonNegative(affected), LastInsertID: uint64NonNegative(lastID)}, nil
@@ -1071,6 +1078,21 @@ func isWriteQuery(upper string) bool {
 		strings.HasPrefix(upper, "ALTER TABLE ") ||
 		strings.HasPrefix(upper, "RENAME TABLE ") ||
 		strings.HasPrefix(upper, "DROP TABLE ") ||
+		strings.HasPrefix(upper, "DROP INDEX ")
+}
+
+func isSchemaChangingQuery(sqlText string) bool {
+	upper := strings.ToUpper(normalizeSQL(sqlText))
+	return strings.HasPrefix(upper, "CREATE TABLE ") ||
+		strings.HasPrefix(upper, "CREATE TEMPORARY TABLE ") ||
+		strings.HasPrefix(upper, "CREATE TEMP TABLE ") ||
+		strings.HasPrefix(upper, "CREATE VIEW ") ||
+		strings.HasPrefix(upper, "CREATE INDEX ") ||
+		strings.HasPrefix(upper, "CREATE UNIQUE INDEX ") ||
+		strings.HasPrefix(upper, "ALTER TABLE ") ||
+		strings.HasPrefix(upper, "RENAME TABLE ") ||
+		strings.HasPrefix(upper, "DROP TABLE ") ||
+		strings.HasPrefix(upper, "DROP VIEW ") ||
 		strings.HasPrefix(upper, "DROP INDEX ")
 }
 

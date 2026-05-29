@@ -81,6 +81,7 @@ type Server struct {
 	wg        sync.WaitGroup
 
 	nextConnectionID atomic.Uint32
+	schemaVersion    atomic.Uint64
 	logWriter        io.Writer
 	logFormat        string
 	logMu            sync.Mutex
@@ -259,6 +260,14 @@ func (s *Server) Queries() []QueryEvent {
 	return out
 }
 
+func (s *Server) currentSchemaVersion() uint64 {
+	return s.schemaVersion.Load()
+}
+
+func (s *Server) bumpSchemaVersion() {
+	s.schemaVersion.Add(1)
+}
+
 // Reset drops all current SQLite objects, reapplies schema and seed data, and clears diagnostics.
 func (s *Server) Reset(ctx context.Context) error {
 	if s.keepConn == nil {
@@ -271,6 +280,7 @@ func (s *Server) Reset(ctx context.Context) error {
 	if err := s.resetBackend(ctx, s.keepConn); err != nil {
 		return err
 	}
+	s.bumpSchemaVersion()
 
 	s.mu.Lock()
 	s.unsupported = nil

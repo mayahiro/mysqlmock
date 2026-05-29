@@ -7,32 +7,42 @@ import (
 	"strings"
 )
 
+type informationSchemaTableCacheEntry struct {
+	version uint64
+	exists  bool
+}
+
 func isInformationSchemaQuery(upperSQL string) bool {
 	unquoted := strings.NewReplacer("`", "", `"`, "").Replace(upperSQL)
 	return strings.Contains(unquoted, "INFORMATION_SCHEMA.")
 }
 
 func (c *mysqlConn) queryInformationSchema(ctx context.Context, sqlText string, args ...any) (resultSet, error) {
-	if err := c.refreshInformationSchema(ctx); err != nil {
-		return resultSet{}, err
+	if tableName, ok := informationSchemaTargetTable(sqlText, args); ok {
+		if _, err := c.refreshInformationSchemaTable(ctx, tableName); err != nil {
+			return resultSet{}, err
+		}
+	} else {
+		if err := c.refreshInformationSchema(ctx); err != nil {
+			return resultSet{}, err
+		}
 	}
 	query := translateSQL(rewriteInformationSchemaSQL(sqlText, c.currentDB))
 	return c.querySQLite(ctx, query, args...)
 }
 
 func (c *mysqlConn) refreshInformationSchema(ctx context.Context) error {
-	if err := c.ensureInformationSchemaAttached(ctx); err != nil {
+	version := c.server.currentSchemaVersion()
+	if c.informationSchemaFullLoaded && c.informationSchemaFullVersion == version {
+		return nil
+	}
+	if err := c.prepareInformationSchema(ctx); err != nil {
 		return err
 	}
-	if err := c.createInformationSchemaTables(ctx); err != nil {
+	if err := c.clearInformationSchema(ctx); err != nil {
 		return err
 	}
-	for _, table := range []string{"schemata", "tables", "columns", "key_column_usage", "statistics", "table_constraints", "referential_constraints", "check_constraints"} {
-		if _, err := c.sqliteConn.ExecContext(ctx, `DELETE FROM "information_schema".`+quoteIdent(table)); err != nil {
-			return fmt.Errorf("clear information_schema.%s: %w", table, err)
-		}
-	}
-	if err := c.insertInformationSchemaSchemata(ctx); err != nil {
+	if err := c.refreshInformationSchemaSchemata(ctx); err != nil {
 		return err
 	}
 
@@ -54,20 +64,125 @@ ORDER BY name`)
 		if err := rows.Scan(&tableType, &tableName, &createSQL); err != nil {
 			return fmt.Errorf("scan sqlite table for information_schema: %w", err)
 		}
-		if err := c.insertInformationSchemaTable(ctx, tableName, tableType); err != nil {
-			return err
-		}
-		if err := c.insertInformationSchemaColumns(ctx, tableName, createSQL.String); err != nil {
-			return err
-		}
-		if err := c.insertInformationSchemaKeys(ctx, tableName); err != nil {
+		if err := c.insertInformationSchemaTableMetadata(ctx, tableName, tableType, createSQL.String); err != nil {
 			return err
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("list sqlite tables for information_schema: %w", err)
 	}
+	c.informationSchemaFullLoaded = true
+	c.informationSchemaFullVersion = version
+	c.informationSchemaTableCache = map[string]informationSchemaTableCacheEntry{}
 	return nil
+}
+
+func (c *mysqlConn) refreshInformationSchemaTable(ctx context.Context, tableName string) (bool, error) {
+	version := c.server.currentSchemaVersion()
+	if entry, ok := c.informationSchemaTableCache[canonicalInformationSchemaTableCacheKey(tableName)]; ok && entry.version == version {
+		return entry.exists, nil
+	}
+	if c.informationSchemaFullLoaded && c.informationSchemaFullVersion == version {
+		return c.informationSchemaCachedTableExists(ctx, tableName)
+	}
+	if err := c.prepareInformationSchema(ctx); err != nil {
+		return false, err
+	}
+	if err := c.refreshInformationSchemaSchemata(ctx); err != nil {
+		return false, err
+	}
+	if err := c.clearInformationSchemaTable(ctx, tableName); err != nil {
+		return false, err
+	}
+
+	var tableType string
+	var createSQL sql.NullString
+	err := c.sqliteConn.QueryRowContext(ctx, `
+SELECT type, sql
+FROM main.sqlite_master
+WHERE type IN ('table', 'view')
+  AND name = ?
+  AND name NOT LIKE 'sqlite_%'`, tableName).Scan(&tableType, &createSQL)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			c.setInformationSchemaTableCache(tableName, version, false)
+			return false, nil
+		}
+		return false, fmt.Errorf("load sqlite table for information_schema.%s: %w", tableName, err)
+	}
+	if err := c.insertInformationSchemaTableMetadata(ctx, tableName, tableType, createSQL.String); err != nil {
+		return false, err
+	}
+	c.setInformationSchemaTableCache(tableName, version, true)
+	return true, nil
+}
+
+func (c *mysqlConn) prepareInformationSchema(ctx context.Context) error {
+	if err := c.ensureInformationSchemaAttached(ctx); err != nil {
+		return err
+	}
+	if err := c.createInformationSchemaTables(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *mysqlConn) clearInformationSchema(ctx context.Context) error {
+	for _, table := range []string{"schemata", "tables", "columns", "key_column_usage", "statistics", "table_constraints", "referential_constraints", "check_constraints"} {
+		if _, err := c.sqliteConn.ExecContext(ctx, `DELETE FROM "information_schema".`+quoteIdent(table)); err != nil {
+			return fmt.Errorf("clear information_schema.%s: %w", table, err)
+		}
+	}
+	return nil
+}
+
+func (c *mysqlConn) clearInformationSchemaTable(ctx context.Context, tableName string) error {
+	deletes := []struct {
+		table string
+		where string
+		args  []any
+	}{
+		{table: "tables", where: "TABLE_SCHEMA = ? AND TABLE_NAME = ?", args: []any{c.currentDB, tableName}},
+		{table: "columns", where: "TABLE_SCHEMA = ? AND TABLE_NAME = ?", args: []any{c.currentDB, tableName}},
+		{table: "key_column_usage", where: "TABLE_SCHEMA = ? AND TABLE_NAME = ?", args: []any{c.currentDB, tableName}},
+		{table: "statistics", where: "TABLE_SCHEMA = ? AND TABLE_NAME = ?", args: []any{c.currentDB, tableName}},
+		{table: "table_constraints", where: "TABLE_SCHEMA = ? AND TABLE_NAME = ?", args: []any{c.currentDB, tableName}},
+		{table: "referential_constraints", where: "CONSTRAINT_SCHEMA = ? AND TABLE_NAME = ?", args: []any{c.currentDB, tableName}},
+	}
+	for _, delete := range deletes {
+		query := `DELETE FROM "information_schema".` + quoteIdent(delete.table) + ` WHERE ` + delete.where
+		if _, err := c.sqliteConn.ExecContext(ctx, query, delete.args...); err != nil {
+			return fmt.Errorf("clear information_schema.%s rows for %s: %w", delete.table, tableName, err)
+		}
+	}
+	return nil
+}
+
+func (c *mysqlConn) setInformationSchemaTableCache(tableName string, version uint64, exists bool) {
+	if c.informationSchemaTableCache == nil {
+		c.informationSchemaTableCache = map[string]informationSchemaTableCacheEntry{}
+	}
+	c.informationSchemaTableCache[canonicalInformationSchemaTableCacheKey(tableName)] = informationSchemaTableCacheEntry{
+		version: version,
+		exists:  exists,
+	}
+}
+
+func (c *mysqlConn) informationSchemaCachedTableExists(ctx context.Context, tableName string) (bool, error) {
+	var count int
+	err := c.sqliteConn.QueryRowContext(ctx, `
+SELECT COUNT(*)
+FROM "information_schema"."tables"
+WHERE TABLE_SCHEMA = ?
+  AND TABLE_NAME = ?`, c.currentDB, tableName).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+func canonicalInformationSchemaTableCacheKey(tableName string) string {
+	return strings.ToLower(tableName)
 }
 
 func (c *mysqlConn) ensureInformationSchemaAttached(ctx context.Context) error {
@@ -198,6 +313,26 @@ VALUES
 		c.currentDB, c.characterSetConnection, c.collationConnection)
 	if err != nil {
 		return fmt.Errorf("insert information_schema.schemata row for %s: %w", c.currentDB, err)
+	}
+	return nil
+}
+
+func (c *mysqlConn) refreshInformationSchemaSchemata(ctx context.Context) error {
+	if _, err := c.sqliteConn.ExecContext(ctx, `DELETE FROM "information_schema"."schemata"`); err != nil {
+		return fmt.Errorf("clear information_schema.schemata: %w", err)
+	}
+	return c.insertInformationSchemaSchemata(ctx)
+}
+
+func (c *mysqlConn) insertInformationSchemaTableMetadata(ctx context.Context, tableName, tableType, createSQL string) error {
+	if err := c.insertInformationSchemaTable(ctx, tableName, tableType); err != nil {
+		return err
+	}
+	if err := c.insertInformationSchemaColumns(ctx, tableName, createSQL); err != nil {
+		return err
+	}
+	if err := c.insertInformationSchemaKeys(ctx, tableName); err != nil {
+		return err
 	}
 	return nil
 }
@@ -583,6 +718,75 @@ func informationSchemaColumnTypes(declaredType string) (dataType, columnType str
 		dataType = "blob"
 	}
 	return dataType, columnType
+}
+
+func informationSchemaTargetTable(sqlText string, args []any) (string, bool) {
+	if containsSQLIdentifier(sqlText, "OR") || informationSchemaReferencesSchemata(sqlText) {
+		return "", false
+	}
+	for i := 0; i < len(sqlText); {
+		if sqlText[i] == '\'' {
+			end, _ := quotedSQLSpan(sqlText, i)
+			i = end
+			continue
+		}
+		if end, ok := sqlCommentSpan(sqlText, i); ok {
+			i = end
+			continue
+		}
+		name, end, ok := readSQLNameToken(sqlText, i)
+		if !ok {
+			i++
+			continue
+		}
+		if !strings.EqualFold(unquoteSQLWord(name), "TABLE_NAME") {
+			i = end
+			continue
+		}
+		next := skipSQLSpaces(sqlText, end)
+		if next >= len(sqlText) || sqlText[next] != '=' {
+			i = end
+			continue
+		}
+		valueStart := skipSQLSpaces(sqlText, next+1)
+		if valueStart >= len(sqlText) {
+			return "", false
+		}
+		if sqlText[valueStart] == '?' {
+			index := countPlaceholders(sqlText[:valueStart])
+			return informationSchemaTableNameArg(args, index)
+		}
+		if sqlText[valueStart] == '\'' || sqlText[valueStart] == '"' {
+			valueEnd, ok := quotedSQLSpan(sqlText, valueStart)
+			if !ok {
+				return "", false
+			}
+			return unquoteSQLWord(sqlText[valueStart:valueEnd]), true
+		}
+		return "", false
+	}
+	return "", false
+}
+
+func informationSchemaReferencesSchemata(sqlText string) bool {
+	unquoted := strings.NewReplacer("`", "", `"`, "").Replace(strings.ToUpper(sqlText))
+	normalized := strings.Join(strings.Fields(unquoted), " ")
+	return strings.Contains(normalized, "INFORMATION_SCHEMA.SCHEMATA") ||
+		strings.Contains(normalized, "INFORMATION_SCHEMA . SCHEMATA")
+}
+
+func informationSchemaTableNameArg(args []any, index int) (string, bool) {
+	if index < 0 || index >= len(args) {
+		return "", false
+	}
+	switch value := args[index].(type) {
+	case string:
+		return value, value != ""
+	case []byte:
+		return string(value), len(value) != 0
+	default:
+		return "", false
+	}
 }
 
 func rewriteInformationSchemaSQL(sqlText, currentDB string) string {

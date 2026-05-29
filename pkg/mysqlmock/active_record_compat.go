@@ -46,10 +46,7 @@ func (c *mysqlConn) showFullFields(ctx context.Context, sqlText string) (resultS
 	if !ok {
 		return resultSet{}, c.server.unsupportedError(sqlText)
 	}
-	if err := c.refreshInformationSchema(ctx); err != nil {
-		return resultSet{}, err
-	}
-	exists, err := c.tableExists(ctx, tableName)
+	exists, err := c.refreshInformationSchemaTable(ctx, tableName)
 	if err != nil {
 		return resultSet{}, err
 	}
@@ -161,10 +158,7 @@ func (c *mysqlConn) showKeys(ctx context.Context, sqlText string) (resultSet, er
 	if !ok {
 		return resultSet{}, c.server.unsupportedError(sqlText)
 	}
-	if err := c.refreshInformationSchema(ctx); err != nil {
-		return resultSet{}, err
-	}
-	exists, err := c.tableExists(ctx, tableName)
+	exists, err := c.refreshInformationSchemaTable(ctx, tableName)
 	if err != nil {
 		return resultSet{}, err
 	}
