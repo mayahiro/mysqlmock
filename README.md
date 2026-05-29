@@ -267,8 +267,9 @@ automatic rowid assignment for a single `INTEGER PRIMARY KEY`, so inserts must
 provide that key value explicitly.
 MySQL-visible index names remain table-scoped; mysqlmock maps them to private
 SQLite index names internally to avoid SQLite's schema-wide index namespace.
-Common scalar functions used by ORM queries include `IFNULL`, `COALESCE`,
-`CONCAT`, `CAST`, `DATE_FORMAT`, `JSON_EXTRACT`, and `JSON_UNQUOTE`.
+Common scalar functions and operators used by ORM queries include `IFNULL`,
+`COALESCE`, `CONCAT`, `CAST`, `DATE_FORMAT`, `JSON_EXTRACT`, `JSON_UNQUOTE`,
+`RAND`, `FIND_IN_SET`, `FIELD`, and `REGEXP`.
 
 The SQLite fallback also handles common MySQL repository-test syntax such as
 `INSERT ... ON DUPLICATE KEY UPDATE` with `VALUES(column)`, ActiveRecord-style
@@ -346,6 +347,10 @@ See [examples/active_record_smoke](examples/active_record_smoke).
   type yet.
 - `SET NAMES` records connection character set variables but does not transcode
   query or result data.
+- `REGEXP` compatibility is backed by Go regular expressions and does not
+  exactly match every MySQL regular expression edge case.
+- `RAND(seed)` is deterministic for equal seeds but does not reproduce MySQL's
+  full per-statement random sequence behavior.
 - TLS, compression, `multiStatements=true`, and `LOAD DATA LOCAL INFILE` are
   not supported.
 - MySQL-specific SQL compatibility is intentionally small and should be expanded

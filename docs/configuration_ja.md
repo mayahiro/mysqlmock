@@ -238,6 +238,9 @@ fallback:
 `fallback.unsupported` は、rules、built-in compatibility handlers、SQLite fallback のいずれでも扱えなかった query に返す MySQL error を制御します
 
 SQLite fallback は Repository test 向けの限定的な互換性として、`VALUES(column)`、ActiveRecord-style row alias、insert-side `DEFAULT` values を含む `INSERT ... ON DUPLICATE KEY UPDATE`、`INSERT IGNORE`、`REPLACE INTO` を扱います
+ORM や repository query でよく使う scalar function/operator として `RAND`、`FIND_IN_SET`、`FIELD`、`REGEXP` operator も登録します
+`REGEXP` は Go regular expression を使うため、MySQL regular expression dialect との完全一致は保証しません
+`RAND(seed)` は同じ seed に対して deterministic ですが、MySQL の per-statement random sequence behavior までは再現しません
 
 MySQL-compatible DDL で index を作成した場合、mysqlmock は軽量な index metadata も保持し、ORM schema introspection が使う `SHOW KEYS` の prefix length、expression、visibility fields を返します
 

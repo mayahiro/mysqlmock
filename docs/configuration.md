@@ -258,7 +258,12 @@ compatibility handlers, or SQLite fallback.
 SQLite fallback includes focused repository-test compatibility for
 `INSERT ... ON DUPLICATE KEY UPDATE` with `VALUES(column)`, ActiveRecord-style
 row aliases, and insert-side `DEFAULT` values, `INSERT IGNORE`, and
-`REPLACE INTO`.
+`REPLACE INTO`. It also registers MySQL-compatible scalar functions for common
+ORM and repository queries, including `RAND`, `FIND_IN_SET`, `FIELD`, and the
+`REGEXP` operator. `REGEXP` uses Go regular expressions, so exact MySQL regular
+expression dialect compatibility is not guaranteed. `RAND(seed)` is
+deterministic for equal seeds but does not reproduce MySQL's full per-statement
+random sequence behavior.
 
 For MySQL-compatible DDL that creates indexes, mysqlmock also keeps lightweight
 index metadata so `SHOW KEYS` can expose prefix length, expression, and

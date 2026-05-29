@@ -225,7 +225,7 @@ Write validation は、duplicate key、foreign key、NOT NULL、CHECK constraint
 Schema と query fallback は、`TRUE`、`FALSE`、`NOW()`、`CURRENT_TIMESTAMP()`、`AUTO_INCREMENT`、TiDB `AUTO_RANDOM`、よく使われる MySQL/TiDB DDL option、table-level `PRIMARY KEY` / `UNIQUE KEY` / `KEY` 定義、単純な MySQL index DDL、よく使う `ALTER TABLE` / `RENAME TABLE` variants を、可能な範囲で SQLite-compatible SQL に変換します
 `AUTO_INCREMENT` column が複合 primary key に含まれる場合、mysqlmock は複合 key を維持して `AUTO_INCREMENT` を削除します。SQLite の自動 rowid 採番は単一の `INTEGER PRIMARY KEY` でのみ使えるため、この key value は insert 時に明示する必要があります
 MySQL-visible index name は table scoped のまま扱い、SQLite 内部では private index name に変換することで SQLite の schema-wide index namespace との衝突を避けます
-ORM query でよく使う scalar function として `IFNULL`、`COALESCE`、`CONCAT`、`CAST`、`DATE_FORMAT`、`JSON_EXTRACT`、`JSON_UNQUOTE` を扱います
+ORM query でよく使う scalar function/operator として `IFNULL`、`COALESCE`、`CONCAT`、`CAST`、`DATE_FORMAT`、`JSON_EXTRACT`、`JSON_UNQUOTE`、`RAND`、`FIND_IN_SET`、`FIELD`、`REGEXP` を扱います
 
 SQLite fallback は、`VALUES(column)`、ActiveRecord-style row alias、insert-side `DEFAULT` values を含む一般的な `INSERT ... ON DUPLICATE KEY UPDATE`、`INSERT IGNORE`、`REPLACE INTO` と、`NOWAIT` / `SKIP LOCKED` を含む `FOR UPDATE` locking clause の strip も扱います
 mysqlmock は本物の MySQL row lock は再現しません
@@ -291,6 +291,8 @@ Ruby dependencies が利用できる環境では、この hook で Rails / Activ
 
 - Prepared statement support は、すべての MySQL binary protocol type の網羅を目標にしていません
 - `SET NAMES` は connection character set variable を記録しますが、query data や result data の transcoding は行いません
+- `REGEXP` compatibility は Go regular expression を使うため、MySQL regular expression の edge case までは完全一致しません
+- `RAND(seed)` は同じ seed に対して deterministic ですが、MySQL の per-statement random sequence behavior までは再現しません
 - TLS、compression、`multiStatements=true`、`LOAD DATA LOCAL INFILE` は未対応です
 - MySQL-specific SQL compatibility は意図的に小さく保っており、実際の unsupported-query report から拡張する前提です
 
