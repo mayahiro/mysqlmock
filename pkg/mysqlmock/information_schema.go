@@ -676,7 +676,7 @@ func (c *mysqlConn) insertInformationSchemaColumns(ctx context.Context, tableNam
 
 		var defaultArg any
 		if defaultValue.Valid {
-			defaultArg = defaultValue.String
+			defaultArg = mysqlColumnDefaultMetadataValue(defaultValue.String)
 		}
 		_, err := c.sqliteConn.ExecContext(ctx, `
 INSERT INTO "information_schema"."columns"
@@ -694,6 +694,36 @@ VALUES
 		return fmt.Errorf("list sqlite columns for information_schema.%s: %w", tableName, err)
 	}
 	return nil
+}
+
+func mysqlColumnDefaultMetadataValue(defaultSQL string) any {
+	value := strings.TrimSpace(defaultSQL)
+	if strings.EqualFold(value, "NULL") {
+		return nil
+	}
+	if unquoted, ok := unquoteSQLStringLiteral(value); ok {
+		return unquoted
+	}
+	return value
+}
+
+func unquoteSQLStringLiteral(value string) (string, bool) {
+	value = strings.TrimSpace(value)
+	if len(value) < 2 {
+		return "", false
+	}
+	quote := value[0]
+	if value[len(value)-1] != quote {
+		return "", false
+	}
+	switch quote {
+	case '\'':
+		return strings.ReplaceAll(value[1:len(value)-1], "''", "'"), true
+	case '"':
+		return strings.ReplaceAll(value[1:len(value)-1], `""`, `"`), true
+	default:
+		return "", false
+	}
 }
 
 func informationSchemaColumnTypes(declaredType string) (dataType, columnType string) {

@@ -2750,6 +2750,8 @@ func TestActiveRecordStyleMySQLCompatibility(t *testing.T) {
 		  id INTEGER PRIMARY KEY AUTO_INCREMENT,
 		  email VARCHAR(255) NOT NULL UNIQUE,
 		  name VARCHAR(255) NOT NULL DEFAULT 'anonymous',
+		  nickname VARCHAR(255) NOT NULL DEFAULT '',
+		  login_count INT NOT NULL DEFAULT '999',
 		  active TINYINT(1) NOT NULL DEFAULT 1,
 		  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
@@ -2867,8 +2869,14 @@ func TestActiveRecordStyleMySQLCompatibility(t *testing.T) {
 	if fieldByName["email"].key != "UNI" || fieldByName["email"].null != "NO" {
 		t.Fatalf("email field metadata = %#v, want unique not-null", fieldByName["email"])
 	}
-	if fieldByName["name"].key != "MUL" || !fieldByName["name"].def.Valid || fieldByName["name"].def.String != "'anonymous'" {
+	if fieldByName["name"].key != "MUL" || !fieldByName["name"].def.Valid || fieldByName["name"].def.String != "anonymous" {
 		t.Fatalf("name field metadata = %#v, want indexed default", fieldByName["name"])
+	}
+	if !fieldByName["nickname"].def.Valid || fieldByName["nickname"].def.String != "" {
+		t.Fatalf("nickname field metadata = %#v, want empty string default", fieldByName["nickname"])
+	}
+	if !fieldByName["login_count"].def.Valid || fieldByName["login_count"].def.String != "999" {
+		t.Fatalf("login_count field metadata = %#v, want quoted numeric default normalized", fieldByName["login_count"])
 	}
 
 	var likeField string
