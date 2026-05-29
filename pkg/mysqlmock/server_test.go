@@ -246,6 +246,7 @@ func TestMySQLStringLiteralLikeAndQualifiedUpdateCompatibility(t *testing.T) {
 CREATE TABLE search_items (
   id INTEGER PRIMARY KEY AUTO_INCREMENT,
   name TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 0,
   payload TEXT NULL
 );`}
 	server := mysqlmock.Start(t, mysqlmock.WithConfig(cfg))
@@ -298,12 +299,40 @@ CREATE TABLE search_items (
 	if _, err := db.ExecContext(ctx, `UPDATE search_items SET search_items.name = 'Updated' WHERE search_items.id = 1`); err != nil {
 		t.Fatalf("table-qualified UPDATE SET target: %v", err)
 	}
+	if _, err := db.ExecContext(ctx, `UPDATE search_items SET search_items.enabled = 1 WHERE search_items.id = 2`); err != nil {
+		t.Fatalf("table-qualified UPDATE integer SET target: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE search_items SET search_items.enabled = TRUE WHERE search_items.id = 3`); err != nil {
+		t.Fatalf("table-qualified UPDATE TRUE SET target: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE search_items SET search_items.enabled = FALSE WHERE search_items.id = 1`); err != nil {
+		t.Fatalf("table-qualified UPDATE FALSE SET target: %v", err)
+	}
 	var name string
 	if err := db.QueryRowContext(ctx, "SELECT name FROM search_items WHERE id = 1").Scan(&name); err != nil {
 		t.Fatalf("select updated row: %v", err)
 	}
 	if name != "Updated" {
 		t.Fatalf("updated name = %q, want Updated", name)
+	}
+	var enabled int
+	if err := db.QueryRowContext(ctx, "SELECT enabled FROM search_items WHERE id = 2").Scan(&enabled); err != nil {
+		t.Fatalf("select integer-updated row: %v", err)
+	}
+	if enabled != 1 {
+		t.Fatalf("integer-updated enabled = %d, want 1", enabled)
+	}
+	if err := db.QueryRowContext(ctx, "SELECT enabled FROM search_items WHERE id = 3").Scan(&enabled); err != nil {
+		t.Fatalf("select TRUE-updated row: %v", err)
+	}
+	if enabled != 1 {
+		t.Fatalf("TRUE-updated enabled = %d, want 1", enabled)
+	}
+	if err := db.QueryRowContext(ctx, "SELECT enabled FROM search_items WHERE id = 1").Scan(&enabled); err != nil {
+		t.Fatalf("select FALSE-updated row: %v", err)
+	}
+	if enabled != 0 {
+		t.Fatalf("FALSE-updated enabled = %d, want 0", enabled)
 	}
 }
 

@@ -67,7 +67,12 @@ func translateMySQLUpdateSetTargets(sqlText string) string {
 	if !changed {
 		return sqlText
 	}
-	return sqlText[:setStart] + " " + strings.Join(assignments, ", ") + sqlText[setEnd:]
+	setClause := strings.TrimSpace(strings.Join(assignments, ", "))
+	suffix := sqlText[setEnd:]
+	if suffix != "" && setClause != "" && !isSQLSpace(suffix[0]) {
+		suffix = " " + suffix
+	}
+	return sqlText[:setStart] + " " + setClause + suffix
 }
 
 func isMySQLUpdateSetTerminator(word string) bool {
