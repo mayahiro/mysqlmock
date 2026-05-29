@@ -85,6 +85,37 @@ CREATE TABLE target_users (
 	assertInformationSchemaColumnNames(t, ctx, conn, "target_users", []string{"id", "cached_out"})
 }
 
+func TestRefreshInformationSchemaFullSkipsUntilSchemaVersionChanges(t *testing.T) {
+	ctx := context.Background()
+	conn := newInformationSchemaTestConn(t, ctx)
+
+	if _, err := conn.sqliteConn.ExecContext(ctx, `
+CREATE TABLE target_users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT
+);`); err != nil {
+		t.Fatalf("create test table: %v", err)
+	}
+
+	if err := conn.refreshInformationSchema(ctx); err != nil {
+		t.Fatalf("refresh full information_schema: %v", err)
+	}
+	assertInformationSchemaColumnNames(t, ctx, conn, "target_users", []string{"id"})
+
+	if _, err := conn.sqliteConn.ExecContext(ctx, `ALTER TABLE target_users ADD COLUMN cached_out TEXT`); err != nil {
+		t.Fatalf("alter test table without version bump: %v", err)
+	}
+	if err := conn.refreshInformationSchema(ctx); err != nil {
+		t.Fatalf("refresh cached full information_schema: %v", err)
+	}
+	assertInformationSchemaColumnNames(t, ctx, conn, "target_users", []string{"id"})
+
+	conn.server.bumpSchemaVersion()
+	if err := conn.refreshInformationSchema(ctx); err != nil {
+		t.Fatalf("refresh invalidated full information_schema: %v", err)
+	}
+	assertInformationSchemaColumnNames(t, ctx, conn, "target_users", []string{"id", "cached_out"})
+}
+
 func TestExecSQLiteSchemaChangeInvalidatesInformationSchemaCache(t *testing.T) {
 	ctx := context.Background()
 	conn := newInformationSchemaTestConn(t, ctx)

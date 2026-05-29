@@ -7,13 +7,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"io"
-	"math"
 	"net"
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 )
 
 const (
@@ -24,6 +21,7 @@ const (
 	clientTransactions     uint32 = 0x00002000
 	clientSecureConnection uint32 = 0x00008000
 	clientPluginAuth       uint32 = 0x00080000
+	clientDeprecateEOF     uint32 = 0x01000000
 
 	serverStatusInTrans    uint16 = 0x0001
 	serverStatusAutocommit uint16 = 0x0002
@@ -101,9 +99,7 @@ type mysqlConn struct {
 	nextStatementID uint32
 	statements      map[uint32]*preparedStatement
 
-	informationSchemaFullLoaded  bool
-	informationSchemaFullVersion uint64
-	informationSchemaTableCache  map[string]informationSchemaTableCacheEntry
+	informationSchemaCache informationSchemaCache
 }
 
 type resultColumn struct {
@@ -253,13 +249,7 @@ func (c *mysqlConn) readHandshakeResponse(payload []byte) error {
 
 func (c *mysqlConn) writeHandshake() error {
 	authData := []byte("12345678abcdefghijkl")
-	caps := clientLongPassword |
-		clientLongFlag |
-		clientConnectWithDB |
-		clientProtocol41 |
-		clientTransactions |
-		clientSecureConnection |
-		clientPluginAuth
+	caps := serverCapabilityFlags()
 
 	payload := make([]byte, 0, 128)
 	payload = append(payload, 0x0a)
@@ -279,6 +269,17 @@ func (c *mysqlConn) writeHandshake() error {
 	payload = append(payload, "mysql_native_password"...)
 	payload = append(payload, 0x00)
 	return c.writePacket(0, payload)
+}
+
+func serverCapabilityFlags() uint32 {
+	return clientLongPassword |
+		clientLongFlag |
+		clientConnectWithDB |
+		clientProtocol41 |
+		clientTransactions |
+		clientSecureConnection |
+		clientPluginAuth |
+		clientDeprecateEOF
 }
 
 func (c *mysqlConn) handleQuery(ctx context.Context, sqlText string) error {
@@ -304,6 +305,9 @@ func (c *mysqlConn) handleQuery(ctx context.Context, sqlText string) error {
 	case resultSet:
 		c.recordResult(v)
 		return c.writeResultSet(1, v)
+	case *sqliteResultSet:
+		c.recordResult(v)
+		return c.writeSQLiteTextResultSet(1, v)
 	default:
 		return c.writeErr(1, errPacket(mysqlErrUnknown, "HY000", "Unsupported query response"))
 	}
@@ -428,7 +432,7 @@ func (c *mysqlConn) executeQuery(ctx context.Context, command, sqlText string, a
 
 	if isReadQuery(upper) {
 		c.logQuery(command, "sqlite", sqlText, normalized)
-		return c.querySQLite(ctx, c.server.translateSQLCached(trimmed), args...)
+		return c.querySQLiteText(ctx, c.server.translateSQLCached(trimmed), command == "COM_QUERY", args...)
 	}
 	if isWriteQuery(upper) {
 		c.logQuery(command, "sqlite", sqlText, normalized)
@@ -786,175 +790,9 @@ func (c *mysqlConn) recordResult(resp any) {
 		}
 	case resultSet:
 		c.lastAffectedRows = -1
+	case *sqliteResultSet:
+		c.lastAffectedRows = -1
 	}
-}
-
-func (c *mysqlConn) querySQLite(ctx context.Context, query string, args ...any) (resultSet, error) {
-	rows, err := c.sqliteConn.QueryContext(ctx, query, args...)
-	if err != nil {
-		return resultSet{}, err
-	}
-	defer rows.Close()
-
-	names, err := rows.Columns()
-	if err != nil {
-		return resultSet{}, err
-	}
-	columnTypes, _ := rows.ColumnTypes()
-	columns := make([]resultColumn, len(names))
-	zeroFillWidths := c.resultZeroFillWidths(query, names)
-	for i, name := range names {
-		columns[i] = resultColumn{Name: name, Type: fieldTypeVarString}
-		if i < len(columnTypes) {
-			columns[i].Type = mysqlFieldType(columnTypes[i])
-			columns[i].ZeroFillWidth = mysqlZeroFillWidth(columnTypes[i].DatabaseTypeName())
-		}
-		if i < len(zeroFillWidths) && zeroFillWidths[i] > columns[i].ZeroFillWidth {
-			columns[i].ZeroFillWidth = zeroFillWidths[i]
-		}
-		if columns[i].ZeroFillWidth > 0 {
-			columns[i].Type = fieldTypeVarString
-		}
-	}
-
-	resultRows := make([][]any, 0)
-	for rows.Next() {
-		values := make([]any, len(names))
-		scan := make([]any, len(names))
-		for i := range values {
-			scan[i] = &values[i]
-		}
-		if err := rows.Scan(scan...); err != nil {
-			return resultSet{}, err
-		}
-		for i, value := range values {
-			if columns[i].ZeroFillWidth > 0 {
-				if value != nil {
-					values[i] = textValueForColumn(value, columns[i])
-				}
-				continue
-			}
-			if columns[i].Type == fieldTypeVarString {
-				columns[i].Type = fieldTypeFromValue(value)
-			}
-		}
-		resultRows = append(resultRows, values)
-	}
-	if err := rows.Err(); err != nil {
-		return resultSet{}, err
-	}
-	return resultSet{Columns: columns, Rows: resultRows}, nil
-}
-
-func (c *mysqlConn) writeResultSet(seq byte, rs resultSet) error {
-	if err := c.writePacket(seq, appendLenEncInt(nil, uint64(len(rs.Columns)))); err != nil {
-		return err
-	}
-	seq++
-	for _, col := range rs.Columns {
-		if err := c.writePacket(seq, columnDefinition(c.currentDB, col)); err != nil {
-			return err
-		}
-		seq++
-	}
-	if err := c.writeEOF(seq); err != nil {
-		return err
-	}
-	seq++
-	for _, row := range rs.Rows {
-		if err := c.writePacket(seq, textRow(rs.Columns, row)); err != nil {
-			return err
-		}
-		seq++
-	}
-	return c.writeEOF(seq)
-}
-
-func (c *mysqlConn) writeBinaryResultSet(seq byte, rs resultSet) error {
-	rows := make([][]byte, len(rs.Rows))
-	for i, row := range rs.Rows {
-		payload, err := binaryRow(rs.Columns, row)
-		if err != nil {
-			return err
-		}
-		rows[i] = payload
-	}
-
-	if err := c.writePacket(seq, appendLenEncInt(nil, uint64(len(rs.Columns)))); err != nil {
-		return err
-	}
-	seq++
-	for _, col := range rs.Columns {
-		if err := c.writePacket(seq, columnDefinition(c.currentDB, col)); err != nil {
-			return err
-		}
-		seq++
-	}
-	if err := c.writeEOF(seq); err != nil {
-		return err
-	}
-	seq++
-	for _, payload := range rows {
-		if err := c.writePacket(seq, payload); err != nil {
-			return err
-		}
-		seq++
-	}
-	return c.writeEOF(seq)
-}
-
-func (c *mysqlConn) writeOK(seq byte, ok okResult) error {
-	payload := []byte{0x00}
-	payload = appendLenEncInt(payload, ok.AffectedRows)
-	payload = appendLenEncInt(payload, ok.LastInsertID)
-	payload = appendUint16(payload, c.statusFlags)
-	payload = appendUint16(payload, ok.Warnings)
-	return c.writePacket(seq, payload)
-}
-
-func (c *mysqlConn) writeEOF(seq byte) error {
-	payload := []byte{0xfe}
-	payload = appendUint16(payload, 0)
-	payload = appendUint16(payload, c.statusFlags)
-	return c.writePacket(seq, payload)
-}
-
-func (c *mysqlConn) writeErr(seq byte, err *mysqlError) error {
-	payload := []byte{0xff}
-	payload = appendUint16(payload, err.Code)
-	payload = append(payload, '#')
-	payload = append(payload, fixedSQLState(err.SQLState)...)
-	payload = append(payload, err.Message...)
-	return c.writePacket(seq, payload)
-}
-
-func (c *mysqlConn) readPacket() ([]byte, byte, error) {
-	header := make([]byte, 4)
-	if _, err := io.ReadFull(c.netConn, header); err != nil {
-		return nil, 0, err
-	}
-	length := int(header[0]) | int(header[1])<<8 | int(header[2])<<16
-	seq := header[3]
-	if length == 0 {
-		return nil, seq, nil
-	}
-	payload := make([]byte, length)
-	if _, err := io.ReadFull(c.netConn, payload); err != nil {
-		return nil, seq, err
-	}
-	return payload, seq, nil
-}
-
-func (c *mysqlConn) writePacket(seq byte, payload []byte) error {
-	if len(payload) >= 1<<24 {
-		return errors.New("mysqlmock does not support packets larger than 16MB")
-	}
-	header := []byte{byte(len(payload)), byte(len(payload) >> 8), byte(len(payload) >> 16), seq}
-	if _, err := c.netConn.Write(header); err != nil {
-		return err
-	}
-	_, err := c.netConn.Write(payload)
-	return err
 }
 
 func (c *mysqlConn) currentUser() string {
@@ -970,131 +808,6 @@ func oneRow(name string, value any) resultSet {
 		Columns: []resultColumn{{Name: name, Type: fieldTypeVarString}},
 		Rows:    [][]any{{value}},
 	}
-}
-
-func columnDefinition(schema string, col resultColumn) []byte {
-	payload := make([]byte, 0, 64)
-	payload = appendLenEncString(payload, "def")
-	payload = appendLenEncString(payload, schema)
-	payload = appendLenEncString(payload, "")
-	payload = appendLenEncString(payload, "")
-	payload = appendLenEncString(payload, col.Name)
-	payload = appendLenEncString(payload, col.Name)
-	payload = append(payload, 0x0c)
-	charset := uint16(45)
-	if col.Type != fieldTypeVarString && col.Type != fieldTypeBlob {
-		charset = 63
-	}
-	payload = appendUint16(payload, charset)
-	payload = appendUint32(payload, 1024)
-	payload = append(payload, col.Type)
-	payload = appendUint16(payload, 0)
-	payload = append(payload, 0)
-	payload = append(payload, 0x00, 0x00)
-	return payload
-}
-
-func textRow(columns []resultColumn, values []any) []byte {
-	payload := make([]byte, 0, len(values)*8)
-	for i, value := range values {
-		if value == nil {
-			payload = append(payload, 0xfb)
-			continue
-		}
-		var column resultColumn
-		if i < len(columns) {
-			column = columns[i]
-		}
-		payload = appendLenEncString(payload, textValueForColumn(value, column))
-	}
-	return payload
-}
-
-func textValueForColumn(value any, column resultColumn) string {
-	if column.ZeroFillWidth <= 0 {
-		return textValue(value)
-	}
-	text := textValue(value)
-	if len(text) >= column.ZeroFillWidth || strings.HasPrefix(text, "-") {
-		return text
-	}
-	for i := 0; i < len(text); i++ {
-		if text[i] < '0' || text[i] > '9' {
-			return text
-		}
-	}
-	return strings.Repeat("0", column.ZeroFillWidth-len(text)) + text
-}
-
-func textValue(value any) string {
-	switch v := value.(type) {
-	case nil:
-		return ""
-	case []byte:
-		return string(v)
-	case time.Time:
-		return v.Format("2006-01-02 15:04:05.999999")
-	case bool:
-		if v {
-			return "1"
-		}
-		return "0"
-	default:
-		return fmt.Sprint(v)
-	}
-}
-
-func mysqlFieldType(ct *sql.ColumnType) byte {
-	dbType := strings.ToUpper(ct.DatabaseTypeName())
-	switch {
-	case strings.Contains(dbType, "INT"):
-		return fieldTypeLongLong
-	case dbType == "REAL" || dbType == "DOUBLE" || dbType == "FLOAT":
-		return fieldTypeDouble
-	case dbType == "NUMERIC" || dbType == "DECIMAL":
-		return fieldTypeDecimal
-	case strings.Contains(dbType, "BLOB"):
-		return fieldTypeBlob
-	case strings.Contains(dbType, "DATE") || strings.Contains(dbType, "TIME"):
-		return fieldTypeDateTime
-	default:
-		return fieldTypeVarString
-	}
-}
-
-func fieldTypeFromValue(value any) byte {
-	switch value.(type) {
-	case int, int8, int16, int32, int64, uint, uint8, uint16, uint32, uint64:
-		return fieldTypeLongLong
-	case float32, float64:
-		return fieldTypeDouble
-	case []byte:
-		return fieldTypeBlob
-	case time.Time:
-		return fieldTypeDateTime
-	default:
-		return fieldTypeVarString
-	}
-}
-
-func mysqlZeroFillWidth(databaseTypeName string) int {
-	upper := strings.ToUpper(strings.TrimSpace(databaseTypeName))
-	if !strings.Contains(upper, "ZEROFILL") {
-		return 0
-	}
-	open := strings.IndexByte(upper, '(')
-	if open < 0 {
-		return 0
-	}
-	close := strings.IndexByte(upper[open+1:], ')')
-	if close < 0 {
-		return 0
-	}
-	width, err := parseInt64String(upper[open+1 : open+1+close])
-	if err != nil || width <= 0 {
-		return 0
-	}
-	return int(width)
 }
 
 func (c *mysqlConn) resultZeroFillWidths(query string, names []string) []int {
@@ -1194,42 +907,6 @@ func selectItemColumnName(item string) (string, bool) {
 	return "", false
 }
 
-func findTopLevelSQLKeyword(sqlText string, pos int, keyword string) (int, bool) {
-	depth := 0
-	for i := pos; i < len(sqlText); {
-		if end, ok := quotedSQLSpan(sqlText, i); ok {
-			i = end
-			continue
-		}
-		if end, ok := sqlCommentSpan(sqlText, i); ok {
-			i = end
-			continue
-		}
-		switch sqlText[i] {
-		case '(':
-			depth++
-			i++
-			continue
-		case ')':
-			if depth > 0 {
-				depth--
-			}
-			i++
-			continue
-		}
-		word, end, ok := readSQLIdentifier(sqlText, i)
-		if !ok {
-			i++
-			continue
-		}
-		if depth == 0 && strings.EqualFold(word, keyword) {
-			return i, true
-		}
-		i = end
-	}
-	return 0, false
-}
-
 func hasAdditionalTopLevelSelectSource(sqlText string) bool {
 	depth := 0
 	for i := 0; i < len(sqlText); {
@@ -1277,88 +954,6 @@ func hasAdditionalTopLevelSelectSource(sqlText string) bool {
 	return false
 }
 
-func appendUint16(buf []byte, n uint16) []byte {
-	return append(buf, byte(n), byte(n>>8))
-}
-
-func appendUint32(buf []byte, n uint32) []byte {
-	return append(buf, byte(n), byte(n>>8), byte(n>>16), byte(n>>24))
-}
-
-func appendLenEncInt(buf []byte, n uint64) []byte {
-	switch {
-	case n < 251:
-		return append(buf, byte(n))
-	case n <= math.MaxUint16:
-		buf = append(buf, 0xfc)
-		return appendUint16(buf, uint16(n))
-	case n <= 0x00ffffff:
-		return append(buf, 0xfd, byte(n), byte(n>>8), byte(n>>16))
-	default:
-		buf = append(buf, 0xfe)
-		for i := 0; i < 8; i++ {
-			buf = append(buf, byte(n>>(8*i)))
-		}
-		return buf
-	}
-}
-
-func appendLenEncString(buf []byte, s string) []byte {
-	buf = appendLenEncInt(buf, uint64(len(s)))
-	return append(buf, s...)
-}
-
-func fixedSQLState(state string) string {
-	if len(state) == 5 {
-		return state
-	}
-	if state == "" {
-		return "HY000"
-	}
-	if len(state) > 5 {
-		return state[:5]
-	}
-	return state + strings.Repeat("0", 5-len(state))
-}
-
-func errPacket(code uint16, state, message string) *mysqlError {
-	return &mysqlError{Code: code, SQLState: fixedSQLState(state), Message: message}
-}
-
-func mapSQLiteError(sqlText string, err error) *mysqlError {
-	msg := err.Error()
-	lower := strings.ToLower(msg)
-	switch {
-	case strings.Contains(lower, "unique constraint"):
-		return errPacket(mysqlErrDupEntry, "23000", "Duplicate entry")
-	case strings.Contains(lower, "not null constraint"):
-		return errPacket(mysqlErrBadNull, "23000", "Column cannot be null")
-	case strings.Contains(lower, "foreign key constraint"):
-		return errPacket(mysqlErrNoReferenced, "23000", "Cannot add or update child row")
-	case strings.Contains(lower, "constraint failed"):
-		return errPacket(mysqlErrCheck, "HY000", "Check constraint failed")
-	case strings.Contains(lower, "datatype mismatch"):
-		return errPacket(mysqlErrWrongValueForField, "HY000", msg)
-	case strings.Contains(lower, "no such table"):
-		return errPacket(mysqlErrNoSuchTable, "42S02", msg)
-	case strings.Contains(lower, "syntax error"):
-		return errPacket(mysqlErrUnknown, "HY000", "Unsupported query: "+sqlText)
-	default:
-		return errPacket(mysqlErrUnknown, "HY000", msg)
-	}
-}
-
-func (c *mysqlConn) mapSQLiteError(sqlText string, err error) *mysqlError {
-	if c.server.cfg.Compat.WriteValidation == "off" {
-		return errPacket(mysqlErrUnknown, "HY000", err.Error())
-	}
-	return mapSQLiteError(sqlText, err)
-}
-
-func isSQLiteSyntaxError(err error) bool {
-	return strings.Contains(strings.ToLower(err.Error()), "syntax error")
-}
-
 func isReadQuery(upper string) bool {
 	return strings.HasPrefix(upper, "SELECT ") ||
 		upper == "SELECT" ||
@@ -1397,24 +992,6 @@ func isSchemaChangingQuery(sqlText string) bool {
 		strings.HasPrefix(upper, "DROP TABLE ") ||
 		strings.HasPrefix(upper, "DROP VIEW ") ||
 		strings.HasPrefix(upper, "DROP INDEX ")
-}
-
-func normalizeSQL(sqlText string) string {
-	trimmed := strings.TrimSpace(sqlText)
-	trimmed = strings.TrimSuffix(trimmed, ";")
-	return strings.Join(strings.Fields(trimmed), " ")
-}
-
-func unquoteSQLWord(value string) string {
-	value = strings.TrimSpace(value)
-	value = strings.TrimSuffix(value, ";")
-	if len(value) >= 2 {
-		quote := value[0]
-		if (quote == '\'' || quote == '"' || quote == '`') && value[len(value)-1] == quote {
-			return value[1 : len(value)-1]
-		}
-	}
-	return value
 }
 
 func translateSQL(sqlText string) string {
@@ -1840,177 +1417,6 @@ func consumeOptionalNumericCall(sqlText string, pos int) int {
 		return -1
 	}
 	return i + 1
-}
-
-func consumeKeyword(sqlText string, pos *int, keyword string) bool {
-	word, next, ok := readSQLIdentifier(sqlText, skipSQLSpaces(sqlText, *pos))
-	if !ok || !strings.EqualFold(word, keyword) {
-		return false
-	}
-	*pos = next
-	return true
-}
-
-func readSQLNameToken(sqlText string, pos int) (string, int, bool) {
-	pos = skipSQLSpaces(sqlText, pos)
-	if pos >= len(sqlText) {
-		return "", pos, false
-	}
-	if sqlText[pos] == '`' || sqlText[pos] == '"' {
-		end, ok := quotedSQLSpan(sqlText, pos)
-		if !ok {
-			return "", pos, false
-		}
-		return sqlText[pos:end], end, true
-	}
-	if _, end, ok := readSQLIdentifier(sqlText, pos); ok {
-		return sqlText[pos:end], end, true
-	}
-	return "", pos, false
-}
-
-func parenthesizedSQLSpan(sqlText string, pos int) (int, bool) {
-	if pos >= len(sqlText) || sqlText[pos] != '(' {
-		return pos, false
-	}
-	depth := 0
-	for i := pos; i < len(sqlText); {
-		if copyEnd, ok := quotedSQLSpan(sqlText, i); ok {
-			i = copyEnd
-			continue
-		}
-		if copyEnd, ok := sqlCommentSpan(sqlText, i); ok {
-			i = copyEnd
-			continue
-		}
-		switch sqlText[i] {
-		case '(':
-			depth++
-		case ')':
-			depth--
-			if depth == 0 {
-				return i + 1, true
-			}
-		}
-		i++
-	}
-	return len(sqlText), false
-}
-
-func readSQLIdentifier(sqlText string, pos int) (string, int, bool) {
-	if pos >= len(sqlText) || !isSQLIdentifierStart(sqlText[pos]) {
-		return "", pos, false
-	}
-	start := pos
-	pos++
-	for pos < len(sqlText) && isSQLIdentifierPart(sqlText[pos]) {
-		pos++
-	}
-	return sqlText[start:pos], pos, true
-}
-
-func skipSQLSpaces(sqlText string, pos int) int {
-	for pos < len(sqlText) && isSQLSpace(sqlText[pos]) {
-		pos++
-	}
-	return pos
-}
-
-func quotedSQLSpan(sqlText string, pos int) (int, bool) {
-	if pos >= len(sqlText) {
-		return pos, false
-	}
-	quote := sqlText[pos]
-	if quote != '\'' && quote != '"' && quote != '`' {
-		return pos, false
-	}
-	i := pos + 1
-	for i < len(sqlText) {
-		if sqlText[i] == '\\' && quote != '`' && i+1 < len(sqlText) {
-			i += 2
-			continue
-		}
-		if sqlText[i] == quote {
-			if quote != '`' && i+1 < len(sqlText) && sqlText[i+1] == quote {
-				i += 2
-				continue
-			}
-			return i + 1, true
-		}
-		i++
-	}
-	return len(sqlText), true
-}
-
-func sqlCommentSpan(sqlText string, pos int) (int, bool) {
-	if pos+1 < len(sqlText) && sqlText[pos] == '-' && sqlText[pos+1] == '-' {
-		i := pos + 2
-		for i < len(sqlText) && sqlText[i] != '\n' {
-			i++
-		}
-		if i < len(sqlText) {
-			i++
-		}
-		return i, true
-	}
-	if sqlText[pos] == '#' {
-		i := pos + 1
-		for i < len(sqlText) && sqlText[i] != '\n' {
-			i++
-		}
-		if i < len(sqlText) {
-			i++
-		}
-		return i, true
-	}
-	if pos+1 < len(sqlText) && sqlText[pos] == '/' && sqlText[pos+1] == '*' {
-		i := pos + 2
-		for i+1 < len(sqlText) && !(sqlText[i] == '*' && sqlText[i+1] == '/') {
-			i++
-		}
-		if i+1 < len(sqlText) {
-			i += 2
-		} else {
-			i = len(sqlText)
-		}
-		return i, true
-	}
-	return pos, false
-}
-
-func consumeEmptyCall(sqlText string, pos int) int {
-	i := pos
-	for i < len(sqlText) && isSQLSpace(sqlText[i]) {
-		i++
-	}
-	if i >= len(sqlText) || sqlText[i] != '(' {
-		return -1
-	}
-	i++
-	for i < len(sqlText) && isSQLSpace(sqlText[i]) {
-		i++
-	}
-	if i >= len(sqlText) || sqlText[i] != ')' {
-		return -1
-	}
-	return i + 1
-}
-
-func isSQLIdentifierStart(ch byte) bool {
-	return ch == '_' || ('A' <= ch && ch <= 'Z') || ('a' <= ch && ch <= 'z')
-}
-
-func isSQLIdentifierPart(ch byte) bool {
-	return isSQLIdentifierStart(ch) || ('0' <= ch && ch <= '9') || ch == '$'
-}
-
-func isSQLSpace(ch byte) bool {
-	switch ch {
-	case ' ', '\t', '\n', '\r', '\f':
-		return true
-	default:
-		return false
-	}
 }
 
 func (c *mysqlConn) logQuery(command, route, sqlText, normalizedSQL string) {

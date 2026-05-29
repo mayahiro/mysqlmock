@@ -7,11 +7,6 @@ import (
 	"strings"
 )
 
-type informationSchemaTableCacheEntry struct {
-	version uint64
-	exists  bool
-}
-
 func isInformationSchemaQuery(upperSQL string) bool {
 	unquoted := strings.NewReplacer("`", "", `"`, "").Replace(upperSQL)
 	return strings.Contains(unquoted, "INFORMATION_SCHEMA.")
@@ -33,7 +28,7 @@ func (c *mysqlConn) queryInformationSchema(ctx context.Context, sqlText string, 
 
 func (c *mysqlConn) refreshInformationSchema(ctx context.Context) error {
 	version := c.server.currentSchemaVersion()
-	if c.informationSchemaFullLoaded && c.informationSchemaFullVersion == version {
+	if c.informationSchemaCache.hasFullRefresh(version) {
 		return nil
 	}
 	if err := c.prepareInformationSchema(ctx); err != nil {
@@ -71,18 +66,16 @@ ORDER BY name`)
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("list sqlite tables for information_schema: %w", err)
 	}
-	c.informationSchemaFullLoaded = true
-	c.informationSchemaFullVersion = version
-	c.informationSchemaTableCache = map[string]informationSchemaTableCacheEntry{}
+	c.informationSchemaCache.markFullRefresh(version)
 	return nil
 }
 
 func (c *mysqlConn) refreshInformationSchemaTable(ctx context.Context, tableName string) (bool, error) {
 	version := c.server.currentSchemaVersion()
-	if entry, ok := c.informationSchemaTableCache[canonicalInformationSchemaTableCacheKey(tableName)]; ok && entry.version == version {
-		return entry.exists, nil
+	if exists, ok := c.informationSchemaCache.tableExists(tableName, version); ok {
+		return exists, nil
 	}
-	if c.informationSchemaFullLoaded && c.informationSchemaFullVersion == version {
+	if c.informationSchemaCache.hasFullRefresh(version) {
 		return c.informationSchemaCachedTableExists(ctx, tableName)
 	}
 	if err := c.prepareInformationSchema(ctx); err != nil {
@@ -105,7 +98,7 @@ WHERE type IN ('table', 'view')
   AND name NOT LIKE 'sqlite_%'`, tableName).Scan(&tableType, &createSQL)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			c.setInformationSchemaTableCache(tableName, version, false)
+			c.informationSchemaCache.markTable(tableName, version, false)
 			return false, nil
 		}
 		return false, fmt.Errorf("load sqlite table for information_schema.%s: %w", tableName, err)
@@ -113,7 +106,7 @@ WHERE type IN ('table', 'view')
 	if err := c.insertInformationSchemaTableMetadata(ctx, tableName, tableType, createSQL.String); err != nil {
 		return false, err
 	}
-	c.setInformationSchemaTableCache(tableName, version, true)
+	c.informationSchemaCache.markTable(tableName, version, true)
 	return true, nil
 }
 
@@ -158,16 +151,6 @@ func (c *mysqlConn) clearInformationSchemaTable(ctx context.Context, tableName s
 	return nil
 }
 
-func (c *mysqlConn) setInformationSchemaTableCache(tableName string, version uint64, exists bool) {
-	if c.informationSchemaTableCache == nil {
-		c.informationSchemaTableCache = map[string]informationSchemaTableCacheEntry{}
-	}
-	c.informationSchemaTableCache[canonicalInformationSchemaTableCacheKey(tableName)] = informationSchemaTableCacheEntry{
-		version: version,
-		exists:  exists,
-	}
-}
-
 func (c *mysqlConn) informationSchemaCachedTableExists(ctx context.Context, tableName string) (bool, error) {
 	var count int
 	err := c.sqliteConn.QueryRowContext(ctx, `
@@ -179,10 +162,6 @@ WHERE TABLE_SCHEMA = ?
 		return false, err
 	}
 	return count > 0, nil
-}
-
-func canonicalInformationSchemaTableCacheKey(tableName string) string {
-	return strings.ToLower(tableName)
 }
 
 func (c *mysqlConn) ensureInformationSchemaAttached(ctx context.Context) error {

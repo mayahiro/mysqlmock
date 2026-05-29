@@ -448,38 +448,6 @@ func sanitizeSQLName(value string) string {
 	return result
 }
 
-func splitSQLTopLevelList(sqlText string) []string {
-	items := []string{}
-	start := 0
-	depth := 0
-	for i := 0; i < len(sqlText); {
-		if end, ok := quotedSQLSpan(sqlText, i); ok {
-			i = end
-			continue
-		}
-		if end, ok := sqlCommentSpan(sqlText, i); ok {
-			i = end
-			continue
-		}
-		switch sqlText[i] {
-		case '(':
-			depth++
-		case ')':
-			if depth > 0 {
-				depth--
-			}
-		case ',':
-			if depth == 0 {
-				items = append(items, sqlText[start:i])
-				start = i + 1
-			}
-		}
-		i++
-	}
-	items = append(items, sqlText[start:])
-	return items
-}
-
 func expandTiDBDDLComments(sqlText string) string {
 	var out strings.Builder
 	out.Grow(len(sqlText))

@@ -62,7 +62,8 @@ func (c *mysqlConn) handleStmtPrepare(sqlText string) error {
 		seq++
 	}
 	if paramCount > 0 {
-		return c.writeEOF(seq)
+		_, err := c.writeColumnDefinitionTerminator(seq)
+		return err
 	}
 	return nil
 }

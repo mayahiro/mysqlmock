@@ -11,6 +11,18 @@ import (
 
 var errRuleDisconnect = errors.New("rule requested disconnect")
 
+type preparedRule struct {
+	config        RuleConfig
+	match         string
+	normalizedSQL string
+	regex         *regexp.Regexp
+}
+
+type ruleMatchCache struct {
+	normalizedSQL    string
+	normalizedSQLSet bool
+}
+
 type ruleResponseProfile struct {
 	Type     string
 	Code     uint16
@@ -81,15 +93,25 @@ func (s *Server) executeRule(ctx context.Context, sqlText string, args []any) (a
 }
 
 func (s *Server) matchRule(sqlText string, args []any) (RuleConfig, bool, error) {
-	for i, rule := range s.cfg.Rules {
-		matched, err := ruleMatches(rule.Request, sqlText, args)
+	rules := s.rules
+	if rules == nil && len(s.cfg.Rules) > 0 {
+		var err error
+		rules, err = prepareRules(s.cfg.Rules)
+		if err != nil {
+			return RuleConfig{}, false, err
+		}
+	}
+
+	var cache ruleMatchCache
+	for i, rule := range rules {
+		matched, err := rule.matches(sqlText, args, &cache)
 		if err != nil {
 			return RuleConfig{}, false, err
 		}
 		if !matched {
 			continue
 		}
-		if rule.Response.Once {
+		if rule.config.Response.Once {
 			s.mu.Lock()
 			if s.ruleOnceUsed == nil {
 				s.ruleOnceUsed = map[int]bool{}
@@ -101,7 +123,7 @@ func (s *Server) matchRule(sqlText string, args []any) (RuleConfig, bool, error)
 			s.ruleOnceUsed[i] = true
 			s.mu.Unlock()
 		}
-		return rule, true, nil
+		return rule.config, true, nil
 	}
 	return RuleConfig{}, false, nil
 }
@@ -135,21 +157,68 @@ func lookupRuleResponseProfile(name string) (ruleResponseProfile, bool) {
 }
 
 func ruleMatches(req RuleRequestConfig, sqlText string, args []any) (bool, error) {
+	rule, err := prepareRule(RuleConfig{Request: req})
+	if err != nil {
+		return false, err
+	}
+	var cache ruleMatchCache
+	return rule.matches(sqlText, args, &cache)
+}
+
+func prepareRules(rules []RuleConfig) ([]preparedRule, error) {
+	if len(rules) == 0 {
+		return nil, nil
+	}
+	prepared := make([]preparedRule, len(rules))
+	for i, rule := range rules {
+		compiled, err := prepareRule(rule)
+		if err != nil {
+			return nil, fmt.Errorf("rules[%d]: %w", i, err)
+		}
+		prepared[i] = compiled
+	}
+	return prepared, nil
+}
+
+func prepareRule(rule RuleConfig) (preparedRule, error) {
+	match := rule.Request.Match
+	if match == "" {
+		match = "exact"
+	}
+
+	prepared := preparedRule{
+		config: rule,
+		match:  match,
+	}
+	switch match {
+	case "exact", "contains", "any":
+	case "normalized":
+		prepared.normalizedSQL = normalizeSQL(rule.Request.SQL)
+	case "regex":
+		compiled, err := regexp.Compile(rule.Request.SQL)
+		if err != nil {
+			return preparedRule{}, fmt.Errorf("invalid request.sql regex: %w", err)
+		}
+		prepared.regex = compiled
+	default:
+		return preparedRule{}, fmt.Errorf("unsupported rule match: %s", rule.Request.Match)
+	}
+	return prepared, nil
+}
+
+func (r preparedRule) matches(sqlText string, args []any, cache *ruleMatchCache) (bool, error) {
+	req := r.config.Request
 	if !ruleParamsMatch(req.Params, args) {
 		return false, nil
 	}
 
-	match := req.Match
-	if match == "" {
-		match = "exact"
-	}
-	switch match {
+	switch r.match {
 	case "exact":
 		return sqlText == req.SQL, nil
 	case "normalized":
-		return strings.EqualFold(normalizeSQL(sqlText), normalizeSQL(req.SQL)), nil
+		return strings.EqualFold(cache.normalized(sqlText), r.normalizedSQL), nil
 	case "regex":
-		return regexp.MatchString(req.SQL, sqlText)
+		return r.regex.MatchString(sqlText), nil
 	case "contains":
 		return strings.Contains(sqlText, req.SQL), nil
 	case "any":
@@ -157,6 +226,14 @@ func ruleMatches(req RuleRequestConfig, sqlText string, args []any) (bool, error
 	default:
 		return false, fmt.Errorf("unsupported rule match: %s", req.Match)
 	}
+}
+
+func (c *ruleMatchCache) normalized(sqlText string) string {
+	if !c.normalizedSQLSet {
+		c.normalizedSQL = normalizeSQL(sqlText)
+		c.normalizedSQLSet = true
+	}
+	return c.normalizedSQL
 }
 
 func ruleParamsMatch(want, got []any) bool {

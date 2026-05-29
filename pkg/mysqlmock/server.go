@@ -75,6 +75,8 @@ func LogFormat(format string) Option {
 type Server struct {
 	cfg Config
 
+	rules []preparedRule
+
 	listener net.Listener
 	addr     string
 
@@ -94,12 +96,11 @@ type Server struct {
 	translationMu     sync.Mutex
 	preparedMu        sync.Mutex
 	metadataMu        sync.Mutex
+	diagnostics       diagnosticsStore
+	advisoryLocks     advisoryLockStore
 
 	mu             sync.Mutex
-	unsupported    []UnsupportedQuery
-	queries        []QueryEvent
 	ruleOnceUsed   map[int]bool
-	advisoryLocks  map[string]uint32
 	indexMetadata  map[string]mysqlIndexMetadata
 	columnMetadata map[string]mysqlColumnMetadata
 	autoIncrement  map[string]uint64
@@ -172,13 +173,17 @@ func New(opts ...Option) (*Server, error) {
 	if logFormat != "text" && logFormat != "json" {
 		return nil, fmt.Errorf("unsupported log format: %s", logFormat)
 	}
+	preparedRules, err := prepareRules(cfg.Rules)
+	if err != nil {
+		return nil, err
+	}
 
 	s := &Server{
 		cfg:            cfg,
+		rules:          preparedRules,
 		done:           make(chan struct{}),
 		logWriter:      options.logWriter,
 		logFormat:      logFormat,
-		advisoryLocks:  map[string]uint32{},
 		indexMetadata:  map[string]mysqlIndexMetadata{},
 		columnMetadata: map[string]mysqlColumnMetadata{},
 		autoIncrement:  map[string]uint64{},
@@ -263,22 +268,12 @@ func (s *Server) DSN() string {
 
 // Unsupported returns a snapshot of unsupported queries observed by the server.
 func (s *Server) Unsupported() []UnsupportedQuery {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	out := make([]UnsupportedQuery, len(s.unsupported))
-	copy(out, s.unsupported)
-	return out
+	return s.diagnostics.unsupportedSnapshot()
 }
 
 // Queries returns a snapshot of query events observed by the server.
 func (s *Server) Queries() []QueryEvent {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	out := make([]QueryEvent, len(s.queries))
-	copy(out, s.queries)
-	return out
+	return s.diagnostics.queriesSnapshot()
 }
 
 func (s *Server) currentSchemaVersion() uint64 {
@@ -322,9 +317,8 @@ func (s *Server) Reset(ctx context.Context) error {
 		s.baseSchemaVersion.Store(s.currentSchemaVersion())
 	}
 
+	s.diagnostics.reset()
 	s.mu.Lock()
-	s.unsupported = nil
-	s.queries = nil
 	s.ruleOnceUsed = nil
 	s.autoIncrement = map[string]uint64{}
 	s.mu.Unlock()
@@ -878,9 +872,7 @@ func (s *Server) recordUnsupported(u UnsupportedQuery) {
 	}
 	u.Suggestion = s.suggestedRule(u)
 
-	s.mu.Lock()
-	s.unsupported = append(s.unsupported, u)
-	s.mu.Unlock()
+	s.diagnostics.recordUnsupported(u)
 	s.logQuery(QueryEvent{
 		Event:         "query",
 		ConnectionID:  u.ConnectionID,
@@ -894,41 +886,15 @@ func (s *Server) recordUnsupported(u UnsupportedQuery) {
 }
 
 func (s *Server) getAdvisoryLock(name string, connectionID uint32) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.advisoryLocks == nil {
-		s.advisoryLocks = map[string]uint32{}
-	}
-	holder, ok := s.advisoryLocks[name]
-	if !ok || holder == connectionID {
-		s.advisoryLocks[name] = connectionID
-		return 1
-	}
-	return 0
+	return s.advisoryLocks.get(name, connectionID)
 }
 
 func (s *Server) releaseAdvisoryLock(name string, connectionID uint32) any {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	holder, ok := s.advisoryLocks[name]
-	if !ok {
-		return nil
-	}
-	if holder != connectionID {
-		return 0
-	}
-	delete(s.advisoryLocks, name)
-	return 1
+	return s.advisoryLocks.release(name, connectionID)
 }
 
 func (s *Server) releaseAdvisoryLocks(connectionID uint32) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for name, holder := range s.advisoryLocks {
-		if holder == connectionID {
-			delete(s.advisoryLocks, name)
-		}
-	}
+	s.advisoryLocks.releaseAll(connectionID)
 }
 
 func (s *Server) logf(format string, args ...any) {
@@ -954,9 +920,7 @@ func (s *Server) logQuery(event QueryEvent) {
 		event.Event = "query"
 	}
 
-	s.mu.Lock()
-	s.queries = append(s.queries, event)
-	s.mu.Unlock()
+	s.diagnostics.recordQuery(event)
 
 	if s.logWriter == nil {
 		return
