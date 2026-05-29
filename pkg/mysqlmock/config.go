@@ -65,8 +65,9 @@ type DatabaseConfig struct {
 
 // CompatConfig contains built-in MySQL compatibility values.
 type CompatConfig struct {
-	Profile   string            `yaml:"profile"`
-	Variables map[string]string `yaml:"variables"`
+	Profile        string            `yaml:"profile"`
+	AllowZeroDates bool              `yaml:"allow_zero_dates"`
+	Variables      map[string]string `yaml:"variables"`
 }
 
 // FallbackConfig controls behavior after rules and built-in compatibility handlers.

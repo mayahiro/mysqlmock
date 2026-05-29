@@ -481,6 +481,18 @@ CREATE TABLE strict_values (
 			wantErr: "Error 1292 (22007): Incorrect datetime value: 'not-a-date' for column 'created_at' at row 1",
 		},
 		{
+			name:    "zero datetime rejected by default",
+			query:   "INSERT INTO strict_values (short_name, count_value, created_at, checked_value) VALUES (?, ?, ?, ?)",
+			args:    []any{"ok", 1, "0000-00-00 00:00:00", 1},
+			wantErr: "Error 1292 (22007): Incorrect datetime value: '0000-00-00 00:00:00' for column 'created_at' at row 1",
+		},
+		{
+			name:    "zero in date rejected by default",
+			query:   "INSERT INTO strict_values (short_name, count_value, created_at, checked_value) VALUES (?, ?, ?, ?)",
+			args:    []any{"ok", 1, "0001-00-00 00:00:00", 1},
+			wantErr: "Error 1292 (22007): Incorrect datetime value: '0001-00-00 00:00:00' for column 'created_at' at row 1",
+		},
+		{
 			name:    "check constraint",
 			query:   "INSERT INTO strict_values (short_name, count_value, created_at, checked_value) VALUES (?, ?, ?, ?)",
 			args:    []any{"ok", 1, "2026-05-28 10:11:12", 0},
@@ -505,6 +517,70 @@ CREATE TABLE strict_values (
 	} else if !strings.Contains(err.Error(), "Error 1406 (22001): Data too long for column 'short_name' at row 1") {
 		t.Fatalf("update error = %v, want data too long", err)
 	}
+}
+
+func TestAllowZeroDatesCompatibility(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cfg := mysqlmock.DefaultConfig()
+	cfg.Compat.AllowZeroDates = true
+	cfg.Schema = []string{`
+CREATE TABLE zero_date_values (
+  id INTEGER PRIMARY KEY AUTO_INCREMENT,
+  date_value DATE NOT NULL,
+  datetime_value DATETIME NOT NULL
+);`}
+	server := mysqlmock.Start(t, mysqlmock.WithConfig(cfg))
+
+	db, err := sql.Open("mysql", server.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	if _, err := db.ExecContext(ctx, "INSERT INTO zero_date_values (date_value, datetime_value) VALUES (?, ?)", "0000-00-00", "0000-00-00 00:00:00"); err != nil {
+		t.Fatalf("insert all-zero date: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "INSERT INTO zero_date_values (date_value, datetime_value) VALUES (?, ?)", "0001-00-00", "0001-00-00 00:00:00"); err != nil {
+		t.Fatalf("insert zero-in-date: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "UPDATE zero_date_values SET datetime_value = ? WHERE id = 2", "0000-00-00 00:00:00.123456"); err != nil {
+		t.Fatalf("update zero datetime: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "INSERT INTO zero_date_values (date_value, datetime_value) VALUES (?, ?)", "2026-13-01", "2026-05-28 10:11:12"); err == nil {
+		t.Fatal("expected non-zero invalid date to remain rejected")
+	} else if !strings.Contains(err.Error(), "Error 1292") {
+		t.Fatalf("invalid date error = %v, want Error 1292", err)
+	}
+
+	rows, err := db.QueryContext(ctx, "SELECT CAST(date_value AS TEXT), CAST(datetime_value AS TEXT) FROM zero_date_values ORDER BY id")
+	if err != nil {
+		t.Fatalf("select zero dates: %v", err)
+	}
+	defer rows.Close()
+
+	got := [][2]string{}
+	for rows.Next() {
+		var dateValue string
+		var datetimeValue string
+		if err := rows.Scan(&dateValue, &datetimeValue); err != nil {
+			t.Fatalf("scan zero dates: %v", err)
+		}
+		got = append(got, [2]string{dateValue, datetimeValue})
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read zero dates: %v", err)
+	}
+	want := [][2]string{
+		{"0000-00-00", "0000-00-00 00:00:00"},
+		{"0001-00-00", "0000-00-00 00:00:00.123456"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("zero date rows = %#v, want %#v", got, want)
+	}
+	mysqlmock.AssertNoUnsupported(t, server)
 }
 
 func TestSavepointRollback(t *testing.T) {
@@ -1327,6 +1403,7 @@ database:
   mode: memory
 compat:
   profile: gorm
+  allow_zero_dates: true
   variables:
     lower_case_table_names: "1"
 `)
@@ -1340,6 +1417,9 @@ compat:
 	}
 	if cfg.Compat.Profile != "gorm" {
 		t.Fatalf("compat profile = %q, want gorm", cfg.Compat.Profile)
+	}
+	if !cfg.Compat.AllowZeroDates {
+		t.Fatal("compat allow_zero_dates = false, want true")
 	}
 	for name, want := range map[string]string{
 		"version":                "8.0.41-mock",
@@ -2897,6 +2977,9 @@ CREATE TABLE ddl_users (
 	}
 	if nickname != "Nick" {
 		t.Fatalf("renamed table nickname = %q, want Nick", nickname)
+	}
+	if _, err := db.ExecContext(ctx, "DROP DATABASE IF EXISTS `teardown_db`"); err != nil {
+		t.Fatalf("drop database teardown: %v", err)
 	}
 	mysqlmock.AssertNoUnsupported(t, server)
 }

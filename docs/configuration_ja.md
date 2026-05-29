@@ -49,6 +49,7 @@ database:
 | `database.mode` | `memory` |
 | `database.shared` | `true` |
 | `compat.profile` | `default` |
+| `compat.allow_zero_dates` | `false` |
 | `fallback.type` | `sqlite` |
 | `fallback.unsupported.type` | `error` |
 | `fallback.unsupported.code` | `1105` |
@@ -185,6 +186,7 @@ mysqlmock が seed insert statement を組み立てるとき、table name と co
 ```yaml
 compat:
   profile: gorm
+  allow_zero_dates: false
   variables:
     lower_case_table_names: "1"
     time_zone: "SYSTEM"
@@ -219,6 +221,9 @@ compat:
 - `tx_read_only`
 - `unique_checks`
 
+`allow_zero_dates: true` は write validation で `'0000-00-00'` や `'0001-00-00 00:00:00'` のような zero date part を許容します
+default は MySQL 8.0 の default strict SQL mode に寄せるため `false` です
+
 明示した `compat.variables` は profile default を上書きします
 ただし、実効 `version` variable は常に `server.mysql_version` から決まります
 
@@ -238,10 +243,11 @@ fallback:
 `fallback.unsupported` は、rules、built-in compatibility handlers、SQLite fallback のいずれでも扱えなかった query に返す MySQL error を制御します
 
 SQLite fallback は Repository test 向けの限定的な互換性として、`VALUES(column)`、ActiveRecord-style row alias、insert-side `DEFAULT` values を含む `INSERT ... ON DUPLICATE KEY UPDATE`、`INSERT IGNORE`、`REPLACE INTO` を扱います
-ORM や repository query でよく使う scalar function/operator として `RAND`、`FIND_IN_SET`、`FIELD`、`REGEXP` operator も登録します
+ORM や repository query でよく使う scalar function/operator として `CHAR_LENGTH`、`CHARACTER_LENGTH`、`CURDATE`、`RAND`、`FIND_IN_SET`、`FIELD`、`REGEXP` operator も登録します
 `REGEXP` は Go regular expression を使うため、MySQL regular expression dialect との完全一致は保証しません
 `RAND(seed)` は同じ seed に対して deterministic ですが、MySQL の per-statement random sequence behavior までは再現しません
 SQLite fallback は MySQL string literal の backslash escape、明示的な `ESCAPE` 句がない `LIKE` pattern の MySQL default backslash escape、`UPDATE ... SET table.column = ...` target の table qualifier 除去も扱います
+`DROP DATABASE` と `DROP SCHEMA` は teardown 用の no-op statement として受け付けます
 
 MySQL-compatible DDL で index を作成した場合、mysqlmock は軽量な index metadata も保持し、ORM schema introspection が使う `SHOW KEYS` の prefix length、expression、visibility fields を返します
 

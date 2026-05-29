@@ -50,6 +50,7 @@ Missing nested values are filled from defaults.
 | `database.mode` | `memory` |
 | `database.shared` | `true` |
 | `compat.profile` | `default` |
+| `compat.allow_zero_dates` | `false` |
 | `fallback.type` | `sqlite` |
 | `fallback.unsupported.type` | `error` |
 | `fallback.unsupported.code` | `1105` |
@@ -202,6 +203,7 @@ quoted when mysqlmock builds seed insert statements.
 ```yaml
 compat:
   profile: gorm
+  allow_zero_dates: false
   variables:
     lower_case_table_names: "1"
     time_zone: "SYSTEM"
@@ -236,6 +238,10 @@ The `gorm` profile adds common ORM initialization variables, including:
 - `tx_read_only`
 - `unique_checks`
 
+`allow_zero_dates: true` accepts zero date parts such as `'0000-00-00'` and
+`'0001-00-00 00:00:00'` during write validation. The default is `false` to
+match MySQL 8.0's default strict SQL mode more closely.
+
 Explicit `compat.variables` values override profile defaults. `server.mysql_version`
 always controls the effective `version` variable.
 
@@ -259,15 +265,17 @@ SQLite fallback includes focused repository-test compatibility for
 `INSERT ... ON DUPLICATE KEY UPDATE` with `VALUES(column)`, ActiveRecord-style
 row aliases, and insert-side `DEFAULT` values, `INSERT IGNORE`, and
 `REPLACE INTO`. It also registers MySQL-compatible scalar functions for common
-ORM and repository queries, including `RAND`, `FIND_IN_SET`, `FIELD`, and the
-`REGEXP` operator. `REGEXP` uses Go regular expressions, so exact MySQL regular
-expression dialect compatibility is not guaranteed. `RAND(seed)` is
+ORM and repository queries, including `CHAR_LENGTH`, `CHARACTER_LENGTH`,
+`CURDATE`, `RAND`, `FIND_IN_SET`, `FIELD`, and the `REGEXP` operator. `REGEXP`
+uses Go regular expressions, so exact MySQL regular expression dialect
+compatibility is not guaranteed. `RAND(seed)` is
 deterministic for equal seeds but does not reproduce MySQL's full per-statement
 random sequence behavior.
 The fallback also translates MySQL backslash escapes in string literals, adds
 MySQL's default backslash escape behavior for `LIKE` patterns when no explicit
 `ESCAPE` clause is present, and removes table qualifiers from
-`UPDATE ... SET table.column = ...` targets.
+`UPDATE ... SET table.column = ...` targets. `DROP DATABASE` and `DROP SCHEMA`
+are accepted as no-op teardown statements.
 
 For MySQL-compatible DDL that creates indexes, mysqlmock also keeps lightweight
 index metadata so `SHOW KEYS` can expose prefix length, expression, and

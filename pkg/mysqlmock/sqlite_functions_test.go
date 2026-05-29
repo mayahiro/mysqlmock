@@ -41,6 +41,26 @@ func TestMySQLFunctionCompatibilityUDFs(t *testing.T) {
 		t.Fatalf("RAND(seed) values = %v and %v, want repeatable values for equal seeds", firstSeededRand, secondSeededRand)
 	}
 
+	var asciiLength int
+	var multibyteLength int
+	var nullCharLength sql.NullInt64
+	var curDate string
+	if err := db.QueryRowContext(ctx, `
+SELECT
+  CHAR_LENGTH('abc'),
+  CHARACTER_LENGTH(char(12354) || char(12356) || char(12358)),
+  CHAR_LENGTH(NULL),
+  CURDATE()
+`).Scan(&asciiLength, &multibyteLength, &nullCharLength, &curDate); err != nil {
+		t.Fatalf("SELECT CHAR_LENGTH/CURDATE: %v", err)
+	}
+	if asciiLength != 3 || multibyteLength != 3 || nullCharLength.Valid {
+		t.Fatalf("CHAR_LENGTH results = %d, %d, %#v, want 3, 3, NULL", asciiLength, multibyteLength, nullCharLength)
+	}
+	if _, err := time.Parse("2006-01-02", curDate); err != nil {
+		t.Fatalf("CURDATE() = %q, want YYYY-MM-DD date: %v", curDate, err)
+	}
+
 	var findInSet int
 	var findInSetMissing int
 	var nullFindInSet sql.NullInt64

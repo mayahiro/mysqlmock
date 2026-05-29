@@ -1122,6 +1122,8 @@ func isWriteQuery(upper string) bool {
 		strings.HasPrefix(upper, "ALTER TABLE ") ||
 		strings.HasPrefix(upper, "RENAME TABLE ") ||
 		strings.HasPrefix(upper, "DROP TABLE ") ||
+		strings.HasPrefix(upper, "DROP DATABASE ") ||
+		strings.HasPrefix(upper, "DROP SCHEMA ") ||
 		strings.HasPrefix(upper, "DROP INDEX ")
 }
 

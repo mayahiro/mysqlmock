@@ -138,6 +138,9 @@ const configSchemaJSON = `{
           "type": "string",
           "enum": ["default", "gorm"]
         },
+        "allow_zero_dates": {
+          "type": "boolean"
+        },
         "variables": {
           "type": "object",
           "additionalProperties": {

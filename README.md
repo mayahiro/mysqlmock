@@ -158,6 +158,7 @@ seed:
 
 compat:
   profile: gorm
+  allow_zero_dates: false
 
 fallback:
   type: sqlite
@@ -235,8 +236,8 @@ including `SET NAMES`, `SET autocommit`, `SELECT VERSION()`, `SELECT @@...`,
 queries, and a small `information_schema` subset.
 
 Built-in scalar compatibility functions include `DATABASE()`, `SCHEMA()`,
-`USER()`, `CURRENT_USER()`, `CONNECTION_ID()`, `LAST_INSERT_ID()`, and
-`ROW_COUNT()`.
+`USER()`, `CURRENT_USER()`, `CONNECTION_ID()`, `LAST_INSERT_ID()`,
+`ROW_COUNT()`, `CHAR_LENGTH()`, `CHARACTER_LENGTH()`, and `CURDATE()`.
 
 `information_schema.schemata`, `tables`, `columns`, `key_column_usage`,
 `statistics`, `table_constraints`, `referential_constraints`, and
@@ -254,13 +255,15 @@ the index was created through mysqlmock's MySQL-compatible DDL path.
 Write validation maps common repository-test failures to MySQL-like errors,
 including duplicate keys, foreign keys, NOT NULL, CHECK constraints, data too
 long for character columns, incorrect integer values, and incorrect datetime
-values.
+values. Set `compat.allow_zero_dates: true` to accept zero date parts such as
+`'0000-00-00'` and `'0001-00-00 00:00:00'` for legacy data.
 
 Schema and query fallback translate `TRUE`, `FALSE`, `NOW()`,
 `CURRENT_TIMESTAMP()`, `AUTO_INCREMENT`, TiDB `AUTO_RANDOM`, common MySQL and
 TiDB DDL options, table-level `PRIMARY KEY` / `UNIQUE KEY` / `KEY` definitions,
 simple MySQL index DDL, and common `ALTER TABLE` / `RENAME TABLE` variants into
-SQLite-compatible SQL where possible.
+SQLite-compatible SQL where possible. `DROP DATABASE` / `DROP SCHEMA` are
+accepted as no-op teardown statements.
 When an `AUTO_INCREMENT` column belongs to a composite primary key, mysqlmock
 keeps the composite key and strips `AUTO_INCREMENT`; SQLite only supports
 automatic rowid assignment for a single `INTEGER PRIMARY KEY`, so inserts must
@@ -269,7 +272,8 @@ MySQL-visible index names remain table-scoped; mysqlmock maps them to private
 SQLite index names internally to avoid SQLite's schema-wide index namespace.
 Common scalar functions and operators used by ORM queries include `IFNULL`,
 `COALESCE`, `CONCAT`, `CAST`, `DATE_FORMAT`, `JSON_EXTRACT`, `JSON_UNQUOTE`,
-`RAND`, `FIND_IN_SET`, `FIELD`, and `REGEXP`.
+`CHAR_LENGTH`, `CHARACTER_LENGTH`, `CURDATE`, `RAND`, `FIND_IN_SET`, `FIELD`,
+and `REGEXP`.
 SQLite fallback also handles MySQL backslash escapes in string literals,
 MySQL's default backslash escape for `LIKE` patterns, and table-qualified
 `UPDATE ... SET table.column = ...` targets emitted by some ORMs.

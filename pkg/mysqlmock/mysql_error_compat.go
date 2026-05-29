@@ -72,7 +72,7 @@ func (c *mysqlConn) validateMySQLInsertValues(ctx context.Context, query string,
 			if i >= len(columns) {
 				continue
 			}
-			if err := validateMySQLColumnValue(tableColumns, columns[i], value, rowIndex+1); err != nil {
+			if err := c.validateMySQLColumnValue(tableColumns, columns[i], value, rowIndex+1); err != nil {
 				return err
 			}
 		}
@@ -130,13 +130,13 @@ func (c *mysqlConn) validateMySQLUpdateValues(ctx context.Context, query string,
 		placeholderCount := countPlaceholders(valueExpr)
 		switch {
 		case placeholderCount == 1 && isBarePlaceholderExpr(valueExpr) && argPos < len(args):
-			if err := validateMySQLColumnValue(tableColumns, unquoteSQLWord(columnName), args[argPos], 1); err != nil {
+			if err := c.validateMySQLColumnValue(tableColumns, unquoteSQLWord(columnName), args[argPos], 1); err != nil {
 				return err
 			}
 		case placeholderCount == 0:
 			value, ok := c.evaluateValidationExpr(ctx, valueExpr)
 			if ok {
-				if err := validateMySQLColumnValue(tableColumns, unquoteSQLWord(columnName), value, 1); err != nil {
+				if err := c.validateMySQLColumnValue(tableColumns, unquoteSQLWord(columnName), value, 1); err != nil {
 					return err
 				}
 			}
@@ -159,7 +159,11 @@ func (c *mysqlConn) evaluateValidationExpr(ctx context.Context, expr string) (an
 	return rs.Rows[0][0], true
 }
 
-func validateMySQLColumnValue(columns []sqliteTableColumn, columnName string, value any, rowNumber int) error {
+func (c *mysqlConn) validateMySQLColumnValue(columns []sqliteTableColumn, columnName string, value any, rowNumber int) error {
+	return validateMySQLColumnValue(columns, columnName, value, rowNumber, c.server.cfg.Compat.AllowZeroDates)
+}
+
+func validateMySQLColumnValue(columns []sqliteTableColumn, columnName string, value any, rowNumber int, allowZeroDates bool) error {
 	if value == nil {
 		return nil
 	}
@@ -178,8 +182,11 @@ func validateMySQLColumnValue(columns []sqliteTableColumn, columnName string, va
 		}
 	}
 	if isMySQLDateTimeType(column.Type) {
-		if text, ok := stringLikeValue(value); ok && !isMySQLDateTimeLiteral(strings.TrimSpace(text)) {
-			return errPacket(mysqlErrWrongValue, "22007", fmt.Sprintf("Incorrect datetime value: '%s' for column '%s' at row %d", text, column.Name, rowNumber))
+		if text, ok := stringLikeValue(value); ok {
+			trimmed := strings.TrimSpace(text)
+			if !isMySQLDateTimeLiteral(trimmed) && !(allowZeroDates && isMySQLZeroDateLiteral(trimmed)) {
+				return errPacket(mysqlErrWrongValue, "22007", fmt.Sprintf("Incorrect datetime value: '%s' for column '%s' at row %d", text, column.Name, rowNumber))
+			}
 		}
 	}
 	return nil
@@ -239,4 +246,79 @@ func isMySQLDateTimeLiteral(value string) bool {
 		}
 	}
 	return false
+}
+
+func isMySQLZeroDateLiteral(value string) bool {
+	date, rest, ok := splitMySQLDateLiteral(value)
+	if !ok || !hasZeroMySQLDatePart(date) {
+		return false
+	}
+	if rest == "" {
+		return true
+	}
+	return isMySQLTimeLiteral(rest)
+}
+
+func splitMySQLDateLiteral(value string) (date, rest string, ok bool) {
+	if len(value) < len("0000-00-00") {
+		return "", "", false
+	}
+	date = value[:10]
+	if date[4] != '-' || date[7] != '-' {
+		return "", "", false
+	}
+	year, okYear := parseFixedDigits(date[0:4])
+	month, okMonth := parseFixedDigits(date[5:7])
+	day, okDay := parseFixedDigits(date[8:10])
+	if !okYear || !okMonth || !okDay || year > 9999 || month > 12 || day > 31 {
+		return "", "", false
+	}
+	if len(value) == 10 {
+		return date, "", true
+	}
+	if value[10] != ' ' && value[10] != 'T' {
+		return "", "", false
+	}
+	return date, value[11:], true
+}
+
+func hasZeroMySQLDatePart(date string) bool {
+	return date[0:4] == "0000" || date[5:7] == "00" || date[8:10] == "00"
+}
+
+func isMySQLTimeLiteral(value string) bool {
+	if len(value) < len("00:00:00") {
+		return false
+	}
+	if value[2] != ':' || value[5] != ':' {
+		return false
+	}
+	hour, okHour := parseFixedDigits(value[0:2])
+	minute, okMinute := parseFixedDigits(value[3:5])
+	second, okSecond := parseFixedDigits(value[6:8])
+	if !okHour || !okMinute || !okSecond || hour > 23 || minute > 59 || second > 59 {
+		return false
+	}
+	if len(value) == 8 {
+		return true
+	}
+	if value[8] != '.' || len(value[9:]) == 0 || len(value[9:]) > 6 {
+		return false
+	}
+	_, ok := parseFixedDigits(value[9:])
+	return ok
+}
+
+func parseFixedDigits(value string) (int, bool) {
+	if value == "" {
+		return 0, false
+	}
+	out := 0
+	for i := 0; i < len(value); i++ {
+		if value[i] < '0' || value[i] > '9' {
+			return 0, false
+		}
+		out = out*10 + int(value[i]-'0')
+	}
+	return out, true
 }

@@ -148,6 +148,7 @@ seed:
 
 compat:
   profile: gorm
+  allow_zero_dates: false
 
 fallback:
   type: sqlite
@@ -211,7 +212,7 @@ Repository test では workflow 後に `mysqlmock.AssertNoUnsupported(t, server)
 Built-in compatibility handler は、MySQL client や ORM の初期化でよく出る query を扱います
 対象には `SET NAMES`、`SET autocommit`、`SELECT VERSION()`、`SELECT @@...`、`SHOW VARIABLES`、`SHOW TABLES`、ActiveRecord-style schema introspection query、小さな `information_schema` subset が含まれます
 
-Built-in scalar compatibility function として、`DATABASE()`、`SCHEMA()`、`USER()`、`CURRENT_USER()`、`CONNECTION_ID()`、`LAST_INSERT_ID()`、`ROW_COUNT()` を扱います
+Built-in scalar compatibility function として、`DATABASE()`、`SCHEMA()`、`USER()`、`CURRENT_USER()`、`CONNECTION_ID()`、`LAST_INSERT_ID()`、`ROW_COUNT()`、`CHAR_LENGTH()`、`CHARACTER_LENGTH()`、`CURDATE()` を扱います
 
 `information_schema.schemata`、`tables`、`columns`、`key_column_usage`、`statistics`、`table_constraints`、`referential_constraints`、`check_constraints` は、SQLite schema から派生した小さな metadata subset として利用できます
 
@@ -221,11 +222,13 @@ ActiveRecord-style schema introspection として、`SHOW FULL FIELDS`、`SHOW C
 `SHOW KEYS` は、mysqlmock の MySQL-compatible DDL path で作成された index について prefix length、expression、visibility metadata も返します
 
 Write validation は、duplicate key、foreign key、NOT NULL、CHECK constraint、character column の data too long、incorrect integer value、incorrect datetime value など、Repository test でよく使う失敗を MySQL-like error に map します
+legacy data のために `'0000-00-00'` や `'0001-00-00 00:00:00'` のような zero date part を許容する場合は `compat.allow_zero_dates: true` を設定します
 
 Schema と query fallback は、`TRUE`、`FALSE`、`NOW()`、`CURRENT_TIMESTAMP()`、`AUTO_INCREMENT`、TiDB `AUTO_RANDOM`、よく使われる MySQL/TiDB DDL option、table-level `PRIMARY KEY` / `UNIQUE KEY` / `KEY` 定義、単純な MySQL index DDL、よく使う `ALTER TABLE` / `RENAME TABLE` variants を、可能な範囲で SQLite-compatible SQL に変換します
+`DROP DATABASE` / `DROP SCHEMA` は teardown 用の no-op statement として受け付けます
 `AUTO_INCREMENT` column が複合 primary key に含まれる場合、mysqlmock は複合 key を維持して `AUTO_INCREMENT` を削除します。SQLite の自動 rowid 採番は単一の `INTEGER PRIMARY KEY` でのみ使えるため、この key value は insert 時に明示する必要があります
 MySQL-visible index name は table scoped のまま扱い、SQLite 内部では private index name に変換することで SQLite の schema-wide index namespace との衝突を避けます
-ORM query でよく使う scalar function/operator として `IFNULL`、`COALESCE`、`CONCAT`、`CAST`、`DATE_FORMAT`、`JSON_EXTRACT`、`JSON_UNQUOTE`、`RAND`、`FIND_IN_SET`、`FIELD`、`REGEXP` を扱います
+ORM query でよく使う scalar function/operator として `IFNULL`、`COALESCE`、`CONCAT`、`CAST`、`DATE_FORMAT`、`JSON_EXTRACT`、`JSON_UNQUOTE`、`CHAR_LENGTH`、`CHARACTER_LENGTH`、`CURDATE`、`RAND`、`FIND_IN_SET`、`FIELD`、`REGEXP` を扱います
 SQLite fallback は、MySQL string literal の backslash escape、`LIKE` pattern の MySQL default backslash escape、一部 ORM が出す `UPDATE ... SET table.column = ...` 形式の target も扱います
 
 SQLite fallback は、`VALUES(column)`、ActiveRecord-style row alias、insert-side `DEFAULT` values を含む一般的な `INSERT ... ON DUPLICATE KEY UPDATE`、`INSERT IGNORE`、`REPLACE INTO` と、`NOWAIT` / `SKIP LOCKED` を含む `FOR UPDATE` locking clause の strip も扱います

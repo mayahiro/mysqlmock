@@ -18,6 +18,16 @@ func init() {
 }
 
 func registerSQLiteMySQLFunctions() {
+	registerSQLiteMySQLFunction("char_length", mysqlCharLengthFunction())
+	registerSQLiteMySQLFunction("character_length", mysqlCharLengthFunction())
+
+	registerSQLiteMySQLFunction("curdate", &sqlite.FunctionImpl{
+		NArgs: 0,
+		Scalar: func(_ *sqlite.FunctionContext, _ []driver.Value) (driver.Value, error) {
+			return time.Now().Format("2006-01-02"), nil
+		},
+	})
+
 	registerSQLiteMySQLFunction("rand", &sqlite.FunctionImpl{
 		NArgs: -1,
 		Scalar: func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
@@ -96,6 +106,19 @@ func registerSQLiteMySQLFunctions() {
 			return int64(0), nil
 		},
 	})
+}
+
+func mysqlCharLengthFunction() *sqlite.FunctionImpl {
+	return &sqlite.FunctionImpl{
+		NArgs:         1,
+		Deterministic: true,
+		Scalar: func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+			if args[0] == nil {
+				return nil, nil
+			}
+			return int64(len([]rune(mysqlCompatString(args[0])))), nil
+		},
+	}
 }
 
 func registerSQLiteMySQLFunction(name string, impl *sqlite.FunctionImpl) {

@@ -7,6 +7,9 @@ import (
 )
 
 func (c *mysqlConn) execMySQLDDLCompatibility(ctx context.Context, sqlText string) (okResult, bool, error) {
+	if isDropDatabaseStatement(sqlText) {
+		return okResult{}, true, nil
+	}
 	if oldName, newName, ok := parseRenameTable(sqlText); ok {
 		resp, err := c.execSQLite(ctx, fmt.Sprintf("ALTER TABLE %s RENAME TO %s", quoteIdent(oldName), quoteIdent(newName)))
 		if err == nil {
@@ -65,6 +68,29 @@ func (c *mysqlConn) execMySQLDDLCompatibility(ctx context.Context, sqlText strin
 		return okResult{}, true, nil
 	}
 	return okResult{}, false, nil
+}
+
+func isDropDatabaseStatement(sqlText string) bool {
+	pos := 0
+	if !consumeKeyword(sqlText, &pos, "DROP") {
+		return false
+	}
+	if !consumeKeyword(sqlText, &pos, "DATABASE") && !consumeKeyword(sqlText, &pos, "SCHEMA") {
+		return false
+	}
+	if consumeKeyword(sqlText, &pos, "IF") && !consumeKeyword(sqlText, &pos, "EXISTS") {
+		return false
+	}
+	_, next, ok := readSQLNameToken(sqlText, pos)
+	if !ok {
+		return false
+	}
+	pos = next
+	pos = skipSQLSpaces(sqlText, pos)
+	if pos < len(sqlText) && sqlText[pos] == ';' {
+		pos = skipSQLSpaces(sqlText, pos+1)
+	}
+	return pos == len(sqlText)
 }
 
 func (c *mysqlConn) renameIndex(ctx context.Context, tableName, oldName, newName string) (okResult, bool, error) {

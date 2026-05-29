@@ -42,6 +42,9 @@ func TestConfigSchemaJSON(t *testing.T) {
 
 	compat := properties["compat"].(map[string]any)
 	compatProperties := compat["properties"].(map[string]any)
+	if compatProperties["allow_zero_dates"] == nil {
+		t.Fatal("schema did not include compat.allow_zero_dates")
+	}
 	profile := compatProperties["profile"].(map[string]any)
 	profileEnum := profile["enum"].([]any)
 	for _, want := range []string{"default", "gorm"} {
