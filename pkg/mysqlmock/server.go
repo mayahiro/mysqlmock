@@ -85,6 +85,7 @@ type Server struct {
 	logWriter        io.Writer
 	logFormat        string
 	logMu            sync.Mutex
+	translationMu    sync.Mutex
 
 	mu            sync.Mutex
 	unsupported   []UnsupportedQuery
@@ -93,6 +94,7 @@ type Server struct {
 	advisoryLocks map[string]uint32
 	indexMetadata map[string]mysqlIndexMetadata
 	tableDDL      map[string]string
+	translation   sqlTranslationCache
 }
 
 // UnsupportedQuery records a query that mysqlmock could not execute.
@@ -391,11 +393,15 @@ func (s *Server) openBackend(ctx context.Context) error {
 	s.db = db
 	s.keepConn = keepConn
 
-	if err := s.applySchema(ctx, keepConn); err != nil {
-		_ = s.closeBackend()
-		return err
-	}
-	if err := s.applySeed(ctx, keepConn, s.cfg.Seed); err != nil {
+	if err := withSQLiteTransaction(ctx, keepConn, "initial setup", func() error {
+		if err := s.applySchema(ctx, keepConn); err != nil {
+			return err
+		}
+		if err := s.applySeed(ctx, keepConn, s.cfg.Seed); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
 		_ = s.closeBackend()
 		return err
 	}

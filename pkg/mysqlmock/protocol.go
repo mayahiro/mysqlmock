@@ -414,7 +414,7 @@ func (c *mysqlConn) executeQuery(ctx context.Context, command, sqlText string, a
 
 	if isReadQuery(upper) {
 		c.logQuery(command, "sqlite", sqlText, normalized)
-		return c.querySQLite(ctx, translateSQL(trimmed), args...)
+		return c.querySQLite(ctx, c.server.translateSQLCached(trimmed), args...)
 	}
 	if isWriteQuery(upper) {
 		c.logQuery(command, "sqlite", sqlText, normalized)
@@ -431,7 +431,7 @@ func (c *mysqlConn) executeQuery(ctx context.Context, command, sqlText string, a
 				return resp, err
 			}
 		}
-		resp, err := c.execSQLiteStatements(ctx, translateSQLStatements(trimmed), args...)
+		resp, err := c.execSQLiteStatements(ctx, c.server.translateSQLStatementsCached(trimmed), args...)
 		if err == nil {
 			c.server.recordMySQLIndexMetadata(trimmed)
 			c.server.recordMySQLTableDDL(trimmed)
@@ -1115,6 +1115,9 @@ func unquoteSQLWord(value string) string {
 }
 
 func translateSQL(sqlText string) string {
+	if !needsSQLTranslation(sqlText) {
+		return sqlText
+	}
 	if stripped, ok := stripMySQLLockingClause(sqlText); ok {
 		sqlText = stripped
 	}
@@ -1237,6 +1240,38 @@ func translateSQL(sqlText string) string {
 		i++
 	}
 	return out.String()
+}
+
+func needsSQLTranslation(sqlText string) bool {
+	if strings.Contains(sqlText, "<=>") {
+		return true
+	}
+	if stripsMySQLDDLOptions(sqlText) {
+		return true
+	}
+	for i := 0; i < len(sqlText); {
+		if end, ok := quotedSQLSpan(sqlText, i); ok {
+			i = end
+			continue
+		}
+		if end, ok := sqlCommentSpan(sqlText, i); ok {
+			i = end
+			continue
+		}
+		ident, end, ok := readSQLIdentifier(sqlText, i)
+		if !ok {
+			i++
+			continue
+		}
+		switch strings.ToUpper(ident) {
+		case "TRUE", "FALSE", "NOW", "CURRENT_TIMESTAMP",
+			"CONCAT", "DATE_FORMAT", "JSON_EXTRACT", "JSON_UNQUOTE", "CAST",
+			"AUTO_INCREMENT", "AUTO_RANDOM", "FOR", "LOCK":
+			return true
+		}
+		i = end
+	}
+	return false
 }
 
 func stripsMySQLDDLOptions(sqlText string) bool {

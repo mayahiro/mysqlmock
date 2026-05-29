@@ -27,7 +27,7 @@ func (c *mysqlConn) queryInformationSchema(ctx context.Context, sqlText string, 
 			return resultSet{}, err
 		}
 	}
-	query := translateSQL(rewriteInformationSchemaSQL(sqlText, c.currentDB))
+	query := c.server.translateSQLCached(rewriteInformationSchemaSQL(sqlText, c.currentDB))
 	return c.querySQLite(ctx, query, args...)
 }
 
