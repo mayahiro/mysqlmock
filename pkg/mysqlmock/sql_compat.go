@@ -72,9 +72,55 @@ func translateCreateTableStatements(sqlText string) ([]string, bool) {
 	}
 
 	rebuilt := sqlText[:bodyStart+1] + strings.Join(translatedItems, ",\n") + sqlText[bodyEnd-1:]
+	rebuilt = stripMySQLPartitionClause(rebuilt)
 	statements := []string{translateSQL(rebuilt)}
 	statements = append(statements, indexStatements...)
 	return statements, true
+}
+
+func stripMySQLPartitionClause(sqlText string) string {
+	depth := 0
+	for i := 0; i < len(sqlText); {
+		if end, ok := quotedSQLSpan(sqlText, i); ok {
+			i = end
+			continue
+		}
+		if end, ok := sqlCommentSpan(sqlText, i); ok {
+			i = end
+			continue
+		}
+		switch sqlText[i] {
+		case '(':
+			depth++
+			i++
+			continue
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+			i++
+			continue
+		}
+		word, end, ok := readSQLIdentifier(sqlText, i)
+		if !ok {
+			i++
+			continue
+		}
+		if depth == 0 && strings.EqualFold(word, "PARTITION") {
+			pos := end
+			if consumeKeyword(sqlText, &pos, "BY") {
+				prefix := strings.TrimRightFunc(sqlText[:i], func(r rune) bool {
+					return r == ' ' || r == '\t' || r == '\n' || r == '\r' || r == '\f'
+				})
+				if strings.HasSuffix(strings.TrimSpace(sqlText), ";") && !strings.HasSuffix(prefix, ";") {
+					return prefix + ";"
+				}
+				return prefix
+			}
+		}
+		i = end
+	}
+	return sqlText
 }
 
 func translateCreateTableColumnItem(item string) string {

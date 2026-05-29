@@ -51,6 +51,7 @@ Missing nested values are filled from defaults.
 | `database.shared` | `true` |
 | `compat.profile` | `default` |
 | `compat.allow_zero_dates` | `false` |
+| `compat.implicit_defaults` | `false` |
 | `compat.write_validation` | `strict` |
 | `fallback.type` | `sqlite` |
 | `fallback.unsupported.type` | `error` |
@@ -205,6 +206,7 @@ quoted when mysqlmock builds seed insert statements.
 compat:
   profile: gorm
   allow_zero_dates: false
+  implicit_defaults: false
   write_validation: strict
   variables:
     lower_case_table_names: "1"
@@ -243,6 +245,11 @@ The `gorm` profile adds common ORM initialization variables, including:
 `allow_zero_dates: true` accepts zero date parts such as `'0000-00-00'` and
 `'0001-00-00 00:00:00'` during write validation. The default is `false` to
 match MySQL 8.0's default strict SQL mode more closely.
+
+`implicit_defaults: true` emulates non-strict MySQL implicit defaults for
+`NOT NULL` columns that do not have explicit defaults. Numeric columns use `0`,
+date and datetime columns use the corresponding zero date value, and string
+columns use an empty string. The default is `false`.
 
 `write_validation` controls write-path compatibility checks:
 
@@ -286,6 +293,9 @@ MySQL's default backslash escape behavior for `LIKE` patterns when no explicit
 `ESCAPE` clause is present, and removes table qualifiers from
 `UPDATE ... SET table.column = ...` targets. `DROP DATABASE` and `DROP SCHEMA`
 are accepted as no-op teardown statements.
+For `CREATE TABLE` statements, mysqlmock strips MySQL partition clauses before
+SQLite execution and applies `ZEROFILL` display width padding to simple
+result-set values for declared integer columns.
 
 For MySQL-compatible DDL that creates indexes, mysqlmock also keeps lightweight
 index metadata so `SHOW KEYS` can expose prefix length, expression, and

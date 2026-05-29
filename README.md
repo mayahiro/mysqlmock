@@ -159,6 +159,7 @@ seed:
 compat:
   profile: gorm
   allow_zero_dates: false
+  implicit_defaults: false
   write_validation: strict
 
 fallback:
@@ -258,6 +259,8 @@ including duplicate keys, foreign keys, NOT NULL, CHECK constraints, data too
 long for character columns, incorrect integer values, and incorrect datetime
 values. Set `compat.allow_zero_dates: true` to accept zero date parts such as
 `'0000-00-00'` and `'0001-00-00 00:00:00'` for legacy data.
+Set `compat.implicit_defaults: true` to emulate non-strict MySQL implicit
+defaults for `NOT NULL` columns without explicit defaults.
 Set `compat.write_validation: basic` to skip value pre-validation on successful
 writes while keeping SQLite constraint error mapping, or `off` to return raw
 SQLite errors as generic MySQL errors.
@@ -268,6 +271,9 @@ TiDB DDL options, table-level `PRIMARY KEY` / `UNIQUE KEY` / `KEY` definitions,
 simple MySQL index DDL, and common `ALTER TABLE` / `RENAME TABLE` variants into
 SQLite-compatible SQL where possible. `DROP DATABASE` / `DROP SCHEMA` are
 accepted as no-op teardown statements.
+`CREATE TABLE ... PARTITION BY ...` partition clauses are stripped for SQLite
+execution. Integer columns declared with `ZEROFILL` use the declared display
+width for simple result-set values.
 When an `AUTO_INCREMENT` column belongs to a composite primary key, mysqlmock
 keeps the composite key and strips `AUTO_INCREMENT`; SQLite only supports
 automatic rowid assignment for a single `INTEGER PRIMARY KEY`, so inserts must

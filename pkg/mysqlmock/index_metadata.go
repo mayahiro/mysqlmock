@@ -21,6 +21,48 @@ type mysqlIndexColumnMetadata struct {
 	Expression string
 }
 
+type mysqlColumnMetadata struct {
+	TableName     string
+	ColumnName    string
+	ZeroFillWidth int
+}
+
+func (s *Server) recordMySQLColumnMetadata(sqlText string) {
+	for _, metadata := range parseMySQLColumnMetadata(sqlText) {
+		if metadata.TableName == "" || metadata.ColumnName == "" || metadata.ZeroFillWidth <= 0 {
+			continue
+		}
+		s.mu.Lock()
+		if s.columnMetadata == nil {
+			s.columnMetadata = map[string]mysqlColumnMetadata{}
+		}
+		s.columnMetadata[columnMetadataKey(metadata.TableName, metadata.ColumnName)] = metadata
+		s.mu.Unlock()
+	}
+}
+
+func (s *Server) lookupMySQLColumnMetadata(tableName, columnName string) (mysqlColumnMetadata, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	metadata, ok := s.columnMetadata[columnMetadataKey(tableName, columnName)]
+	return metadata, ok
+}
+
+func (s *Server) renameMySQLTableColumnMetadata(oldName, newName string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	renamed := map[string]mysqlColumnMetadata{}
+	for key, metadata := range s.columnMetadata {
+		if !strings.EqualFold(metadata.TableName, oldName) {
+			renamed[key] = metadata
+			continue
+		}
+		metadata.TableName = newName
+		renamed[columnMetadataKey(newName, metadata.ColumnName)] = metadata
+	}
+	s.columnMetadata = renamed
+}
+
 func (s *Server) recordMySQLIndexMetadata(sqlText string) {
 	for _, metadata := range parseMySQLIndexMetadata(sqlText) {
 		if metadata.TableName == "" || metadata.IndexName == "" {
@@ -181,6 +223,10 @@ func indexMetadataKey(tableName, indexName string) string {
 	return strings.ToLower(unquoteSQLWord(tableName)) + "." + strings.ToLower(unquoteSQLWord(indexName))
 }
 
+func columnMetadataKey(tableName, columnName string) string {
+	return strings.ToLower(unquoteSQLWord(tableName)) + "." + strings.ToLower(unquoteSQLWord(columnName))
+}
+
 func tableMetadataKey(tableName string) string {
 	return strings.ToLower(unquoteSQLWord(tableName))
 }
@@ -201,7 +247,7 @@ func sqliteIndexName(tableName, indexName string) string {
 }
 
 func parseCreateTableDDLTableName(sqlText string) (string, bool) {
-	pos := 0
+	pos := skipSQLSpaces(sqlText, 0)
 	if !consumeKeyword(sqlText, &pos, "CREATE") {
 		return "", false
 	}
@@ -220,7 +266,7 @@ func parseCreateTableDDLTableName(sqlText string) (string, bool) {
 }
 
 func parseDropTableName(sqlText string) (string, bool) {
-	pos := 0
+	pos := skipSQLSpaces(sqlText, 0)
 	if !consumeKeyword(sqlText, &pos, "DROP") || !consumeKeyword(sqlText, &pos, "TABLE") {
 		return "", false
 	}
@@ -234,7 +280,7 @@ func parseDropTableName(sqlText string) (string, bool) {
 }
 
 func parseAlterTableName(sqlText string) (string, bool) {
-	pos := 0
+	pos := skipSQLSpaces(sqlText, 0)
 	if !consumeKeyword(sqlText, &pos, "ALTER") || !consumeKeyword(sqlText, &pos, "TABLE") {
 		return "", false
 	}
@@ -260,8 +306,62 @@ func parseMySQLIndexMetadata(sqlText string) []mysqlIndexMetadata {
 	return parseCreateTableIndexMetadata(sqlText)
 }
 
+func parseMySQLColumnMetadata(sqlText string) []mysqlColumnMetadata {
+	tableName, ok := parseCreateTableDDLTableName(sqlText)
+	if !ok {
+		return nil
+	}
+	pos := skipSQLSpaces(sqlText, 0)
+	if !consumeKeyword(sqlText, &pos, "CREATE") {
+		return nil
+	}
+	_ = consumeKeyword(sqlText, &pos, "TEMPORARY")
+	_ = consumeKeyword(sqlText, &pos, "TEMP")
+	if !consumeKeyword(sqlText, &pos, "TABLE") {
+		return nil
+	}
+	if consumeKeyword(sqlText, &pos, "IF") {
+		if !consumeKeyword(sqlText, &pos, "NOT") || !consumeKeyword(sqlText, &pos, "EXISTS") {
+			return nil
+		}
+	}
+	if _, next, ok := readSQLQualifiedName(sqlText, pos); ok {
+		pos = next
+	}
+	bodyStart := skipSQLSpaces(sqlText, pos)
+	bodyEnd, ok := parenthesizedSQLSpan(sqlText, bodyStart)
+	if !ok {
+		return nil
+	}
+	metadata := []mysqlColumnMetadata{}
+	for _, item := range splitSQLTopLevelList(sqlText[bodyStart+1 : bodyEnd-1]) {
+		item = strings.TrimSpace(item)
+		columnName, pos, ok := readSQLNameToken(item, 0)
+		if !ok || isCreateTableConstraintItem(columnName) {
+			continue
+		}
+		if width := mysqlZeroFillWidth(item[pos:]); width > 0 {
+			metadata = append(metadata, mysqlColumnMetadata{
+				TableName:     tableName,
+				ColumnName:    unquoteSQLWord(columnName),
+				ZeroFillWidth: width,
+			})
+		}
+	}
+	return metadata
+}
+
+func isCreateTableConstraintItem(firstToken string) bool {
+	switch strings.ToUpper(unquoteSQLWord(firstToken)) {
+	case "PRIMARY", "UNIQUE", "KEY", "INDEX", "CONSTRAINT", "FOREIGN", "CHECK", "FULLTEXT", "SPATIAL":
+		return true
+	default:
+		return false
+	}
+}
+
 func parseCreateIndexMetadata(sqlText string) (mysqlIndexMetadata, bool) {
-	pos := 0
+	pos := skipSQLSpaces(sqlText, 0)
 	if !consumeKeyword(sqlText, &pos, "CREATE") {
 		return mysqlIndexMetadata{}, false
 	}
@@ -297,7 +397,7 @@ func parseCreateIndexMetadata(sqlText string) (mysqlIndexMetadata, bool) {
 }
 
 func parseAlterTableAddIndexMetadata(sqlText string) (mysqlIndexMetadata, bool) {
-	pos := 0
+	pos := skipSQLSpaces(sqlText, 0)
 	if !consumeKeyword(sqlText, &pos, "ALTER") || !consumeKeyword(sqlText, &pos, "TABLE") {
 		return mysqlIndexMetadata{}, false
 	}
@@ -333,7 +433,7 @@ func parseAlterTableAddIndexMetadata(sqlText string) (mysqlIndexMetadata, bool) 
 }
 
 func parseCreateTableIndexMetadata(sqlText string) []mysqlIndexMetadata {
-	pos := 0
+	pos := skipSQLSpaces(sqlText, 0)
 	if !consumeKeyword(sqlText, &pos, "CREATE") {
 		return nil
 	}

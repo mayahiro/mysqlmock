@@ -45,6 +45,9 @@ func TestConfigSchemaJSON(t *testing.T) {
 	if compatProperties["allow_zero_dates"] == nil {
 		t.Fatal("schema did not include compat.allow_zero_dates")
 	}
+	if compatProperties["implicit_defaults"] == nil {
+		t.Fatal("schema did not include compat.implicit_defaults")
+	}
 	writeValidation := compatProperties["write_validation"].(map[string]any)
 	writeValidationEnum := writeValidation["enum"].([]any)
 	for _, want := range []string{"strict", "basic", "off"} {

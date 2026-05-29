@@ -1465,6 +1465,7 @@ database:
 compat:
   profile: gorm
   allow_zero_dates: true
+  implicit_defaults: true
   write_validation: basic
   variables:
     lower_case_table_names: "1"
@@ -1482,6 +1483,9 @@ compat:
 	}
 	if !cfg.Compat.AllowZeroDates {
 		t.Fatal("compat allow_zero_dates = false, want true")
+	}
+	if !cfg.Compat.ImplicitDefaults {
+		t.Fatal("compat implicit_defaults = false, want true")
 	}
 	if cfg.Compat.WriteValidation != "basic" {
 		t.Fatalf("compat write_validation = %q, want basic", cfg.Compat.WriteValidation)
@@ -1648,6 +1652,126 @@ CREATE TABLE mysql_style_users (
 	if name != "Alice" || quantity != 0 {
 		t.Fatalf("mysql style row = name:%q quantity:%d, want Alice/0", name, quantity)
 	}
+}
+
+func TestSchemaPreservesExplicitDefaultsAndLegacyImplicitDefaults(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cfg := mysqlmock.DefaultConfig()
+	cfg.Compat.ImplicitDefaults = true
+	cfg.Compat.AllowZeroDates = true
+	cfg.Schema = []string{`
+CREATE TABLE legacy_defaults (
+  id INTEGER PRIMARY KEY AUTO_INCREMENT,
+  explicit_int INT NOT NULL DEFAULT 999,
+  explicit_empty VARCHAR(16) NOT NULL DEFAULT '',
+  explicit_zero INT NOT NULL DEFAULT 0,
+  implicit_int INT NOT NULL,
+  implicit_text VARCHAR(16) NOT NULL,
+  implicit_date DATE NOT NULL,
+  implicit_datetime DATETIME NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+`}
+	server := mysqlmock.Start(t, mysqlmock.WithConfig(cfg))
+	db, err := sql.Open("mysql", server.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO legacy_defaults (explicit_int, explicit_empty, explicit_zero)
+VALUES (DEFAULT, DEFAULT, DEFAULT)
+`); err != nil {
+		t.Fatalf("insert explicit defaults with implicit omitted columns: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `
+INSERT INTO legacy_defaults (implicit_int, implicit_text, implicit_date, implicit_datetime)
+VALUES (?, ?, ?, ?)
+`, nil, nil, nil, nil); err != nil {
+		t.Fatalf("insert implicit defaults for NULL values: %v", err)
+	}
+
+	rows, err := db.QueryContext(ctx, `
+SELECT
+  explicit_int,
+  explicit_empty,
+  explicit_zero,
+  implicit_int,
+  implicit_text,
+  CAST(implicit_date AS TEXT),
+  CAST(implicit_datetime AS TEXT)
+FROM legacy_defaults
+ORDER BY id`)
+	if err != nil {
+		t.Fatalf("select legacy defaults: %v", err)
+	}
+	defer rows.Close()
+
+	type defaultRow struct {
+		explicitInt      int
+		explicitEmpty    string
+		explicitZero     int
+		implicitInt      int
+		implicitText     string
+		implicitDate     string
+		implicitDateTime string
+	}
+	got := []defaultRow{}
+	for rows.Next() {
+		var row defaultRow
+		if err := rows.Scan(&row.explicitInt, &row.explicitEmpty, &row.explicitZero, &row.implicitInt, &row.implicitText, &row.implicitDate, &row.implicitDateTime); err != nil {
+			t.Fatalf("scan legacy defaults: %v", err)
+		}
+		got = append(got, row)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read legacy defaults: %v", err)
+	}
+	want := []defaultRow{
+		{explicitInt: 999, explicitEmpty: "", explicitZero: 0, implicitInt: 0, implicitText: "", implicitDate: "0000-00-00", implicitDateTime: "0000-00-00 00:00:00"},
+		{explicitInt: 999, explicitEmpty: "", explicitZero: 0, implicitInt: 0, implicitText: "", implicitDate: "0000-00-00", implicitDateTime: "0000-00-00 00:00:00"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("legacy defaults = %#v, want %#v", got, want)
+	}
+	mysqlmock.AssertNoUnsupported(t, server)
+}
+
+func TestSchemaAppliesPartitionAndZerofillDDL(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cfg := mysqlmock.DefaultConfig()
+	cfg.Schema = []string{`
+CREATE TABLE partitioned_zerofill_values (
+  id INTEGER NOT NULL AUTO_INCREMENT,
+  zero_padding INT(5) ZEROFILL NOT NULL DEFAULT 0,
+  PRIMARY KEY (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+PARTITION BY HASH(id) PARTITIONS 4;
+`}
+	server := mysqlmock.Start(t, mysqlmock.WithConfig(cfg))
+	db, err := sql.Open("mysql", server.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	if _, err := db.ExecContext(ctx, "INSERT INTO partitioned_zerofill_values (zero_padding) VALUES (?)", 42); err != nil {
+		t.Fatalf("insert partitioned zerofill row: %v", err)
+	}
+	var zeroPadding string
+	if err := db.QueryRowContext(ctx, "SELECT zero_padding FROM partitioned_zerofill_values WHERE id = ?", 1).Scan(&zeroPadding); err != nil {
+		t.Fatalf("select zerofill value: %v", err)
+	}
+	if zeroPadding != "00042" {
+		t.Fatalf("zero_padding = %q, want 00042", zeroPadding)
+	}
+	mysqlmock.AssertNoUnsupported(t, server)
 }
 
 func TestSchemaAppliesMySQLIndexDDL(t *testing.T) {

@@ -494,6 +494,38 @@ ALTER TABLE ` + "`users`" + ` ADD KEY ` + "`idx_users_email`" + ` (` + "`email`"
 	}
 }
 
+func TestParseMySQLColumnMetadataZerofill(t *testing.T) {
+	metadata := parseMySQLColumnMetadata(`
+CREATE TABLE partitioned_zerofill_values (
+  id INTEGER NOT NULL AUTO_INCREMENT,
+  zero_padding INT(5) ZEROFILL NOT NULL DEFAULT 0,
+  PRIMARY KEY (id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+PARTITION BY HASH(id) PARTITIONS 4;
+`)
+	if len(metadata) != 1 {
+		t.Fatalf("metadata length = %d, want 1: %#v", len(metadata), metadata)
+	}
+	if metadata[0].TableName != "partitioned_zerofill_values" || metadata[0].ColumnName != "zero_padding" || metadata[0].ZeroFillWidth != 5 {
+		t.Fatalf("metadata = %#v, want zero_padding width 5", metadata[0])
+	}
+
+	tableName, ok := parseSimpleSelectTableName("SELECT zero_padding FROM partitioned_zerofill_values WHERE id = ?")
+	if !ok || tableName != "partitioned_zerofill_values" {
+		t.Fatalf("parse simple select table = %q/%v, want partitioned_zerofill_values/true", tableName, ok)
+	}
+	if !isSelectAllItem("`partitioned_zerofill_values`.*") {
+		t.Fatal("qualified select-all item was not recognized")
+	}
+	columnName, ok := selectItemColumnName("`partitioned_zerofill_values`.`zero_padding` AS `zp`")
+	if !ok || columnName != "zero_padding" {
+		t.Fatalf("select item column = %q/%v, want zero_padding/true", columnName, ok)
+	}
+	if columnName, ok := selectItemColumnName("COUNT(*) AS `zero_padding`"); ok {
+		t.Fatalf("select item expression column = %q/%v, want unsupported expression", columnName, ok)
+	}
+}
+
 func TestPreparedStatementsWithGoSQLDriverOverPipe(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

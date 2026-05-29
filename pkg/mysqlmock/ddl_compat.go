@@ -14,6 +14,7 @@ func (c *mysqlConn) execMySQLDDLCompatibility(ctx context.Context, sqlText strin
 		resp, err := c.execSQLite(ctx, fmt.Sprintf("ALTER TABLE %s RENAME TO %s", quoteIdent(oldName), quoteIdent(newName)))
 		if err == nil {
 			c.server.renameMySQLTableIndexMetadata(oldName, newName)
+			c.server.renameMySQLTableColumnMetadata(oldName, newName)
 			c.server.renameMySQLTableDDL(oldName, newName)
 			c.server.invalidateMySQLTableDDL(newName)
 		}

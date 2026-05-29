@@ -107,8 +107,9 @@ type mysqlConn struct {
 }
 
 type resultColumn struct {
-	Name string
-	Type byte
+	Name          string
+	Type          byte
+	ZeroFillWidth int
 }
 
 type resultSet struct {
@@ -786,10 +787,18 @@ func (c *mysqlConn) querySQLite(ctx context.Context, query string, args ...any) 
 	}
 	columnTypes, _ := rows.ColumnTypes()
 	columns := make([]resultColumn, len(names))
+	zeroFillWidths := c.resultZeroFillWidths(query, names)
 	for i, name := range names {
 		columns[i] = resultColumn{Name: name, Type: fieldTypeVarString}
 		if i < len(columnTypes) {
 			columns[i].Type = mysqlFieldType(columnTypes[i])
+			columns[i].ZeroFillWidth = mysqlZeroFillWidth(columnTypes[i].DatabaseTypeName())
+		}
+		if i < len(zeroFillWidths) && zeroFillWidths[i] > columns[i].ZeroFillWidth {
+			columns[i].ZeroFillWidth = zeroFillWidths[i]
+		}
+		if columns[i].ZeroFillWidth > 0 {
+			columns[i].Type = fieldTypeVarString
 		}
 	}
 
@@ -804,6 +813,12 @@ func (c *mysqlConn) querySQLite(ctx context.Context, query string, args ...any) 
 			return resultSet{}, err
 		}
 		for i, value := range values {
+			if columns[i].ZeroFillWidth > 0 {
+				if value != nil {
+					values[i] = textValueForColumn(value, columns[i])
+				}
+				continue
+			}
 			if columns[i].Type == fieldTypeVarString {
 				columns[i].Type = fieldTypeFromValue(value)
 			}
@@ -832,7 +847,7 @@ func (c *mysqlConn) writeResultSet(seq byte, rs resultSet) error {
 	}
 	seq++
 	for _, row := range rs.Rows {
-		if err := c.writePacket(seq, textRow(row)); err != nil {
+		if err := c.writePacket(seq, textRow(rs.Columns, row)); err != nil {
 			return err
 		}
 		seq++
@@ -964,16 +979,36 @@ func columnDefinition(schema string, col resultColumn) []byte {
 	return payload
 }
 
-func textRow(values []any) []byte {
+func textRow(columns []resultColumn, values []any) []byte {
 	payload := make([]byte, 0, len(values)*8)
-	for _, value := range values {
+	for i, value := range values {
 		if value == nil {
 			payload = append(payload, 0xfb)
 			continue
 		}
-		payload = appendLenEncString(payload, textValue(value))
+		var column resultColumn
+		if i < len(columns) {
+			column = columns[i]
+		}
+		payload = appendLenEncString(payload, textValueForColumn(value, column))
 	}
 	return payload
+}
+
+func textValueForColumn(value any, column resultColumn) string {
+	if column.ZeroFillWidth <= 0 {
+		return textValue(value)
+	}
+	text := textValue(value)
+	if len(text) >= column.ZeroFillWidth || strings.HasPrefix(text, "-") {
+		return text
+	}
+	for i := 0; i < len(text); i++ {
+		if text[i] < '0' || text[i] > '9' {
+			return text
+		}
+	}
+	return strings.Repeat("0", column.ZeroFillWidth-len(text)) + text
 }
 
 func textValue(value any) string {
@@ -1025,6 +1060,206 @@ func fieldTypeFromValue(value any) byte {
 	default:
 		return fieldTypeVarString
 	}
+}
+
+func mysqlZeroFillWidth(databaseTypeName string) int {
+	upper := strings.ToUpper(strings.TrimSpace(databaseTypeName))
+	if !strings.Contains(upper, "ZEROFILL") {
+		return 0
+	}
+	open := strings.IndexByte(upper, '(')
+	if open < 0 {
+		return 0
+	}
+	close := strings.IndexByte(upper[open+1:], ')')
+	if close < 0 {
+		return 0
+	}
+	width, err := parseInt64String(upper[open+1 : open+1+close])
+	if err != nil || width <= 0 {
+		return 0
+	}
+	return int(width)
+}
+
+func (c *mysqlConn) resultZeroFillWidths(query string, names []string) []int {
+	widths := make([]int, len(names))
+	tableName, selectItems, ok := parseSimpleSelectSource(query)
+	if !ok {
+		return widths
+	}
+	if len(selectItems) == 1 && isSelectAllItem(selectItems[0]) {
+		for i, name := range names {
+			if metadata, ok := c.server.lookupMySQLColumnMetadata(tableName, name); ok {
+				widths[i] = metadata.ZeroFillWidth
+			}
+		}
+		return widths
+	}
+	if len(selectItems) != len(names) {
+		return widths
+	}
+	for i, item := range selectItems {
+		columnName, ok := selectItemColumnName(item)
+		if !ok {
+			continue
+		}
+		if metadata, ok := c.server.lookupMySQLColumnMetadata(tableName, columnName); ok {
+			widths[i] = metadata.ZeroFillWidth
+		}
+	}
+	return widths
+}
+
+func parseSimpleSelectTableName(sqlText string) (string, bool) {
+	tableName, _, ok := parseSimpleSelectSource(sqlText)
+	return tableName, ok
+}
+
+func parseSimpleSelectSource(sqlText string) (string, []string, bool) {
+	pos := 0
+	if !consumeKeyword(sqlText, &pos, "SELECT") {
+		return "", nil, false
+	}
+	fromPos, ok := findTopLevelSQLKeyword(sqlText, pos, "FROM")
+	if !ok {
+		return "", nil, false
+	}
+	selectItems := splitSQLTopLevelList(sqlText[pos:fromPos])
+	pos = fromPos
+	if !consumeKeyword(sqlText, &pos, "FROM") {
+		return "", nil, false
+	}
+	pos = skipSQLSpaces(sqlText, pos)
+	if pos >= len(sqlText) || sqlText[pos] == '(' {
+		return "", nil, false
+	}
+	tableName, pos, ok := readSQLQualifiedName(sqlText, pos)
+	if !ok {
+		return "", nil, false
+	}
+	if hasAdditionalTopLevelSelectSource(sqlText[pos:]) {
+		return "", nil, false
+	}
+	return tableName, selectItems, true
+}
+
+func isSelectAllItem(item string) bool {
+	item = strings.TrimSpace(item)
+	if item == "*" {
+		return true
+	}
+	if strings.HasSuffix(item, ".*") {
+		prefix := strings.TrimSpace(strings.TrimSuffix(item, ".*"))
+		_, pos, ok := readSQLQualifiedName(prefix, 0)
+		return ok && skipSQLSpaces(prefix, pos) == len(prefix)
+	}
+	return false
+}
+
+func selectItemColumnName(item string) (string, bool) {
+	columnName, pos, ok := readSQLQualifiedName(item, 0)
+	if !ok {
+		return "", false
+	}
+	pos = skipSQLSpaces(item, pos)
+	if pos == len(item) {
+		return columnName, true
+	}
+	if consumeKeyword(item, &pos, "AS") {
+		_, pos, ok = readSQLNameToken(item, pos)
+		if !ok {
+			return "", false
+		}
+		return columnName, skipSQLSpaces(item, pos) == len(item)
+	}
+	if _, pos, ok = readSQLNameToken(item, pos); ok {
+		return columnName, skipSQLSpaces(item, pos) == len(item)
+	}
+	return "", false
+}
+
+func findTopLevelSQLKeyword(sqlText string, pos int, keyword string) (int, bool) {
+	depth := 0
+	for i := pos; i < len(sqlText); {
+		if end, ok := quotedSQLSpan(sqlText, i); ok {
+			i = end
+			continue
+		}
+		if end, ok := sqlCommentSpan(sqlText, i); ok {
+			i = end
+			continue
+		}
+		switch sqlText[i] {
+		case '(':
+			depth++
+			i++
+			continue
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+			i++
+			continue
+		}
+		word, end, ok := readSQLIdentifier(sqlText, i)
+		if !ok {
+			i++
+			continue
+		}
+		if depth == 0 && strings.EqualFold(word, keyword) {
+			return i, true
+		}
+		i = end
+	}
+	return 0, false
+}
+
+func hasAdditionalTopLevelSelectSource(sqlText string) bool {
+	depth := 0
+	for i := 0; i < len(sqlText); {
+		if end, ok := quotedSQLSpan(sqlText, i); ok {
+			i = end
+			continue
+		}
+		if end, ok := sqlCommentSpan(sqlText, i); ok {
+			i = end
+			continue
+		}
+		switch sqlText[i] {
+		case '(':
+			depth++
+			i++
+			continue
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+			i++
+			continue
+		case ',':
+			if depth == 0 {
+				return true
+			}
+			i++
+			continue
+		}
+		word, end, ok := readSQLIdentifier(sqlText, i)
+		if !ok {
+			i++
+			continue
+		}
+		if depth == 0 {
+			switch strings.ToUpper(word) {
+			case "JOIN":
+				return true
+			case "WHERE", "GROUP", "HAVING", "ORDER", "LIMIT", "OFFSET", "FOR", "LOCK":
+				return false
+			}
+		}
+		i = end
+	}
+	return false
 }
 
 func appendUint16(buf []byte, n uint16) []byte {
@@ -1235,6 +1470,10 @@ func translateSQL(sqlText string) string {
 					out.WriteString(ident)
 				}
 			case "UNSIGNED":
+				if !stripDDLMode {
+					out.WriteString(ident)
+				}
+			case "ZEROFILL":
 				if !stripDDLMode {
 					out.WriteString(ident)
 				}

@@ -95,14 +95,15 @@ type Server struct {
 	preparedMu        sync.Mutex
 	metadataMu        sync.Mutex
 
-	mu            sync.Mutex
-	unsupported   []UnsupportedQuery
-	queries       []QueryEvent
-	ruleOnceUsed  map[int]bool
-	advisoryLocks map[string]uint32
-	indexMetadata map[string]mysqlIndexMetadata
-	tableDDL      map[string]string
-	translation   sqlTranslationCache
+	mu             sync.Mutex
+	unsupported    []UnsupportedQuery
+	queries        []QueryEvent
+	ruleOnceUsed   map[int]bool
+	advisoryLocks  map[string]uint32
+	indexMetadata  map[string]mysqlIndexMetadata
+	columnMetadata map[string]mysqlColumnMetadata
+	tableDDL       map[string]string
+	translation    sqlTranslationCache
 
 	preparedSchema []preparedSchemaStatement
 	preparedSeed   []map[string][]map[string]any
@@ -172,15 +173,16 @@ func New(opts ...Option) (*Server, error) {
 	}
 
 	s := &Server{
-		cfg:           cfg,
-		done:          make(chan struct{}),
-		logWriter:     options.logWriter,
-		logFormat:     logFormat,
-		advisoryLocks: map[string]uint32{},
-		indexMetadata: map[string]mysqlIndexMetadata{},
-		tableDDL:      map[string]string{},
-		tableColumns:  map[string]cachedTableColumns{},
-		uniqueKeys:    map[string]cachedUniqueKeys{},
+		cfg:            cfg,
+		done:           make(chan struct{}),
+		logWriter:      options.logWriter,
+		logFormat:      logFormat,
+		advisoryLocks:  map[string]uint32{},
+		indexMetadata:  map[string]mysqlIndexMetadata{},
+		columnMetadata: map[string]mysqlColumnMetadata{},
+		tableDDL:       map[string]string{},
+		tableColumns:   map[string]cachedTableColumns{},
+		uniqueKeys:     map[string]cachedUniqueKeys{},
 	}
 	s.nextConnectionID.Store(cfg.Server.ConnectionIDStart)
 	return s, nil
@@ -556,6 +558,7 @@ func (s *Server) applyPreparedSchemaStatement(ctx context.Context, conn *sql.Con
 		}
 	}
 	s.recordMySQLIndexMetadata(stmt.Original)
+	s.recordMySQLColumnMetadata(stmt.Original)
 	s.recordMySQLTableDDL(stmt.Original)
 	return nil
 }

@@ -101,7 +101,8 @@ func (c *mysqlConn) execMySQLUpsert(ctx context.Context, sqlText string, args ..
 		if err != nil {
 			return okResult{}, true, err
 		}
-		result, err := c.execSQLite(ctx, buildSQLiteInsert(stmt.TableName, stmt.Columns), values...)
+		insertColumns, insertValues := c.applyImplicitDefaultInsertValues(tableColumns, stmt.Columns, values)
+		result, err := c.execSQLite(ctx, buildSQLiteInsert(stmt.TableName, insertColumns), insertValues...)
 		if err == nil {
 			affected++
 			if result.LastInsertID != 0 && lastInsertID == 0 {
@@ -113,7 +114,7 @@ func (c *mysqlConn) execMySQLUpsert(ctx context.Context, sqlText string, args ..
 			return okResult{}, true, err
 		}
 
-		rowID, err := c.findConflictRowID(ctx, stmt.TableName, stmt.Columns, values)
+		rowID, err := c.findConflictRowID(ctx, stmt.TableName, insertColumns, insertValues)
 		if err != nil {
 			return okResult{}, true, err
 		}
@@ -121,7 +122,7 @@ func (c *mysqlConn) execMySQLUpsert(ctx context.Context, sqlText string, args ..
 		if err != nil {
 			return okResult{}, true, err
 		}
-		updateSQL, updateArgs, err := buildSQLiteUpsertUpdate(stmt.TableName, stmt.Columns, values, stmt.ValueAlias, stmt.UpdateSQL, stmt.UpdateArgs, rowID)
+		updateSQL, updateArgs, err := buildSQLiteUpsertUpdate(stmt.TableName, insertColumns, insertValues, stmt.ValueAlias, stmt.UpdateSQL, stmt.UpdateArgs, rowID)
 		if err != nil {
 			return okResult{}, true, err
 		}
@@ -148,9 +149,6 @@ func (c *mysqlConn) execMySQLInsertCompatibility(ctx context.Context, sqlText st
 	if err != nil || !ok {
 		return okResult{}, ok, err
 	}
-	if !stmt.Ignore && !stmt.Replace {
-		return okResult{}, false, nil
-	}
 	if len(stmt.Columns) == 0 {
 		columns, err := c.insertColumns(ctx, stmt.TableName)
 		if err != nil {
@@ -162,11 +160,38 @@ func (c *mysqlConn) execMySQLInsertCompatibility(ctx context.Context, sqlText st
 	if err != nil {
 		return okResult{}, true, err
 	}
+	if !stmt.Ignore && !stmt.Replace {
+		if c.server.cfg.Compat.ImplicitDefaults || insertStatementUsesDefaultValues(stmt) {
+			return c.execMySQLPlainInsert(ctx, stmt, tableColumns)
+		}
+		return okResult{}, false, nil
+	}
 
 	if stmt.Ignore {
 		return c.execMySQLInsertIgnore(ctx, stmt, tableColumns)
 	}
 	return c.execMySQLReplace(ctx, stmt, tableColumns)
+}
+
+func (c *mysqlConn) execMySQLPlainInsert(ctx context.Context, stmt mysqlInsertStatement, tableColumns []sqliteTableColumn) (okResult, bool, error) {
+	var affected uint64
+	var lastInsertID uint64
+	for _, row := range stmt.Rows {
+		values, err := c.evaluateUpsertRow(ctx, stmt.TableName, stmt.Columns, tableColumns, row)
+		if err != nil {
+			return okResult{}, true, err
+		}
+		insertColumns, insertValues := c.applyImplicitDefaultInsertValues(tableColumns, stmt.Columns, values)
+		result, err := c.execSQLite(ctx, buildSQLiteInsert(stmt.TableName, insertColumns), insertValues...)
+		if err != nil {
+			return okResult{}, true, err
+		}
+		affected++
+		if result.LastInsertID != 0 && lastInsertID == 0 {
+			lastInsertID = result.LastInsertID
+		}
+	}
+	return okResult{AffectedRows: affected, LastInsertID: lastInsertID}, true, nil
 }
 
 func (c *mysqlConn) execMySQLInsertIgnore(ctx context.Context, stmt mysqlInsertStatement, tableColumns []sqliteTableColumn) (okResult, bool, error) {
@@ -178,7 +203,8 @@ func (c *mysqlConn) execMySQLInsertIgnore(ctx context.Context, stmt mysqlInsertS
 		if err != nil {
 			return okResult{}, true, err
 		}
-		result, err := c.execSQLite(ctx, buildSQLiteInsert(stmt.TableName, stmt.Columns), values...)
+		insertColumns, insertValues := c.applyImplicitDefaultInsertValues(tableColumns, stmt.Columns, values)
+		result, err := c.execSQLite(ctx, buildSQLiteInsert(stmt.TableName, insertColumns), insertValues...)
 		if err == nil {
 			affected++
 			if result.LastInsertID != 0 && lastInsertID == 0 {
@@ -202,7 +228,8 @@ func (c *mysqlConn) execMySQLReplace(ctx context.Context, stmt mysqlInsertStatem
 		if err != nil {
 			return okResult{}, true, err
 		}
-		rowIDs, err := c.findConflictRowIDs(ctx, stmt.TableName, stmt.Columns, values)
+		insertColumns, insertValues := c.applyImplicitDefaultInsertValues(tableColumns, stmt.Columns, values)
+		rowIDs, err := c.findConflictRowIDs(ctx, stmt.TableName, insertColumns, insertValues)
 		if err != nil {
 			return okResult{}, true, err
 		}
@@ -212,7 +239,7 @@ func (c *mysqlConn) execMySQLReplace(ctx context.Context, stmt mysqlInsertStatem
 			}
 			affected++
 		}
-		result, err := c.execSQLite(ctx, buildSQLiteInsert(stmt.TableName, stmt.Columns), values...)
+		result, err := c.execSQLite(ctx, buildSQLiteInsert(stmt.TableName, insertColumns), insertValues...)
 		if err != nil {
 			return okResult{}, true, err
 		}
@@ -615,6 +642,51 @@ func (c *mysqlConn) evaluateUpsertRow(ctx context.Context, tableName string, col
 	return rs.Rows[0], nil
 }
 
+func (c *mysqlConn) applyImplicitDefaultInsertValues(tableColumns []sqliteTableColumn, columns []string, values []any) ([]string, []any) {
+	if !c.server.cfg.Compat.ImplicitDefaults {
+		return columns, values
+	}
+	outColumns := append([]string(nil), columns...)
+	outValues := append([]any(nil), values...)
+	seen := make(map[string]int, len(columns))
+	for i, column := range columns {
+		key := strings.ToLower(unquoteSQLWord(column))
+		seen[key] = i
+		if i >= len(outValues) || outValues[i] != nil {
+			continue
+		}
+		tableColumn, ok := findSQLiteTableColumn(tableColumns, column)
+		if !ok || !needsMySQLImplicitDefault(tableColumn) {
+			continue
+		}
+		if implicit, ok := mysqlImplicitDefaultValue(tableColumn); ok {
+			outValues[i] = implicit
+		}
+	}
+	for _, tableColumn := range tableColumns {
+		key := strings.ToLower(tableColumn.Name)
+		if _, ok := seen[key]; ok || !needsMySQLImplicitDefault(tableColumn) {
+			continue
+		}
+		if implicit, ok := mysqlImplicitDefaultValue(tableColumn); ok {
+			outColumns = append(outColumns, tableColumn.Name)
+			outValues = append(outValues, implicit)
+		}
+	}
+	return outColumns, outValues
+}
+
+func insertStatementUsesDefaultValues(stmt mysqlInsertStatement) bool {
+	for _, row := range stmt.Rows {
+		for _, expr := range row.Exprs {
+			if isBareDefaultExpr(expr) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func isBareDefaultExpr(expr string) bool {
 	pos := skipSQLSpaces(expr, 0)
 	word, next, ok := readSQLIdentifier(expr, pos)
@@ -646,7 +718,37 @@ func (c *mysqlConn) defaultColumnValue(ctx context.Context, tableName, columnNam
 	if !column.NotNull {
 		return nil, nil
 	}
+	if c.server.cfg.Compat.ImplicitDefaults {
+		if implicit, ok := mysqlImplicitDefaultValue(column); ok {
+			return implicit, nil
+		}
+	}
 	return nil, errPacket(mysqlErrUnknown, "HY000", fmt.Sprintf("Field '%s' doesn't have a default value", unquoteSQLWord(columnName)))
+}
+
+func needsMySQLImplicitDefault(column sqliteTableColumn) bool {
+	return column.NotNull && !column.HasDefault && column.PK == 0
+}
+
+func mysqlImplicitDefaultValue(column sqliteTableColumn) (any, bool) {
+	upper := strings.ToUpper(strings.TrimSpace(column.Type))
+	switch {
+	case strings.Contains(upper, "INT"), strings.Contains(upper, "BOOL"), strings.Contains(upper, "BIT"):
+		return int64(0), true
+	case strings.Contains(upper, "DECIMAL"), strings.Contains(upper, "NUMERIC"), strings.Contains(upper, "REAL"),
+		strings.Contains(upper, "DOUBLE"), strings.Contains(upper, "FLOAT"):
+		return float64(0), true
+	case strings.Contains(upper, "DATETIME"), strings.Contains(upper, "TIMESTAMP"):
+		return "0000-00-00 00:00:00", true
+	case strings.Contains(upper, "DATE"):
+		return "0000-00-00", true
+	case strings.Contains(upper, "TIME"):
+		return "00:00:00", true
+	case strings.Contains(upper, "BLOB"):
+		return []byte{}, true
+	default:
+		return "", true
+	}
 }
 
 func findSQLiteTableColumn(columns []sqliteTableColumn, name string) (sqliteTableColumn, bool) {

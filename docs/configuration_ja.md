@@ -50,6 +50,7 @@ database:
 | `database.shared` | `true` |
 | `compat.profile` | `default` |
 | `compat.allow_zero_dates` | `false` |
+| `compat.implicit_defaults` | `false` |
 | `compat.write_validation` | `strict` |
 | `fallback.type` | `sqlite` |
 | `fallback.unsupported.type` | `error` |
@@ -188,6 +189,7 @@ mysqlmock が seed insert statement を組み立てるとき、table name と co
 compat:
   profile: gorm
   allow_zero_dates: false
+  implicit_defaults: false
   write_validation: strict
   variables:
     lower_case_table_names: "1"
@@ -226,6 +228,10 @@ compat:
 `allow_zero_dates: true` は write validation で `'0000-00-00'` や `'0001-00-00 00:00:00'` のような zero date part を許容します
 default は MySQL 8.0 の default strict SQL mode に寄せるため `false` です
 
+`implicit_defaults: true` は、明示 default を持たない `NOT NULL` column に対して非 strict MySQL の implicit default を再現します
+numeric column は `0`、date/datetime column は対応する zero date value、string column は空文字を使います
+default は `false` です
+
 `write_validation` は write-path の compatibility check を制御します
 
 - `strict` は MySQL-like value pre-validation と SQLite error mapping を維持します
@@ -256,6 +262,7 @@ ORM や repository query でよく使う scalar function/operator として `CHA
 `RAND(seed)` は同じ seed に対して deterministic ですが、MySQL の per-statement random sequence behavior までは再現しません
 SQLite fallback は MySQL string literal の backslash escape、明示的な `ESCAPE` 句がない `LIKE` pattern の MySQL default backslash escape、`UPDATE ... SET table.column = ...` target の table qualifier 除去も扱います
 `DROP DATABASE` と `DROP SCHEMA` は teardown 用の no-op statement として受け付けます
+`CREATE TABLE` statement では、MySQL partition clause を SQLite 実行前に strip し、`ZEROFILL` が付いた declared integer column の単純な result-set value に display width padding を適用します
 
 MySQL-compatible DDL で index を作成した場合、mysqlmock は軽量な index metadata も保持し、ORM schema introspection が使う `SHOW KEYS` の prefix length、expression、visibility fields を返します
 
