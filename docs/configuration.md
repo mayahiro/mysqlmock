@@ -264,6 +264,10 @@ ORM and repository queries, including `RAND`, `FIND_IN_SET`, `FIELD`, and the
 expression dialect compatibility is not guaranteed. `RAND(seed)` is
 deterministic for equal seeds but does not reproduce MySQL's full per-statement
 random sequence behavior.
+The fallback also translates MySQL backslash escapes in string literals, adds
+MySQL's default backslash escape behavior for `LIKE` patterns when no explicit
+`ESCAPE` clause is present, and removes table qualifiers from
+`UPDATE ... SET table.column = ...` targets.
 
 For MySQL-compatible DDL that creates indexes, mysqlmock also keeps lightweight
 index metadata so `SHOW KEYS` can expose prefix length, expression, and

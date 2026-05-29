@@ -1165,6 +1165,8 @@ func translateSQL(sqlText string) string {
 	if stripped, ok := stripMySQLLockingClause(sqlText); ok {
 		sqlText = stripped
 	}
+	sqlText = translateMySQLUpdateSetTargets(sqlText)
+	sqlText = translateMySQLLikeDefaultEscape(sqlText)
 	sqlText = translateMySQLOperators(sqlText)
 	sqlText = translateMySQLFunctionCalls(sqlText)
 
@@ -1283,11 +1285,20 @@ func translateSQL(sqlText string) string {
 		out.WriteByte(sqlText[i])
 		i++
 	}
-	return out.String()
+	return translateMySQLStringLiterals(out.String())
 }
 
 func needsSQLTranslation(sqlText string) bool {
 	if strings.Contains(sqlText, "<=>") {
+		return true
+	}
+	if hasMySQLBackslashEscapedString(sqlText) {
+		return true
+	}
+	if canContainMySQLLikePredicate(sqlText) && hasSQLIdentifier(sqlText, "LIKE") {
+		return true
+	}
+	if hasMySQLQualifiedUpdateSetTarget(sqlText) {
 		return true
 	}
 	if stripsMySQLDDLOptions(sqlText) {

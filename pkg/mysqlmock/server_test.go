@@ -237,6 +237,76 @@ func TestSelectVersionAlias(t *testing.T) {
 	}
 }
 
+func TestMySQLStringLiteralLikeAndQualifiedUpdateCompatibility(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cfg := mysqlmock.DefaultConfig()
+	cfg.Schema = []string{`
+CREATE TABLE search_items (
+  id INTEGER PRIMARY KEY AUTO_INCREMENT,
+  name TEXT NOT NULL,
+  payload TEXT NULL
+);`}
+	server := mysqlmock.Start(t, mysqlmock.WithConfig(cfg))
+
+	db, err := sql.Open("mysql", server.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	if _, err := db.ExecContext(ctx, `INSERT INTO search_items (name, payload) VALUES ('Bob\'s 100% ready', '{\"Company\":\"Acme\"}')`); err != nil {
+		t.Fatalf("insert MySQL escaped string literal: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO search_items (name, payload) VALUES ('100X ready', NULL)`); err != nil {
+		t.Fatalf("insert comparison row: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO search_items (name, payload) VALUES ('under_score', NULL)`); err != nil {
+		t.Fatalf("insert underscore row: %v", err)
+	}
+
+	var payload string
+	if err := db.QueryRowContext(ctx, "SELECT payload FROM search_items WHERE id = 1").Scan(&payload); err != nil {
+		t.Fatalf("select JSON payload: %v", err)
+	}
+	if payload != `{"Company":"Acme"}` {
+		t.Fatalf("payload = %q, want unescaped JSON", payload)
+	}
+
+	var likeCount int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM search_items WHERE name LIKE 'Bob\'s 100\%%'`).Scan(&likeCount); err != nil {
+		t.Fatalf("LIKE with default MySQL backslash escape: %v", err)
+	}
+	if likeCount != 1 {
+		t.Fatalf("LIKE percent count = %d, want 1", likeCount)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM search_items WHERE name LIKE 'under\_score'`).Scan(&likeCount); err != nil {
+		t.Fatalf("LIKE underscore default MySQL backslash escape: %v", err)
+	}
+	if likeCount != 1 {
+		t.Fatalf("LIKE underscore count = %d, want 1", likeCount)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM search_items WHERE name LIKE 'Bob!_s 100!%%' ESCAPE '!'`).Scan(&likeCount); err != nil {
+		t.Fatalf("LIKE with explicit escape: %v", err)
+	}
+	if likeCount != 0 {
+		t.Fatalf("explicit ESCAPE LIKE count = %d, want 0", likeCount)
+	}
+
+	if _, err := db.ExecContext(ctx, `UPDATE search_items SET search_items.name = 'Updated' WHERE search_items.id = 1`); err != nil {
+		t.Fatalf("table-qualified UPDATE SET target: %v", err)
+	}
+	var name string
+	if err := db.QueryRowContext(ctx, "SELECT name FROM search_items WHERE id = 1").Scan(&name); err != nil {
+		t.Fatalf("select updated row: %v", err)
+	}
+	if name != "Updated" {
+		t.Fatalf("updated name = %q, want Updated", name)
+	}
+}
+
 func TestForeignKeyConstraintViolationMapsToMySQLError(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

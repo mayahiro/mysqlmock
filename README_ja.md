@@ -226,6 +226,7 @@ Schema と query fallback は、`TRUE`、`FALSE`、`NOW()`、`CURRENT_TIMESTAMP(
 `AUTO_INCREMENT` column が複合 primary key に含まれる場合、mysqlmock は複合 key を維持して `AUTO_INCREMENT` を削除します。SQLite の自動 rowid 採番は単一の `INTEGER PRIMARY KEY` でのみ使えるため、この key value は insert 時に明示する必要があります
 MySQL-visible index name は table scoped のまま扱い、SQLite 内部では private index name に変換することで SQLite の schema-wide index namespace との衝突を避けます
 ORM query でよく使う scalar function/operator として `IFNULL`、`COALESCE`、`CONCAT`、`CAST`、`DATE_FORMAT`、`JSON_EXTRACT`、`JSON_UNQUOTE`、`RAND`、`FIND_IN_SET`、`FIELD`、`REGEXP` を扱います
+SQLite fallback は、MySQL string literal の backslash escape、`LIKE` pattern の MySQL default backslash escape、一部 ORM が出す `UPDATE ... SET table.column = ...` 形式の target も扱います
 
 SQLite fallback は、`VALUES(column)`、ActiveRecord-style row alias、insert-side `DEFAULT` values を含む一般的な `INSERT ... ON DUPLICATE KEY UPDATE`、`INSERT IGNORE`、`REPLACE INTO` と、`NOWAIT` / `SKIP LOCKED` を含む `FOR UPDATE` locking clause の strip も扱います
 mysqlmock は本物の MySQL row lock は再現しません

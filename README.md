@@ -270,6 +270,9 @@ SQLite index names internally to avoid SQLite's schema-wide index namespace.
 Common scalar functions and operators used by ORM queries include `IFNULL`,
 `COALESCE`, `CONCAT`, `CAST`, `DATE_FORMAT`, `JSON_EXTRACT`, `JSON_UNQUOTE`,
 `RAND`, `FIND_IN_SET`, `FIELD`, and `REGEXP`.
+SQLite fallback also handles MySQL backslash escapes in string literals,
+MySQL's default backslash escape for `LIKE` patterns, and table-qualified
+`UPDATE ... SET table.column = ...` targets emitted by some ORMs.
 
 The SQLite fallback also handles common MySQL repository-test syntax such as
 `INSERT ... ON DUPLICATE KEY UPDATE` with `VALUES(column)`, ActiveRecord-style
