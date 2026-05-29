@@ -9,6 +9,7 @@ import (
 type sqliteResultSet struct {
 	Columns []resultColumn
 	rows    *sql.Rows
+	scan    []any
 }
 
 func (c *mysqlConn) querySQLite(ctx context.Context, query string, args ...any) (resultSet, error) {
@@ -101,10 +102,7 @@ func (rs *sqliteResultSet) nextRow(refineColumnTypes bool) ([]any, bool, error) 
 		return nil, false, rs.rows.Err()
 	}
 	values := make([]any, len(rs.Columns))
-	scan := make([]any, len(rs.Columns))
-	for i := range values {
-		scan[i] = &values[i]
-	}
+	scan := rs.scanDestinations(values)
 	if err := rs.rows.Scan(scan...); err != nil {
 		return nil, false, err
 	}
@@ -120,6 +118,17 @@ func (rs *sqliteResultSet) nextRow(refineColumnTypes bool) ([]any, bool, error) 
 		}
 	}
 	return values, true, nil
+}
+
+func (rs *sqliteResultSet) scanDestinations(values []any) []any {
+	if cap(rs.scan) < len(values) {
+		rs.scan = make([]any, len(values))
+	}
+	scan := rs.scan[:len(values)]
+	for i := range values {
+		scan[i] = &values[i]
+	}
+	return scan
 }
 
 func (rs *sqliteResultSet) Close() error {

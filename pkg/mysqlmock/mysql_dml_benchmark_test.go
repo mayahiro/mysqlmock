@@ -3,9 +3,54 @@ package mysqlmock
 import (
 	"context"
 	"testing"
+	"time"
 )
 
 var benchmarkMySQLDMLResult okResult
+
+func TestMySQLUpsertPlaceholderValuesDoNotMutateArgs(t *testing.T) {
+	ctx := context.Background()
+	conn, cleanup := newMySQLDMLBenchmarkConn(t, ctx)
+	defer cleanup()
+
+	sqlText := `
+INSERT INTO dml_bench_users (email, name, login_count, updated_at)
+VALUES ( ? , ? , ? , ? )
+ON DUPLICATE KEY UPDATE
+  name = VALUES(name),
+  login_count = login_count + VALUES(login_count),
+  updated_at = VALUES(updated_at)
+`
+	args := []any{"existing@example.com", "Updated", 2, "2026-05-28 11:00:00"}
+	result, handled, err := conn.execMySQLUpsert(ctx, sqlText, args...)
+	if err != nil {
+		t.Fatalf("exec ON DUPLICATE KEY UPDATE: %v", err)
+	}
+	if !handled {
+		t.Fatal("ON DUPLICATE KEY UPDATE was not handled")
+	}
+	if result.AffectedRows != 2 {
+		t.Fatalf("affected rows = %d, want 2", result.AffectedRows)
+	}
+	if args[0] != "existing@example.com" || args[1] != "Updated" || args[2] != 2 || args[3] != "2026-05-28 11:00:00" {
+		t.Fatalf("args were mutated: %#v", args)
+	}
+
+	rs, err := conn.querySQLite(ctx, "SELECT name, login_count, updated_at FROM dml_bench_users WHERE email = ?", "existing@example.com")
+	if err != nil {
+		t.Fatalf("select upserted row: %v", err)
+	}
+	if len(rs.Rows) != 1 || len(rs.Rows[0]) != 3 {
+		t.Fatalf("upserted rows = %#v, want one row", rs.Rows)
+	}
+	updatedAt, ok := rs.Rows[0][2].(time.Time)
+	if !ok {
+		t.Fatalf("updated_at = %T(%v), want time.Time", rs.Rows[0][2], rs.Rows[0][2])
+	}
+	if rs.Rows[0][0] != "Updated" || rs.Rows[0][1] != int64(3) || !updatedAt.Equal(time.Date(2026, time.May, 28, 11, 0, 0, 0, time.UTC)) {
+		t.Fatalf("upserted row = %#v, want updated values", rs.Rows[0])
+	}
+}
 
 func BenchmarkMySQLCompatibleDML(b *testing.B) {
 	ctx := context.Background()
@@ -90,7 +135,7 @@ VALUES (?, ?, ?, ?)
 	})
 }
 
-func newMySQLDMLBenchmarkConn(b *testing.B, ctx context.Context) (*mysqlConn, func()) {
+func newMySQLDMLBenchmarkConn(b testing.TB, ctx context.Context) (*mysqlConn, func()) {
 	b.Helper()
 
 	cfg := DefaultConfig()

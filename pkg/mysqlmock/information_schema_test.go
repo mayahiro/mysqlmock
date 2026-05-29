@@ -119,6 +119,34 @@ CREATE TABLE target_users (
 	assertInformationSchemaColumnNames(t, ctx, conn, "target_users", []string{"id", "cached_out"})
 }
 
+func TestRefreshInformationSchemaWorksInsideTransaction(t *testing.T) {
+	ctx := context.Background()
+	conn := newInformationSchemaTestConn(t, ctx)
+
+	if _, err := conn.sqliteConn.ExecContext(ctx, `
+CREATE TABLE target_users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  email TEXT NOT NULL UNIQUE
+);`); err != nil {
+		t.Fatalf("create test table: %v", err)
+	}
+	if _, err := conn.sqliteConn.ExecContext(ctx, "BEGIN"); err != nil {
+		t.Fatalf("begin outer transaction: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = conn.sqliteConn.ExecContext(ctx, "ROLLBACK")
+	})
+
+	if err := conn.refreshInformationSchema(ctx); err != nil {
+		t.Fatalf("refresh full information_schema in transaction: %v", err)
+	}
+	assertInformationSchemaColumnNames(t, ctx, conn, "target_users", []string{"id", "email"})
+
+	if _, err := conn.sqliteConn.ExecContext(ctx, "INSERT INTO target_users (email) VALUES (?)", "tx@example.com"); err != nil {
+		t.Fatalf("outer transaction after information_schema refresh: %v", err)
+	}
+}
+
 func TestExecSQLiteSchemaChangeInvalidatesInformationSchemaCache(t *testing.T) {
 	ctx := context.Background()
 	conn := newInformationSchemaTestConn(t, ctx)
@@ -173,6 +201,71 @@ ORDER BY ORDINAL_POSITION`, "target_users")
 	}
 
 	assertInformationSchemaTableNames(t, ctx, conn, "columns", []string{"target_users"})
+}
+
+func TestExecuteQueryCOMQueryStreamsInformationSchemaResultSet(t *testing.T) {
+	ctx := context.Background()
+	conn := newInformationSchemaTestConn(t, ctx)
+
+	if _, err := conn.sqliteConn.ExecContext(ctx, `
+CREATE TABLE target_users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  email TEXT NOT NULL UNIQUE
+);`); err != nil {
+		t.Fatalf("create test table: %v", err)
+	}
+
+	resp, err := conn.executeQuery(ctx, "COM_QUERY", `
+SELECT COLUMN_NAME
+FROM information_schema.columns
+WHERE table_schema = DATABASE()
+  AND table_name = ?
+ORDER BY ORDINAL_POSITION`, "target_users")
+	if err != nil {
+		t.Fatalf("execute COM_QUERY information_schema: %v", err)
+	}
+	stream, ok := resp.(*sqliteResultSet)
+	if !ok {
+		t.Fatalf("executeQuery() returned %T, want *sqliteResultSet", resp)
+	}
+
+	rs, err := stream.materialize()
+	if err != nil {
+		t.Fatalf("materialize streaming information_schema result: %v", err)
+	}
+	if got, want := resultColumnValues(rs, 0), []any{"id", "email"}; !equalAnySlices(got, want) {
+		t.Fatalf("information_schema.columns result = %#v, want %#v", got, want)
+	}
+}
+
+func TestExecuteQueryPreparedPathKeepsMaterializedInformationSchemaResultSet(t *testing.T) {
+	ctx := context.Background()
+	conn := newInformationSchemaTestConn(t, ctx)
+
+	if _, err := conn.sqliteConn.ExecContext(ctx, `
+CREATE TABLE target_users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  email TEXT NOT NULL UNIQUE
+);`); err != nil {
+		t.Fatalf("create test table: %v", err)
+	}
+
+	resp, err := conn.executeQuery(ctx, "COM_STMT_EXECUTE", `
+SELECT COLUMN_NAME
+FROM information_schema.columns
+WHERE table_schema = DATABASE()
+  AND table_name = ?
+ORDER BY ORDINAL_POSITION`, "target_users")
+	if err != nil {
+		t.Fatalf("execute COM_STMT_EXECUTE information_schema: %v", err)
+	}
+	rs, ok := resp.(resultSet)
+	if !ok {
+		t.Fatalf("executeQuery() returned %T, want resultSet", resp)
+	}
+	if got, want := resultColumnValues(rs, 0), []any{"id", "email"}; !equalAnySlices(got, want) {
+		t.Fatalf("information_schema.columns result = %#v, want %#v", got, want)
+	}
 }
 
 func TestShowFullFieldsAndShowKeysUseTargetTableRefresh(t *testing.T) {
@@ -380,6 +473,61 @@ func BenchmarkInformationSchemaRefresh(b *testing.B) {
 			})
 		})
 	}
+}
+
+func BenchmarkInformationSchemaQuery(b *testing.B) {
+	ctx := context.Background()
+	const tableCount = 100
+	query := `
+SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, COLUMN_TYPE
+FROM information_schema.columns
+ORDER BY TABLE_NAME, ORDINAL_POSITION`
+
+	b.Run("tables_100/com_query_streaming", func(b *testing.B) {
+		conn := newInformationSchemaBenchmarkConn(b, ctx, tableCount)
+		if err := conn.refreshInformationSchema(ctx); err != nil {
+			b.Fatalf("warm information_schema: %v", err)
+		}
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			resp, err := conn.executeQuery(ctx, "COM_QUERY", query)
+			if err != nil {
+				b.Fatalf("query information_schema stream: %v", err)
+			}
+			stream, ok := resp.(*sqliteResultSet)
+			if !ok {
+				b.Fatalf("query information_schema stream returned %T, want *sqliteResultSet", resp)
+			}
+			rows, err := consumeBenchmarkSQLiteResultStream(stream)
+			if err != nil {
+				b.Fatalf("consume information_schema stream: %v", err)
+			}
+			benchmarkInformationSchemaRows = rows
+		}
+	})
+
+	b.Run("tables_100/prepared_materialized", func(b *testing.B) {
+		conn := newInformationSchemaBenchmarkConn(b, ctx, tableCount)
+		if err := conn.refreshInformationSchema(ctx); err != nil {
+			b.Fatalf("warm information_schema: %v", err)
+		}
+
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			resp, err := conn.executeQuery(ctx, "COM_STMT_EXECUTE", query)
+			if err != nil {
+				b.Fatalf("query information_schema materialized: %v", err)
+			}
+			rs, ok := resp.(resultSet)
+			if !ok {
+				b.Fatalf("query information_schema materialized returned %T, want resultSet", resp)
+			}
+			benchmarkInformationSchemaRows = len(rs.Rows)
+		}
+	})
 }
 
 func newInformationSchemaBenchmarkConn(b *testing.B, ctx context.Context, tableCount int) *mysqlConn {

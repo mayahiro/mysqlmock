@@ -63,6 +63,55 @@ func TestQuerySnapshotJSONOmitsVolatileFields(t *testing.T) {
 	}
 }
 
+func TestQuerySnapshotJSONEscapesLikeEncodingJSON(t *testing.T) {
+	got, err := mysqlmock.QuerySnapshotJSON([]mysqlmock.QueryEvent{
+		{
+			Command:       "COM_QUERY",
+			Route:         "sqlite",
+			Database:      "mysqlmock",
+			SQL:           "SELECT '<tag>&value'\n",
+			NormalizedSQL: "SELECT \"<&>\"\u2028",
+		},
+	})
+	if err != nil {
+		t.Fatalf("QuerySnapshotJSON: %v", err)
+	}
+
+	want := `{
+  "queries": [
+    {
+      "command": "COM_QUERY",
+      "route": "sqlite",
+      "database": "mysqlmock",
+      "sql": "SELECT '\u003ctag\u003e\u0026value'\n",
+      "normalized_sql": "SELECT \"\u003c\u0026\u003e\"\u2028"
+    }
+  ]
+}
+`
+	if string(got) != want {
+		t.Fatalf("QuerySnapshotJSON() = %q, want %q", got, want)
+	}
+}
+
+func TestSnapshotJSONEmptyQueriesUseEmptyArray(t *testing.T) {
+	got, err := mysqlmock.QuerySnapshotJSON(nil)
+	if err != nil {
+		t.Fatalf("QuerySnapshotJSON: %v", err)
+	}
+	if string(got) != "{\n  \"queries\": []\n}\n" {
+		t.Fatalf("QuerySnapshotJSON(nil) = %q", got)
+	}
+
+	got, err = mysqlmock.UnsupportedSnapshotJSON(nil)
+	if err != nil {
+		t.Fatalf("UnsupportedSnapshotJSON: %v", err)
+	}
+	if string(got) != "{\n  \"queries\": []\n}\n" {
+		t.Fatalf("UnsupportedSnapshotJSON(nil) = %q", got)
+	}
+}
+
 func TestWriteQuerySnapshot(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "queries.golden.json")
 	if err := mysqlmock.WriteQuerySnapshot(path, []mysqlmock.QueryEvent{{SQL: "SELECT 1"}}); err != nil {

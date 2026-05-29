@@ -13,17 +13,32 @@ func isInformationSchemaQuery(upperSQL string) bool {
 }
 
 func (c *mysqlConn) queryInformationSchema(ctx context.Context, sqlText string, args ...any) (resultSet, error) {
+	resp, err := c.queryInformationSchemaText(ctx, sqlText, false, args...)
+	if err != nil {
+		return resultSet{}, err
+	}
+	switch v := resp.(type) {
+	case resultSet:
+		return v, nil
+	case *sqliteResultSet:
+		return v.materialize()
+	default:
+		return resultSet{}, errPacket(mysqlErrUnknown, "HY000", "Unsupported information_schema query response")
+	}
+}
+
+func (c *mysqlConn) queryInformationSchemaText(ctx context.Context, sqlText string, stream bool, args ...any) (any, error) {
 	if tableName, ok := informationSchemaTargetTable(sqlText, args); ok {
 		if _, err := c.refreshInformationSchemaTable(ctx, tableName); err != nil {
-			return resultSet{}, err
+			return nil, err
 		}
 	} else {
 		if err := c.refreshInformationSchema(ctx); err != nil {
-			return resultSet{}, err
+			return nil, err
 		}
 	}
 	query := c.server.translateSQLCached(rewriteInformationSchemaSQL(sqlText, c.currentDB))
-	return c.querySQLite(ctx, query, args...)
+	return c.querySQLiteText(ctx, query, stream, args...)
 }
 
 func (c *mysqlConn) refreshInformationSchema(ctx context.Context) error {
@@ -34,37 +49,42 @@ func (c *mysqlConn) refreshInformationSchema(ctx context.Context) error {
 	if err := c.prepareInformationSchema(ctx); err != nil {
 		return err
 	}
-	if err := c.clearInformationSchema(ctx); err != nil {
-		return err
-	}
-	if err := c.refreshInformationSchemaSchemata(ctx); err != nil {
-		return err
-	}
+	if err := c.withInformationSchemaRefreshBatch(ctx, func() error {
+		if err := c.clearInformationSchema(ctx); err != nil {
+			return err
+		}
+		if err := c.refreshInformationSchemaSchemata(ctx); err != nil {
+			return err
+		}
 
-	rows, err := c.sqliteConn.QueryContext(ctx, `
+		rows, err := c.sqliteConn.QueryContext(ctx, `
 SELECT type, name, sql
 FROM main.sqlite_master
 WHERE type IN ('table', 'view')
   AND name NOT LIKE 'sqlite_%'
 ORDER BY name`)
-	if err != nil {
-		return fmt.Errorf("list sqlite tables for information_schema: %w", err)
-	}
-	defer rows.Close()
+		if err != nil {
+			return fmt.Errorf("list sqlite tables for information_schema: %w", err)
+		}
+		defer rows.Close()
 
-	for rows.Next() {
-		var tableType string
-		var tableName string
-		var createSQL sql.NullString
-		if err := rows.Scan(&tableType, &tableName, &createSQL); err != nil {
-			return fmt.Errorf("scan sqlite table for information_schema: %w", err)
+		for rows.Next() {
+			var tableType string
+			var tableName string
+			var createSQL sql.NullString
+			if err := rows.Scan(&tableType, &tableName, &createSQL); err != nil {
+				return fmt.Errorf("scan sqlite table for information_schema: %w", err)
+			}
+			if err := c.insertInformationSchemaTableMetadata(ctx, tableName, tableType, createSQL.String); err != nil {
+				return err
+			}
 		}
-		if err := c.insertInformationSchemaTableMetadata(ctx, tableName, tableType, createSQL.String); err != nil {
-			return err
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("list sqlite tables for information_schema: %w", err)
 		}
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("list sqlite tables for information_schema: %w", err)
+		return nil
+	}); err != nil {
+		return err
 	}
 	c.informationSchemaCache.markFullRefresh(version)
 	return nil
@@ -81,33 +101,41 @@ func (c *mysqlConn) refreshInformationSchemaTable(ctx context.Context, tableName
 	if err := c.prepareInformationSchema(ctx); err != nil {
 		return false, err
 	}
-	if err := c.refreshInformationSchemaSchemata(ctx); err != nil {
-		return false, err
-	}
-	if err := c.clearInformationSchemaTable(ctx, tableName); err != nil {
-		return false, err
-	}
 
-	var tableType string
-	var createSQL sql.NullString
-	err := c.sqliteConn.QueryRowContext(ctx, `
+	exists := false
+	if err := c.withInformationSchemaRefreshBatch(ctx, func() error {
+		if err := c.refreshInformationSchemaSchemata(ctx); err != nil {
+			return err
+		}
+		if err := c.clearInformationSchemaTable(ctx, tableName); err != nil {
+			return err
+		}
+
+		var tableType string
+		var createSQL sql.NullString
+		err := c.sqliteConn.QueryRowContext(ctx, `
 SELECT type, sql
 FROM main.sqlite_master
 WHERE type IN ('table', 'view')
   AND name = ?
   AND name NOT LIKE 'sqlite_%'`, tableName).Scan(&tableType, &createSQL)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			c.informationSchemaCache.markTable(tableName, version, false)
-			return false, nil
+		if err != nil {
+			if err == sql.ErrNoRows {
+				exists = false
+				return nil
+			}
+			return fmt.Errorf("load sqlite table for information_schema.%s: %w", tableName, err)
 		}
-		return false, fmt.Errorf("load sqlite table for information_schema.%s: %w", tableName, err)
-	}
-	if err := c.insertInformationSchemaTableMetadata(ctx, tableName, tableType, createSQL.String); err != nil {
+		if err := c.insertInformationSchemaTableMetadata(ctx, tableName, tableType, createSQL.String); err != nil {
+			return err
+		}
+		exists = true
+		return nil
+	}); err != nil {
 		return false, err
 	}
-	c.informationSchemaCache.markTable(tableName, version, true)
-	return true, nil
+	c.informationSchemaCache.markTable(tableName, version, exists)
+	return exists, nil
 }
 
 func (c *mysqlConn) prepareInformationSchema(ctx context.Context) error {
@@ -117,6 +145,37 @@ func (c *mysqlConn) prepareInformationSchema(ctx context.Context) error {
 	if err := c.createInformationSchemaTables(ctx); err != nil {
 		return err
 	}
+	return nil
+}
+
+func (c *mysqlConn) withInformationSchemaRefreshBatch(ctx context.Context, refresh func() error) (err error) {
+	if _, err := c.sqliteConn.ExecContext(ctx, "SAVEPOINT mysqlmock_information_schema_refresh"); err != nil {
+		return fmt.Errorf("start information_schema refresh batch: %w", err)
+	}
+
+	released := false
+	defer func() {
+		if released {
+			return
+		}
+		_, rollbackErr := c.sqliteConn.ExecContext(ctx, "ROLLBACK TO SAVEPOINT mysqlmock_information_schema_refresh")
+		_, releaseErr := c.sqliteConn.ExecContext(ctx, "RELEASE SAVEPOINT mysqlmock_information_schema_refresh")
+		if err == nil {
+			if rollbackErr != nil {
+				err = fmt.Errorf("rollback information_schema refresh batch: %w", rollbackErr)
+			} else if releaseErr != nil {
+				err = fmt.Errorf("release information_schema refresh batch after rollback: %w", releaseErr)
+			}
+		}
+	}()
+
+	if err := refresh(); err != nil {
+		return err
+	}
+	if _, err := c.sqliteConn.ExecContext(ctx, "RELEASE SAVEPOINT mysqlmock_information_schema_refresh"); err != nil {
+		return fmt.Errorf("release information_schema refresh batch: %w", err)
+	}
+	released = true
 	return nil
 }
 

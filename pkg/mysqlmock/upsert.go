@@ -387,12 +387,12 @@ func (tpl mysqlUpsertStatementTemplate) bind(args []any) (mysqlUpsertStatement, 
 			return mysqlUpsertStatement{}, sqlCompatErrorf("ON DUPLICATE KEY UPDATE has too few arguments")
 		}
 		rows[i] = mysqlUpsertRow{
-			Exprs: append([]string(nil), row.Exprs...),
-			Args:  append([]any(nil), args[argPos:argPos+row.PlaceholderCount]...),
+			Exprs: row.Exprs,
+			Args:  args[argPos : argPos+row.PlaceholderCount],
 		}
 		argPos += row.PlaceholderCount
 	}
-	updateArgs := append([]any(nil), args[argPos:]...)
+	updateArgs := args[argPos:]
 	if tpl.UpdatePlaceholderCount != len(updateArgs) {
 		return mysqlUpsertStatement{}, sqlCompatErrorf("ON DUPLICATE KEY UPDATE argument count mismatch")
 	}
@@ -506,8 +506,8 @@ func (tpl mysqlInsertStatementTemplate) bind(args []any) (mysqlInsertStatement, 
 			return mysqlInsertStatement{}, false
 		}
 		rows[i] = mysqlUpsertRow{
-			Exprs: append([]string(nil), row.Exprs...),
-			Args:  append([]any(nil), args[argPos:argPos+row.PlaceholderCount]...),
+			Exprs: row.Exprs,
+			Args:  args[argPos : argPos+row.PlaceholderCount],
 		}
 		argPos += row.PlaceholderCount
 	}
@@ -640,6 +640,9 @@ func (c *mysqlConn) evaluateUpsertRow(ctx context.Context, tableName string, col
 	if len(row.Exprs) != len(columns) {
 		return nil, sqlCompatErrorf("ON DUPLICATE KEY UPDATE values row has %d values for %d columns", len(row.Exprs), len(columns))
 	}
+	if isPlaceholderOnlyUpsertRow(row) {
+		return append([]any(nil), row.Args...), nil
+	}
 
 	selectExprs := make([]string, len(row.Exprs))
 	args := []any{}
@@ -676,6 +679,18 @@ func (c *mysqlConn) evaluateUpsertRow(ctx context.Context, tableName string, col
 		return nil, sqlCompatErrorf("ON DUPLICATE KEY UPDATE values row did not evaluate to one row")
 	}
 	return rs.Rows[0], nil
+}
+
+func isPlaceholderOnlyUpsertRow(row mysqlUpsertRow) bool {
+	if len(row.Args) != len(row.Exprs) {
+		return false
+	}
+	for _, expr := range row.Exprs {
+		if !isBarePlaceholderExpr(expr) {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *mysqlConn) applyImplicitDefaultInsertValues(tableColumns []sqliteTableColumn, columns []string, values []any) ([]string, []any) {
