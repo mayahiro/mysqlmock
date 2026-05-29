@@ -233,6 +233,7 @@ Schema と query fallback は、`TRUE`、`FALSE`、`NOW()`、`CURRENT_TIMESTAMP(
 `CREATE TABLE ... PARTITION BY ...` の partition clause は SQLite 実行時に strip します
 `ZEROFILL` が付いた integer column は、単純な result-set value について declared display width に合わせて zero padding します
 `AUTO_INCREMENT` column が複合 primary key に含まれる場合、mysqlmock は複合 key を維持して `AUTO_INCREMENT` を削除します。SQLite の自動 rowid 採番は単一の `INTEGER PRIMARY KEY` でのみ使えるため、この key value は insert 時に明示する必要があります
+単一 column の `AUTO_INCREMENT` では、`ROLLBACK` や `ROLLBACK TO SAVEPOINT` 後も消費済みの採番値を再利用しないようにし、SQLite の default rollback behavior より InnoDB に近い挙動にします
 MySQL-visible index name は table scoped のまま扱い、SQLite 内部では private index name に変換することで SQLite の schema-wide index namespace との衝突を避けます
 ORM query でよく使う scalar function/operator として `IFNULL`、`COALESCE`、`CONCAT`、`CAST`、`DATE_FORMAT`、`JSON_EXTRACT`、`JSON_UNQUOTE`、`CHAR_LENGTH`、`CHARACTER_LENGTH`、`CURDATE`、`RAND`、`FIND_IN_SET`、`FIELD`、`REGEXP` を扱います
 SQLite fallback は、MySQL string literal の backslash escape、`LIKE` pattern の MySQL default backslash escape、一部 ORM が出す `UPDATE ... SET table.column = ...` 形式の target も扱います

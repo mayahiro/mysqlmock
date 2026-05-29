@@ -278,6 +278,9 @@ When an `AUTO_INCREMENT` column belongs to a composite primary key, mysqlmock
 keeps the composite key and strips `AUTO_INCREMENT`; SQLite only supports
 automatic rowid assignment for a single `INTEGER PRIMARY KEY`, so inserts must
 provide that key value explicitly.
+For single-column `AUTO_INCREMENT`, mysqlmock keeps consumed values from being
+reused after `ROLLBACK` or `ROLLBACK TO SAVEPOINT`, matching InnoDB more
+closely than SQLite's default rollback behavior.
 MySQL-visible index names remain table-scoped; mysqlmock maps them to private
 SQLite index names internally to avoid SQLite's schema-wide index namespace.
 Common scalar functions and operators used by ORM queries include `IFNULL`,

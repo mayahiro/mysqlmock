@@ -102,6 +102,7 @@ type Server struct {
 	advisoryLocks  map[string]uint32
 	indexMetadata  map[string]mysqlIndexMetadata
 	columnMetadata map[string]mysqlColumnMetadata
+	autoIncrement  map[string]uint64
 	tableDDL       map[string]string
 	translation    sqlTranslationCache
 
@@ -180,6 +181,7 @@ func New(opts ...Option) (*Server, error) {
 		advisoryLocks:  map[string]uint32{},
 		indexMetadata:  map[string]mysqlIndexMetadata{},
 		columnMetadata: map[string]mysqlColumnMetadata{},
+		autoIncrement:  map[string]uint64{},
 		tableDDL:       map[string]string{},
 		tableColumns:   map[string]cachedTableColumns{},
 		uniqueKeys:     map[string]cachedUniqueKeys{},
@@ -310,6 +312,7 @@ func (s *Server) Reset(ctx context.Context) error {
 		s.mu.Lock()
 		s.indexMetadata = map[string]mysqlIndexMetadata{}
 		s.tableDDL = map[string]string{}
+		s.autoIncrement = map[string]uint64{}
 		s.mu.Unlock()
 		if err := s.resetBackendFull(ctx, s.keepConn); err != nil {
 			return err
@@ -322,6 +325,7 @@ func (s *Server) Reset(ctx context.Context) error {
 	s.unsupported = nil
 	s.queries = nil
 	s.ruleOnceUsed = nil
+	s.autoIncrement = map[string]uint64{}
 	s.mu.Unlock()
 	return nil
 }

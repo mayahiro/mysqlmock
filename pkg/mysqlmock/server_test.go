@@ -185,6 +185,136 @@ func TestServerWithGoSQLDriverMySQL(t *testing.T) {
 	}
 }
 
+func TestAutoIncrementRollbackDoesNotReuseValue(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	server := mysqlmock.Start(t, mysqlmock.WithConfig(testConfig()))
+
+	db, err := sql.Open("mysql", server.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin rollback tx: %v", err)
+	}
+	rolledBack, err := tx.ExecContext(ctx, "INSERT INTO users (name, email) VALUES (?, ?)", "Rollback", "rollback@example.com")
+	if err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("insert rollback row: %v", err)
+	}
+	rolledBackID, err := rolledBack.LastInsertId()
+	if err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("rollback row last insert id: %v", err)
+	}
+	if rolledBackID != 3 {
+		_ = tx.Rollback()
+		t.Fatalf("rollback row id = %d, want 3", rolledBackID)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+
+	inserted, err := db.ExecContext(ctx, "INSERT INTO users (name, email) VALUES (?, ?)", "After Rollback", "after-rollback@example.com")
+	if err != nil {
+		t.Fatalf("insert after rollback: %v", err)
+	}
+	insertedID, err := inserted.LastInsertId()
+	if err != nil {
+		t.Fatalf("after rollback last insert id: %v", err)
+	}
+	if insertedID != 4 {
+		t.Fatalf("after rollback id = %d, want 4", insertedID)
+	}
+
+	var count int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM users WHERE email = ?", "rollback@example.com").Scan(&count); err != nil {
+		t.Fatalf("count rollback row: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("rollback row count = %d, want 0", count)
+	}
+}
+
+func TestAutoIncrementSavepointRollbackDoesNotReuseValue(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	server := mysqlmock.Start(t, mysqlmock.WithConfig(testConfig()))
+
+	db, err := sql.Open("mysql", server.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	kept, err := tx.ExecContext(ctx, "INSERT INTO users (name, email) VALUES (?, ?)", "Keep", "keep-savepoint@example.com")
+	if err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("insert kept row: %v", err)
+	}
+	keptID, err := kept.LastInsertId()
+	if err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("kept row last insert id: %v", err)
+	}
+	if keptID != 3 {
+		_ = tx.Rollback()
+		t.Fatalf("kept row id = %d, want 3", keptID)
+	}
+	if _, err := tx.ExecContext(ctx, "SAVEPOINT sp1"); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("savepoint: %v", err)
+	}
+	discarded, err := tx.ExecContext(ctx, "INSERT INTO users (name, email) VALUES (?, ?)", "Discard", "discard-savepoint@example.com")
+	if err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("insert discarded row: %v", err)
+	}
+	discardedID, err := discarded.LastInsertId()
+	if err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("discarded row last insert id: %v", err)
+	}
+	if discardedID != 4 {
+		_ = tx.Rollback()
+		t.Fatalf("discarded row id = %d, want 4", discardedID)
+	}
+	if _, err := tx.ExecContext(ctx, "ROLLBACK TO SAVEPOINT sp1"); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("rollback to savepoint: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, "RELEASE SAVEPOINT sp1"); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("release savepoint: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	inserted, err := db.ExecContext(ctx, "INSERT INTO users (name, email) VALUES (?, ?)", "After Savepoint", "after-savepoint@example.com")
+	if err != nil {
+		t.Fatalf("insert after savepoint rollback: %v", err)
+	}
+	insertedID, err := inserted.LastInsertId()
+	if err != nil {
+		t.Fatalf("after savepoint last insert id: %v", err)
+	}
+	if insertedID != 5 {
+		t.Fatalf("after savepoint id = %d, want 5", insertedID)
+	}
+}
+
 func TestSelectVersionAlias(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

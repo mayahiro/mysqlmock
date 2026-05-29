@@ -399,6 +399,9 @@ func (c *mysqlConn) executeQuery(ctx context.Context, command, sqlText string, a
 	case upper == "ROLLBACK":
 		c.logQuery(command, "sqlite", sqlText, normalized)
 		resp, err := c.execSQLite(ctx, "ROLLBACK")
+		if err == nil {
+			err = c.restoreMySQLAutoIncrementSequences(ctx)
+		}
 		c.statusFlags &^= serverStatusInTrans
 		return resp, err
 	case upper == "ROLLBACK AND CHAIN":
@@ -406,10 +409,19 @@ func (c *mysqlConn) executeQuery(ctx context.Context, command, sqlText string, a
 		if _, err := c.execSQLite(ctx, "ROLLBACK"); err != nil {
 			return okResult{}, err
 		}
+		if err := c.restoreMySQLAutoIncrementSequences(ctx); err != nil {
+			return okResult{}, err
+		}
 		return c.execSQLite(ctx, "BEGIN")
+	case strings.HasPrefix(upper, "ROLLBACK TO SAVEPOINT "):
+		c.logQuery(command, "sqlite", sqlText, normalized)
+		resp, err := c.execSQLite(ctx, trimmed)
+		if err == nil {
+			err = c.restoreMySQLAutoIncrementSequences(ctx)
+		}
+		return resp, err
 	case strings.HasPrefix(upper, "SAVEPOINT ") ||
-		strings.HasPrefix(upper, "RELEASE SAVEPOINT ") ||
-		strings.HasPrefix(upper, "ROLLBACK TO SAVEPOINT "):
+		strings.HasPrefix(upper, "RELEASE SAVEPOINT "):
 		c.logQuery(command, "sqlite", sqlText, normalized)
 		return c.execSQLite(ctx, trimmed)
 	}
@@ -734,7 +746,9 @@ func (c *mysqlConn) execSQLite(ctx context.Context, query string, args ...any) (
 	}
 	affected, _ := res.RowsAffected()
 	lastID, _ := res.LastInsertId()
-	return okResult{AffectedRows: uint64NonNegative(affected), LastInsertID: uint64NonNegative(lastID)}, nil
+	result := okResult{AffectedRows: uint64NonNegative(affected), LastInsertID: uint64NonNegative(lastID)}
+	c.recordMySQLAutoIncrementAllocation(query, result)
+	return result, nil
 }
 
 func (c *mysqlConn) execSQLiteStatements(ctx context.Context, queries []string, args ...any) (okResult, error) {
