@@ -8,6 +8,9 @@ import (
 )
 
 func (c *mysqlConn) validateMySQLWriteValues(ctx context.Context, query string, args ...any) error {
+	if c.server.cfg.Compat.WriteValidation != "strict" {
+		return nil
+	}
 	trimmed := strings.TrimSpace(query)
 	if trimmed == "" {
 		return nil

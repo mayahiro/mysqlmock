@@ -65,9 +65,10 @@ type DatabaseConfig struct {
 
 // CompatConfig contains built-in MySQL compatibility values.
 type CompatConfig struct {
-	Profile        string            `yaml:"profile"`
-	AllowZeroDates bool              `yaml:"allow_zero_dates"`
-	Variables      map[string]string `yaml:"variables"`
+	Profile         string            `yaml:"profile"`
+	AllowZeroDates  bool              `yaml:"allow_zero_dates"`
+	WriteValidation string            `yaml:"write_validation"`
+	Variables       map[string]string `yaml:"variables"`
 }
 
 // FallbackConfig controls behavior after rules and built-in compatibility handlers.
@@ -141,7 +142,8 @@ func DefaultConfig() Config {
 		},
 		Seed: map[string][]map[string]any{},
 		Compat: CompatConfig{
-			Profile: "default",
+			Profile:         "default",
+			WriteValidation: "strict",
 			Variables: map[string]string{
 				"autocommit":               "1",
 				"character_set_client":     "utf8mb4",
@@ -456,6 +458,11 @@ func (c *Config) applyDefaults() {
 	} else {
 		c.Compat.Profile = normalizeCompatProfile(c.Compat.Profile)
 	}
+	if c.Compat.WriteValidation == "" {
+		c.Compat.WriteValidation = def.Compat.WriteValidation
+	} else {
+		c.Compat.WriteValidation = normalizeWriteValidationMode(c.Compat.WriteValidation)
+	}
 	if c.Compat.Variables == nil {
 		c.Compat.Variables = map[string]string{}
 	}
@@ -498,6 +505,9 @@ func (c Config) Validate() error {
 	}
 	if _, ok := lookupCompatProfile(c.Compat.Profile); !ok {
 		return fmt.Errorf("unsupported compat profile: %s", c.Compat.Profile)
+	}
+	if _, ok := lookupWriteValidationMode(c.Compat.WriteValidation); !ok {
+		return fmt.Errorf("unsupported compat.write_validation: %s", c.Compat.WriteValidation)
 	}
 	switch c.Backend.Mode {
 	case "memory":
@@ -592,6 +602,24 @@ func normalizeCompatProfile(name string) string {
 	name = strings.ToLower(strings.TrimSpace(name))
 	if name == "" {
 		return "default"
+	}
+	return name
+}
+
+func lookupWriteValidationMode(name string) (string, bool) {
+	name = normalizeWriteValidationMode(name)
+	switch name {
+	case "strict", "basic", "off":
+		return name, true
+	default:
+		return "", false
+	}
+}
+
+func normalizeWriteValidationMode(name string) string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "" {
+		return "strict"
 	}
 	return name
 }

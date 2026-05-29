@@ -583,6 +583,67 @@ CREATE TABLE zero_date_values (
 	mysqlmock.AssertNoUnsupported(t, server)
 }
 
+func TestWriteValidationModes(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	newDB := func(t *testing.T, mode string) (*mysqlmock.Server, *sql.DB) {
+		t.Helper()
+
+		cfg := mysqlmock.DefaultConfig()
+		cfg.Compat.WriteValidation = mode
+		cfg.Schema = []string{`
+CREATE TABLE write_validation_values (
+  id INTEGER PRIMARY KEY AUTO_INCREMENT,
+  short_name VARCHAR(3) NOT NULL,
+  required_name TEXT NOT NULL
+);`}
+		server := mysqlmock.Start(t, mysqlmock.WithConfig(cfg))
+		db, err := sql.Open("mysql", server.DSN())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_ = db.Close()
+		})
+		db.SetMaxOpenConns(1)
+		return server, db
+	}
+
+	t.Run("strict pre-validates MySQL-like value errors", func(t *testing.T) {
+		server, db := newDB(t, "strict")
+		if _, err := db.ExecContext(ctx, "INSERT INTO write_validation_values (short_name, required_name) VALUES (?, ?)", "toolong", "Strict"); err == nil {
+			t.Fatal("expected strict write validation error")
+		} else if !strings.Contains(err.Error(), "Error 1406") {
+			t.Fatalf("strict validation error = %v, want Error 1406", err)
+		}
+		mysqlmock.AssertNoUnsupported(t, server)
+	})
+
+	t.Run("basic skips pre-validation but keeps SQLite error mapping", func(t *testing.T) {
+		server, db := newDB(t, "basic")
+		if _, err := db.ExecContext(ctx, "INSERT INTO write_validation_values (short_name, required_name) VALUES (?, ?)", "toolong", "Basic"); err != nil {
+			t.Fatalf("basic write should skip length pre-validation: %v", err)
+		}
+		if _, err := db.ExecContext(ctx, "INSERT INTO write_validation_values (short_name, required_name) VALUES (?, ?)", "ok", nil); err == nil {
+			t.Fatal("expected SQLite NOT NULL error mapping")
+		} else if !strings.Contains(err.Error(), "Error 1048") || !strings.Contains(err.Error(), "Column cannot be null") {
+			t.Fatalf("basic not-null error = %v, want mapped MySQL error", err)
+		}
+		mysqlmock.AssertNoUnsupported(t, server)
+	})
+
+	t.Run("off skips pre-validation and SQLite error mapping", func(t *testing.T) {
+		server, db := newDB(t, "off")
+		if _, err := db.ExecContext(ctx, "INSERT INTO write_validation_values (short_name, required_name) VALUES (?, ?)", "ok", nil); err == nil {
+			t.Fatal("expected raw SQLite NOT NULL error")
+		} else if !strings.Contains(err.Error(), "Error 1105") || strings.Contains(err.Error(), "Column cannot be null") {
+			t.Fatalf("off not-null error = %v, want generic SQLite error", err)
+		}
+		mysqlmock.AssertNoUnsupported(t, server)
+	})
+}
+
 func TestSavepointRollback(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -1404,6 +1465,7 @@ database:
 compat:
   profile: gorm
   allow_zero_dates: true
+  write_validation: basic
   variables:
     lower_case_table_names: "1"
 `)
@@ -1420,6 +1482,9 @@ compat:
 	}
 	if !cfg.Compat.AllowZeroDates {
 		t.Fatal("compat allow_zero_dates = false, want true")
+	}
+	if cfg.Compat.WriteValidation != "basic" {
+		t.Fatalf("compat write_validation = %q, want basic", cfg.Compat.WriteValidation)
 	}
 	for name, want := range map[string]string{
 		"version":                "8.0.41-mock",
@@ -1929,6 +1994,93 @@ ON DUPLICATE KEY UPDATE label = VALUES(label)
 	if unsupported := server.Unsupported(); len(unsupported) != 0 {
 		t.Fatalf("unsupported queries = %#v, want none", unsupported)
 	}
+}
+
+func TestInsertCompatibilityParseCacheBindsArgumentsPerExecution(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cfg := mysqlmock.DefaultConfig()
+	cfg.Schema = []string{`
+CREATE TABLE cached_insert_users (
+  id INTEGER PRIMARY KEY AUTO_INCREMENT,
+  email VARCHAR(255) NOT NULL UNIQUE,
+  name VARCHAR(255) NOT NULL,
+  login_count INTEGER NOT NULL DEFAULT 0
+);`}
+	server := mysqlmock.Start(t, mysqlmock.WithConfig(cfg))
+	db, err := sql.Open("mysql", server.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	upsertSQL := `
+INSERT INTO cached_insert_users (email, name, login_count)
+VALUES (?, ?, ?)
+ON DUPLICATE KEY UPDATE
+  name = VALUES(name),
+  login_count = login_count + VALUES(login_count)
+`
+	if _, err := db.ExecContext(ctx, upsertSQL, "cache-a@example.com", "Cache A", 1); err != nil {
+		t.Fatalf("first cached upsert: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, upsertSQL, "cache-b@example.com", "Cache B", 2); err != nil {
+		t.Fatalf("second cached upsert: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, upsertSQL, "cache-a@example.com", "Cache A Updated", 3); err != nil {
+		t.Fatalf("third cached upsert: %v", err)
+	}
+
+	ignoreSQL := `
+INSERT IGNORE INTO cached_insert_users (email, name, login_count)
+VALUES (?, ?, ?)
+`
+	if _, err := db.ExecContext(ctx, ignoreSQL, "cache-a@example.com", "Ignored", 99); err != nil {
+		t.Fatalf("first cached insert ignore: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, ignoreSQL, "cache-c@example.com", "Cache C", 4); err != nil {
+		t.Fatalf("second cached insert ignore: %v", err)
+	}
+
+	rows, err := db.QueryContext(ctx, "SELECT email, name, login_count FROM cached_insert_users ORDER BY email")
+	if err != nil {
+		t.Fatalf("select cached insert rows: %v", err)
+	}
+	defer rows.Close()
+
+	got := map[string]struct {
+		name       string
+		loginCount int
+	}{}
+	for rows.Next() {
+		var email string
+		var name string
+		var loginCount int
+		if err := rows.Scan(&email, &name, &loginCount); err != nil {
+			t.Fatalf("scan cached insert row: %v", err)
+		}
+		got[email] = struct {
+			name       string
+			loginCount int
+		}{name: name, loginCount: loginCount}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read cached insert rows: %v", err)
+	}
+	want := map[string]struct {
+		name       string
+		loginCount int
+	}{
+		"cache-a@example.com": {name: "Cache A Updated", loginCount: 4},
+		"cache-b@example.com": {name: "Cache B", loginCount: 2},
+		"cache-c@example.com": {name: "Cache C", loginCount: 4},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("cached insert rows = %#v, want %#v", got, want)
+	}
+	mysqlmock.AssertNoUnsupported(t, server)
 }
 
 func TestOnDuplicateKeyUpdateHandlesActiveRecordAliasSyntax(t *testing.T) {
@@ -3580,6 +3732,22 @@ func TestCompatProfileValidation(t *testing.T) {
 	cfg.Compat.Profile = "unknown"
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected unsupported compat profile error")
+	}
+}
+
+func TestWriteValidationModeValidation(t *testing.T) {
+	for _, mode := range []string{"strict", "basic", "off", " BASIC "} {
+		cfg := mysqlmock.DefaultConfig()
+		cfg.Compat.WriteValidation = mode
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("validate write_validation %q: %v", mode, err)
+		}
+	}
+
+	cfg := mysqlmock.DefaultConfig()
+	cfg.Compat.WriteValidation = "unknown"
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected unsupported write_validation mode error")
 	}
 }
 

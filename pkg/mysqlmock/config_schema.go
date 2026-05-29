@@ -141,6 +141,10 @@ const configSchemaJSON = `{
         "allow_zero_dates": {
           "type": "boolean"
         },
+        "write_validation": {
+          "type": "string",
+          "enum": ["strict", "basic", "off"]
+        },
         "variables": {
           "type": "object",
           "additionalProperties": {

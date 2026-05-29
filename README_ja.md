@@ -149,6 +149,7 @@ seed:
 compat:
   profile: gorm
   allow_zero_dates: false
+  write_validation: strict
 
 fallback:
   type: sqlite
@@ -223,6 +224,7 @@ ActiveRecord-style schema introspection として、`SHOW FULL FIELDS`、`SHOW C
 
 Write validation は、duplicate key、foreign key、NOT NULL、CHECK constraint、character column の data too long、incorrect integer value、incorrect datetime value など、Repository test でよく使う失敗を MySQL-like error に map します
 legacy data のために `'0000-00-00'` や `'0001-00-00 00:00:00'` のような zero date part を許容する場合は `compat.allow_zero_dates: true` を設定します
+成功系 write の事前 value validation を省略しつつ SQLite constraint error mapping を残す場合は `compat.write_validation: basic`、SQLite error を generic MySQL error として返す場合は `off` を設定します
 
 Schema と query fallback は、`TRUE`、`FALSE`、`NOW()`、`CURRENT_TIMESTAMP()`、`AUTO_INCREMENT`、TiDB `AUTO_RANDOM`、よく使われる MySQL/TiDB DDL option、table-level `PRIMARY KEY` / `UNIQUE KEY` / `KEY` 定義、単純な MySQL index DDL、よく使う `ALTER TABLE` / `RENAME TABLE` variants を、可能な範囲で SQLite-compatible SQL に変換します
 `DROP DATABASE` / `DROP SCHEMA` は teardown 用の no-op statement として受け付けます

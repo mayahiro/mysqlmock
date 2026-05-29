@@ -51,6 +51,7 @@ Missing nested values are filled from defaults.
 | `database.shared` | `true` |
 | `compat.profile` | `default` |
 | `compat.allow_zero_dates` | `false` |
+| `compat.write_validation` | `strict` |
 | `fallback.type` | `sqlite` |
 | `fallback.unsupported.type` | `error` |
 | `fallback.unsupported.code` | `1105` |
@@ -204,6 +205,7 @@ quoted when mysqlmock builds seed insert statements.
 compat:
   profile: gorm
   allow_zero_dates: false
+  write_validation: strict
   variables:
     lower_case_table_names: "1"
     time_zone: "SYSTEM"
@@ -241,6 +243,14 @@ The `gorm` profile adds common ORM initialization variables, including:
 `allow_zero_dates: true` accepts zero date parts such as `'0000-00-00'` and
 `'0001-00-00 00:00:00'` during write validation. The default is `false` to
 match MySQL 8.0's default strict SQL mode more closely.
+
+`write_validation` controls write-path compatibility checks:
+
+- `strict` keeps MySQL-like value pre-validation and SQLite error mapping.
+- `basic` skips value pre-validation on successful writes, but keeps SQLite
+  constraint error mapping.
+- `off` skips value pre-validation and returns SQLite execution errors as
+  generic MySQL errors.
 
 Explicit `compat.variables` values override profile defaults. `server.mysql_version`
 always controls the effective `version` variable.

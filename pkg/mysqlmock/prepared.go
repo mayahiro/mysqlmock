@@ -97,7 +97,7 @@ func (c *mysqlConn) handleStmtExecute(ctx context.Context, payload []byte) error
 		if isSQLiteSyntaxError(err) {
 			c.recordUnsupported("COM_STMT_EXECUTE", stmt.SQL, normalizeSQL(stmt.SQL), "sqlite")
 		}
-		return c.writeErr(1, mapSQLiteError(stmt.SQL, err))
+		return c.writeErr(1, c.mapSQLiteError(stmt.SQL, err))
 	}
 
 	switch v := resp.(type) {

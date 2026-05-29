@@ -18,15 +18,37 @@ type mysqlUpsertStatement struct {
 	UpdateArgs []any
 }
 
+type mysqlUpsertStatementTemplate struct {
+	TableName              string
+	Columns                []string
+	Rows                   []mysqlUpsertRowTemplate
+	ValueAlias             string
+	UpdateSQL              string
+	UpdatePlaceholderCount int
+}
+
 type mysqlUpsertRow struct {
 	Exprs []string
 	Args  []any
+}
+
+type mysqlUpsertRowTemplate struct {
+	Exprs            []string
+	PlaceholderCount int
 }
 
 type mysqlInsertStatement struct {
 	TableName string
 	Columns   []string
 	Rows      []mysqlUpsertRow
+	Ignore    bool
+	Replace   bool
+}
+
+type mysqlInsertStatementTemplate struct {
+	TableName string
+	Columns   []string
+	Rows      []mysqlUpsertRowTemplate
 	Ignore    bool
 	Replace   bool
 }
@@ -56,7 +78,7 @@ type cachedUniqueKeys struct {
 }
 
 func (c *mysqlConn) execMySQLUpsert(ctx context.Context, sqlText string, args ...any) (okResult, bool, error) {
-	stmt, ok, err := parseMySQLUpsertStatement(sqlText, args)
+	stmt, ok, err := c.server.parseMySQLUpsertStatementCached(sqlText, args)
 	if err != nil || !ok {
 		return okResult{}, ok, err
 	}
@@ -122,7 +144,7 @@ func (c *mysqlConn) execMySQLUpsert(ctx context.Context, sqlText string, args ..
 }
 
 func (c *mysqlConn) execMySQLInsertCompatibility(ctx context.Context, sqlText string, args ...any) (okResult, bool, error) {
-	stmt, ok, err := parseMySQLInsertStatement(sqlText, args)
+	stmt, ok, err := c.server.parseMySQLInsertStatementCached(sqlText, args)
 	if err != nil || !ok {
 		return okResult{}, ok, err
 	}
@@ -202,15 +224,15 @@ func (c *mysqlConn) execMySQLReplace(ctx context.Context, stmt mysqlInsertStatem
 	return okResult{AffectedRows: affected, LastInsertID: lastInsertID}, true, nil
 }
 
-func parseMySQLUpsertStatement(sqlText string, args []any) (mysqlUpsertStatement, bool, error) {
+func parseMySQLUpsertStatementTemplate(sqlText string) (mysqlUpsertStatementTemplate, bool, error) {
 	insertSQL, updateSQL, ok := splitOnDuplicateKeyUpdate(sqlText)
 	if !ok {
-		return mysqlUpsertStatement{}, false, nil
+		return mysqlUpsertStatementTemplate{}, false, nil
 	}
 
 	pos := skipSQLSpaces(insertSQL, 0)
 	if !consumeKeyword(insertSQL, &pos, "INSERT") {
-		return mysqlUpsertStatement{}, false, nil
+		return mysqlUpsertStatementTemplate{}, false, nil
 	}
 	for {
 		start := pos
@@ -223,11 +245,11 @@ func parseMySQLUpsertStatement(sqlText string, args []any) (mysqlUpsertStatement
 		}
 	}
 	if !consumeKeyword(insertSQL, &pos, "INTO") {
-		return mysqlUpsertStatement{}, false, nil
+		return mysqlUpsertStatementTemplate{}, false, nil
 	}
 	tableName, pos, ok := readSQLNameToken(insertSQL, pos)
 	if !ok {
-		return mysqlUpsertStatement{}, false, sqlCompatErrorf("Unsupported ON DUPLICATE KEY UPDATE insert target")
+		return mysqlUpsertStatementTemplate{}, false, sqlCompatErrorf("Unsupported ON DUPLICATE KEY UPDATE insert target")
 	}
 
 	columns := []string{}
@@ -235,7 +257,7 @@ func parseMySQLUpsertStatement(sqlText string, args []any) (mysqlUpsertStatement
 	if next < len(insertSQL) && insertSQL[next] == '(' {
 		columnsEnd, ok := parenthesizedSQLSpan(insertSQL, next)
 		if !ok {
-			return mysqlUpsertStatement{}, false, sqlCompatErrorf("Malformed ON DUPLICATE KEY UPDATE column list")
+			return mysqlUpsertStatementTemplate{}, false, sqlCompatErrorf("Malformed ON DUPLICATE KEY UPDATE column list")
 		}
 		for _, item := range splitSQLTopLevelList(insertSQL[next+1 : columnsEnd-1]) {
 			name := strings.TrimSpace(item)
@@ -248,10 +270,9 @@ func parseMySQLUpsertStatement(sqlText string, args []any) (mysqlUpsertStatement
 	}
 
 	if !consumeKeyword(insertSQL, &pos, "VALUES") && !consumeKeyword(insertSQL, &pos, "VALUE") {
-		return mysqlUpsertStatement{}, false, sqlCompatErrorf("Unsupported ON DUPLICATE KEY UPDATE insert form")
+		return mysqlUpsertStatementTemplate{}, false, sqlCompatErrorf("Unsupported ON DUPLICATE KEY UPDATE insert form")
 	}
-	rows := []mysqlUpsertRow{}
-	argPos := 0
+	rows := []mysqlUpsertRowTemplate{}
 	valueAlias := ""
 	for {
 		pos = skipSQLSpaces(insertSQL, pos)
@@ -260,19 +281,14 @@ func parseMySQLUpsertStatement(sqlText string, args []any) (mysqlUpsertStatement
 		}
 		rowEnd, ok := parenthesizedSQLSpan(insertSQL, pos)
 		if !ok {
-			return mysqlUpsertStatement{}, false, sqlCompatErrorf("Malformed ON DUPLICATE KEY UPDATE values row")
+			return mysqlUpsertStatementTemplate{}, false, sqlCompatErrorf("Malformed ON DUPLICATE KEY UPDATE values row")
 		}
 		exprs := splitSQLTopLevelList(insertSQL[pos+1 : rowEnd-1])
 		placeholderCount := 0
 		for _, expr := range exprs {
 			placeholderCount += countPlaceholders(expr)
 		}
-		if argPos+placeholderCount > len(args) {
-			return mysqlUpsertStatement{}, false, sqlCompatErrorf("ON DUPLICATE KEY UPDATE has too few arguments")
-		}
-		rowArgs := append([]any(nil), args[argPos:argPos+placeholderCount]...)
-		argPos += placeholderCount
-		rows = append(rows, mysqlUpsertRow{Exprs: exprs, Args: rowArgs})
+		rows = append(rows, mysqlUpsertRowTemplate{Exprs: exprs, PlaceholderCount: placeholderCount})
 
 		pos = skipSQLSpaces(insertSQL, rowEnd)
 		if pos < len(insertSQL) && insertSQL[pos] == ',' {
@@ -285,23 +301,46 @@ func parseMySQLUpsertStatement(sqlText string, args []any) (mysqlUpsertStatement
 			valueAlias = nextAlias
 		}
 		if pos != len(insertSQL) {
-			return mysqlUpsertStatement{}, false, sqlCompatErrorf("Unsupported ON DUPLICATE KEY UPDATE values suffix")
+			return mysqlUpsertStatementTemplate{}, false, sqlCompatErrorf("Unsupported ON DUPLICATE KEY UPDATE values suffix")
 		}
 		break
 	}
-	updateArgs := append([]any(nil), args[argPos:]...)
-	if countPlaceholders(updateSQL) != len(updateArgs) {
-		return mysqlUpsertStatement{}, false, sqlCompatErrorf("ON DUPLICATE KEY UPDATE argument count mismatch")
-	}
 
-	return mysqlUpsertStatement{
-		TableName:  tableName,
-		Columns:    columns,
-		Rows:       rows,
-		ValueAlias: valueAlias,
-		UpdateSQL:  updateSQL,
-		UpdateArgs: updateArgs,
+	return mysqlUpsertStatementTemplate{
+		TableName:              tableName,
+		Columns:                columns,
+		Rows:                   rows,
+		ValueAlias:             valueAlias,
+		UpdateSQL:              updateSQL,
+		UpdatePlaceholderCount: countPlaceholders(updateSQL),
 	}, true, nil
+}
+
+func (tpl mysqlUpsertStatementTemplate) bind(args []any) (mysqlUpsertStatement, error) {
+	rows := make([]mysqlUpsertRow, len(tpl.Rows))
+	argPos := 0
+	for i, row := range tpl.Rows {
+		if argPos+row.PlaceholderCount > len(args) {
+			return mysqlUpsertStatement{}, sqlCompatErrorf("ON DUPLICATE KEY UPDATE has too few arguments")
+		}
+		rows[i] = mysqlUpsertRow{
+			Exprs: append([]string(nil), row.Exprs...),
+			Args:  append([]any(nil), args[argPos:argPos+row.PlaceholderCount]...),
+		}
+		argPos += row.PlaceholderCount
+	}
+	updateArgs := append([]any(nil), args[argPos:]...)
+	if tpl.UpdatePlaceholderCount != len(updateArgs) {
+		return mysqlUpsertStatement{}, sqlCompatErrorf("ON DUPLICATE KEY UPDATE argument count mismatch")
+	}
+	return mysqlUpsertStatement{
+		TableName:  tpl.TableName,
+		Columns:    append([]string(nil), tpl.Columns...),
+		Rows:       rows,
+		ValueAlias: tpl.ValueAlias,
+		UpdateSQL:  tpl.UpdateSQL,
+		UpdateArgs: updateArgs,
+	}, nil
 }
 
 func consumeOptionalValuesAlias(sqlText string, pos int) (string, int, bool) {
@@ -330,11 +369,11 @@ func consumeOptionalValuesAlias(sqlText string, pos int) (string, int, bool) {
 	return unquoteSQLWord(name), pos, true
 }
 
-func parseMySQLInsertStatement(sqlText string, args []any) (mysqlInsertStatement, bool, error) {
+func parseMySQLInsertStatementTemplate(sqlText string) (mysqlInsertStatementTemplate, bool, error) {
 	pos := skipSQLSpaces(sqlText, 0)
 	replace := consumeKeyword(sqlText, &pos, "REPLACE")
 	if !replace && !consumeKeyword(sqlText, &pos, "INSERT") {
-		return mysqlInsertStatement{}, false, nil
+		return mysqlInsertStatementTemplate{}, false, nil
 	}
 
 	ignore := false
@@ -356,11 +395,11 @@ modifiersDone:
 	if replace {
 		_ = consumeKeyword(sqlText, &pos, "INTO")
 	} else if !consumeKeyword(sqlText, &pos, "INTO") {
-		return mysqlInsertStatement{}, false, nil
+		return mysqlInsertStatementTemplate{}, false, nil
 	}
 	tableName, pos, ok := readSQLNameToken(sqlText, pos)
 	if !ok {
-		return mysqlInsertStatement{}, false, nil
+		return mysqlInsertStatementTemplate{}, false, nil
 	}
 
 	columns := []string{}
@@ -368,7 +407,7 @@ modifiersDone:
 	if next < len(sqlText) && sqlText[next] == '(' {
 		columnsEnd, ok := parenthesizedSQLSpan(sqlText, next)
 		if !ok {
-			return mysqlInsertStatement{}, false, nil
+			return mysqlInsertStatementTemplate{}, false, nil
 		}
 		for _, item := range splitSQLTopLevelList(sqlText[next+1 : columnsEnd-1]) {
 			name := strings.TrimSpace(item)
@@ -381,19 +420,78 @@ modifiersDone:
 	}
 
 	if !consumeKeyword(sqlText, &pos, "VALUES") && !consumeKeyword(sqlText, &pos, "VALUE") {
-		return mysqlInsertStatement{}, false, nil
+		return mysqlInsertStatementTemplate{}, false, nil
 	}
-	rows, argPos, ok := parseMySQLValuesRows(sqlText, pos, args)
-	if !ok || argPos != len(args) {
-		return mysqlInsertStatement{}, false, nil
+	rows, ok := parseMySQLValueRowTemplates(sqlText, pos)
+	if !ok {
+		return mysqlInsertStatementTemplate{}, false, nil
 	}
-	return mysqlInsertStatement{
+	return mysqlInsertStatementTemplate{
 		TableName: tableName,
 		Columns:   columns,
 		Rows:      rows,
 		Ignore:    ignore,
 		Replace:   replace,
 	}, true, nil
+}
+
+func (tpl mysqlInsertStatementTemplate) bind(args []any) (mysqlInsertStatement, bool) {
+	rows := make([]mysqlUpsertRow, len(tpl.Rows))
+	argPos := 0
+	for i, row := range tpl.Rows {
+		if argPos+row.PlaceholderCount > len(args) {
+			return mysqlInsertStatement{}, false
+		}
+		rows[i] = mysqlUpsertRow{
+			Exprs: append([]string(nil), row.Exprs...),
+			Args:  append([]any(nil), args[argPos:argPos+row.PlaceholderCount]...),
+		}
+		argPos += row.PlaceholderCount
+	}
+	if argPos != len(args) {
+		return mysqlInsertStatement{}, false
+	}
+	return mysqlInsertStatement{
+		TableName: tpl.TableName,
+		Columns:   append([]string(nil), tpl.Columns...),
+		Rows:      rows,
+		Ignore:    tpl.Ignore,
+		Replace:   tpl.Replace,
+	}, true
+}
+
+func parseMySQLValueRowTemplates(sqlText string, pos int) ([]mysqlUpsertRowTemplate, bool) {
+	rows := []mysqlUpsertRowTemplate{}
+	for {
+		pos = skipSQLSpaces(sqlText, pos)
+		if pos >= len(sqlText) {
+			break
+		}
+		rowEnd, ok := parenthesizedSQLSpan(sqlText, pos)
+		if !ok {
+			return nil, false
+		}
+		exprs := splitSQLTopLevelList(sqlText[pos+1 : rowEnd-1])
+		placeholderCount := 0
+		for _, expr := range exprs {
+			placeholderCount += countPlaceholders(expr)
+		}
+		rows = append(rows, mysqlUpsertRowTemplate{Exprs: exprs, PlaceholderCount: placeholderCount})
+
+		pos = skipSQLSpaces(sqlText, rowEnd)
+		if pos < len(sqlText) && sqlText[pos] == ',' {
+			pos++
+			continue
+		}
+		if pos < len(sqlText) && sqlText[pos] == ';' {
+			pos = skipSQLSpaces(sqlText, pos+1)
+		}
+		if pos != len(sqlText) {
+			return nil, false
+		}
+		break
+	}
+	return rows, true
 }
 
 func parseMySQLValuesRows(sqlText string, pos int, args []any) ([]mysqlUpsertRow, int, bool) {

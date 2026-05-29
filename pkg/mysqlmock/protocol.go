@@ -293,7 +293,7 @@ func (c *mysqlConn) handleQuery(ctx context.Context, sqlText string) error {
 		if isSQLiteSyntaxError(err) {
 			c.recordUnsupported("COM_QUERY", sqlText, normalizeSQL(sqlText), "sqlite")
 		}
-		return c.writeErr(1, mapSQLiteError(sqlText, err))
+		return c.writeErr(1, c.mapSQLiteError(sqlText, err))
 	}
 
 	switch v := resp.(type) {
@@ -1096,6 +1096,13 @@ func mapSQLiteError(sqlText string, err error) *mysqlError {
 	default:
 		return errPacket(mysqlErrUnknown, "HY000", msg)
 	}
+}
+
+func (c *mysqlConn) mapSQLiteError(sqlText string, err error) *mysqlError {
+	if c.server.cfg.Compat.WriteValidation == "off" {
+		return errPacket(mysqlErrUnknown, "HY000", err.Error())
+	}
+	return mapSQLiteError(sqlText, err)
 }
 
 func isSQLiteSyntaxError(err error) bool {

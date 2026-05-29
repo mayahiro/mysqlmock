@@ -159,6 +159,7 @@ seed:
 compat:
   profile: gorm
   allow_zero_dates: false
+  write_validation: strict
 
 fallback:
   type: sqlite
@@ -257,6 +258,9 @@ including duplicate keys, foreign keys, NOT NULL, CHECK constraints, data too
 long for character columns, incorrect integer values, and incorrect datetime
 values. Set `compat.allow_zero_dates: true` to accept zero date parts such as
 `'0000-00-00'` and `'0001-00-00 00:00:00'` for legacy data.
+Set `compat.write_validation: basic` to skip value pre-validation on successful
+writes while keeping SQLite constraint error mapping, or `off` to return raw
+SQLite errors as generic MySQL errors.
 
 Schema and query fallback translate `TRUE`, `FALSE`, `NOW()`,
 `CURRENT_TIMESTAMP()`, `AUTO_INCREMENT`, TiDB `AUTO_RANDOM`, common MySQL and

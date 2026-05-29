@@ -50,6 +50,7 @@ database:
 | `database.shared` | `true` |
 | `compat.profile` | `default` |
 | `compat.allow_zero_dates` | `false` |
+| `compat.write_validation` | `strict` |
 | `fallback.type` | `sqlite` |
 | `fallback.unsupported.type` | `error` |
 | `fallback.unsupported.code` | `1105` |
@@ -187,6 +188,7 @@ mysqlmock が seed insert statement を組み立てるとき、table name と co
 compat:
   profile: gorm
   allow_zero_dates: false
+  write_validation: strict
   variables:
     lower_case_table_names: "1"
     time_zone: "SYSTEM"
@@ -223,6 +225,12 @@ compat:
 
 `allow_zero_dates: true` は write validation で `'0000-00-00'` や `'0001-00-00 00:00:00'` のような zero date part を許容します
 default は MySQL 8.0 の default strict SQL mode に寄せるため `false` です
+
+`write_validation` は write-path の compatibility check を制御します
+
+- `strict` は MySQL-like value pre-validation と SQLite error mapping を維持します
+- `basic` は成功系 write の value pre-validation を省略し、SQLite constraint error mapping は維持します
+- `off` は value pre-validation を省略し、SQLite execution error を generic MySQL error として返します
 
 明示した `compat.variables` は profile default を上書きします
 ただし、実効 `version` variable は常に `server.mysql_version` から決まります
