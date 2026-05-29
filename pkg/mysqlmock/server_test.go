@@ -768,11 +768,12 @@ func TestSchemaFilesLoadDumpRelativeToConfigFile(t *testing.T) {
 /*!40101 SET @OLD_CHARACTER_SET_CLIENT=@@CHARACTER_SET_CLIENT */;
 DROP TABLE IF EXISTS ` + "`dump_users`" + `;
 CREATE TABLE ` + "`dump_users`" + ` (
-  ` + "`id`" + ` BIGINT PRIMARY KEY /*T![auto_rand] AUTO_RANDOM(5) */,
+  ` + "`id`" + ` bigint NOT NULL AUTO_INCREMENT,
   ` + "`email`" + ` varchar(255) NOT NULL,
   ` + "`enabled`" + ` tinyint(1) NOT NULL DEFAULT 0,
+  PRIMARY KEY (` + "`id`" + `),
   UNIQUE KEY ` + "`uniq_dump_users_email`" + ` (` + "`email`" + `)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
+) ENGINE=InnoDB AUTO_INCREMENT=100 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 LOCK TABLES ` + "`dump_users`" + ` WRITE;
 INSERT INTO ` + "`dump_users`" + ` VALUES (100, 'ignored@example.com', 1);
 UNLOCK TABLES;

@@ -42,11 +42,15 @@ func translateCreateTableStatements(sqlText string) ([]string, bool) {
 	}
 
 	items := splitSQLTopLevelList(sqlText[bodyStart+1 : bodyEnd-1])
+	autoIncrementPrimaryColumn := autoIncrementPrimaryKeyColumn(items)
 	translatedItems := make([]string, 0, len(items))
 	indexStatements := []string{}
 	for _, item := range items {
 		item = strings.TrimSpace(item)
 		if item == "" {
+			continue
+		}
+		if autoIncrementPrimaryColumn != "" && isPrimaryKeyTableConstraintForColumn(item, autoIncrementPrimaryColumn) {
 			continue
 		}
 		if primary, ok := translatePrimaryKeyTableConstraint(item); ok {
@@ -58,6 +62,9 @@ func translateCreateTableStatements(sqlText string) ([]string, bool) {
 				indexStatements = append(indexStatements, indexStmt)
 			}
 			continue
+		}
+		if autoIncrementPrimaryColumn != "" && createTableColumnName(item) == autoIncrementPrimaryColumn {
+			item = translateAutoIncrementPrimaryKeyColumn(item)
 		}
 		translatedItems = append(translatedItems, translateCreateTableColumnItem(item))
 	}
@@ -76,6 +83,134 @@ func translateCreateTableColumnItem(item string) string {
 		item = ensurePrimaryKeyAutoincrement(item)
 	}
 	return translateSQL(item)
+}
+
+func autoIncrementPrimaryKeyColumn(items []string) string {
+	var column string
+	for _, item := range items {
+		item = strings.TrimSpace(item)
+		if !containsSQLIdentifier(item, "AUTO_INCREMENT") {
+			continue
+		}
+		name := createTableColumnName(item)
+		if name == "" {
+			continue
+		}
+		if column != "" {
+			return ""
+		}
+		column = name
+	}
+	if column == "" {
+		return ""
+	}
+	for _, item := range items {
+		if isPrimaryKeyTableConstraintForColumn(item, column) {
+			return column
+		}
+	}
+	return ""
+}
+
+func createTableColumnName(item string) string {
+	item = strings.TrimSpace(item)
+	if item == "" {
+		return ""
+	}
+	if isTableConstraintItem(item) {
+		return ""
+	}
+	name, _, ok := readSQLNameToken(item, 0)
+	if !ok {
+		return ""
+	}
+	return unquoteSQLWord(name)
+}
+
+func isTableConstraintItem(item string) bool {
+	pos := skipSQLSpaces(item, 0)
+	if consumeKeyword(item, &pos, "CONSTRAINT") {
+		if _, next, ok := readSQLNameToken(item, pos); ok {
+			pos = next
+		} else {
+			return false
+		}
+	}
+	for _, keyword := range []string{"PRIMARY", "UNIQUE", "KEY", "INDEX", "FOREIGN", "CHECK"} {
+		if consumeKeyword(item, &pos, keyword) {
+			return true
+		}
+	}
+	return false
+}
+
+func isPrimaryKeyTableConstraintForColumn(item, columnName string) bool {
+	pos := skipSQLSpaces(item, 0)
+	if consumeKeyword(item, &pos, "CONSTRAINT") {
+		if _, next, ok := readSQLNameToken(item, pos); ok {
+			pos = next
+		} else {
+			return false
+		}
+	}
+	if !consumeKeyword(item, &pos, "PRIMARY") || !consumeKeyword(item, &pos, "KEY") {
+		return false
+	}
+	if next, ok := consumeSQLNamedOption(item, pos, "USING"); ok {
+		pos = next
+	}
+	columnsStart := skipSQLSpaces(item, pos)
+	columnsEnd, ok := parenthesizedSQLSpan(item, columnsStart)
+	if !ok {
+		return false
+	}
+	columns := splitSQLTopLevelList(item[columnsStart+1 : columnsEnd-1])
+	if len(columns) != 1 {
+		return false
+	}
+	name, _, ok := readSQLNameToken(strings.TrimSpace(columns[0]), 0)
+	return ok && strings.EqualFold(unquoteSQLWord(name), columnName)
+}
+
+func translateAutoIncrementPrimaryKeyColumn(item string) string {
+	name, pos, ok := readSQLNameToken(item, 0)
+	if !ok {
+		return item
+	}
+	out := []string{name, "INTEGER", "PRIMARY KEY", "AUTOINCREMENT"}
+	if defaultValue, ok := extractColumnDefault(item[pos:]); ok {
+		out = append(out, "DEFAULT "+defaultValue)
+	}
+	return strings.Join(out, " ")
+}
+
+func extractColumnDefault(sqlText string) (string, bool) {
+	for i := 0; i < len(sqlText); {
+		if end, ok := quotedSQLSpan(sqlText, i); ok {
+			i = end
+			continue
+		}
+		if end, ok := sqlCommentSpan(sqlText, i); ok {
+			i = end
+			continue
+		}
+		word, end, ok := readSQLIdentifier(sqlText, i)
+		if !ok {
+			i++
+			continue
+		}
+		if !strings.EqualFold(word, "DEFAULT") {
+			i = end
+			continue
+		}
+		valueStart := skipSQLSpaces(sqlText, end)
+		valueEnd := consumeSQLValue(sqlText, valueStart)
+		if valueEnd <= valueStart {
+			return "", false
+		}
+		return strings.TrimSpace(sqlText[valueStart:valueEnd]), true
+	}
+	return "", false
 }
 
 func translatePrimaryKeyTableConstraint(item string) (string, bool) {

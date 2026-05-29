@@ -349,6 +349,31 @@ CREATE TABLE update_patterns (
 	}
 }
 
+func TestTranslateSQLStatementsConvertsMySQLDumpAutoIncrementPrimaryKey(t *testing.T) {
+	input := `
+CREATE TABLE users (
+  id bigint NOT NULL AUTO_INCREMENT,
+  email varchar(255) NOT NULL,
+  PRIMARY KEY (id),
+  UNIQUE KEY uniq_users_email (email)
+) ENGINE=InnoDB AUTO_INCREMENT=100 DEFAULT CHARSET=utf8mb4;
+`
+	got := translateSQLStatements(input)
+	if len(got) != 2 {
+		t.Fatalf("translateSQLStatements() returned %d statements, want 2: %#v", len(got), got)
+	}
+	if !strings.Contains(got[0], "id INTEGER PRIMARY KEY AUTOINCREMENT") {
+		t.Fatalf("create table translation = %q, want auto-increment primary key column", got[0])
+	}
+	if strings.Contains(got[0], "PRIMARY KEY (id)") || strings.Contains(got[0], "AUTO_INCREMENT") {
+		t.Fatalf("create table translation = %q, want table primary key and AUTO_INCREMENT removed", got[0])
+	}
+	wantUniqueIndex := "CREATE UNIQUE INDEX " + quoteIdent(sqliteIndexName("users", "uniq_users_email")) + " ON users (email)"
+	if got[1] != wantUniqueIndex {
+		t.Fatalf("unique index translation = %q, want %q", got[1], wantUniqueIndex)
+	}
+}
+
 func TestTranslateSQLStripsLockingClause(t *testing.T) {
 	tests := []struct {
 		name  string
