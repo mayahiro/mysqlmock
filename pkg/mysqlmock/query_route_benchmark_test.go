@@ -200,6 +200,8 @@ func benchmarkClassifyCOMQueryRoute(c *mysqlConn, sqlText string, args ...any) (
 		return benchmarkCOMQueryRouteCompat, nil
 	case isInformationSchemaQuery(upper):
 		return benchmarkCOMQueryRouteCompat, nil
+	case isCreateDatabaseStatement(trimmed):
+		return benchmarkCOMQueryRouteCompat, nil
 	case upper == "BEGIN" || upper == "START TRANSACTION":
 		return benchmarkCOMQueryRouteSQLiteWrite, nil
 	case upper == "COMMIT":

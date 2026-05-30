@@ -229,7 +229,7 @@ legacy data のために `'0000-00-00'` や `'0001-00-00 00:00:00'` のような
 成功系 write の事前 value validation を省略しつつ SQLite constraint error mapping を残す場合は `compat.write_validation: basic`、SQLite error を generic MySQL error として返す場合は `off` を設定します
 
 Schema と query fallback は、`TRUE`、`FALSE`、`NOW()`、`CURRENT_TIMESTAMP()`、`AUTO_INCREMENT`、TiDB `AUTO_RANDOM`、よく使われる MySQL/TiDB DDL option、table-level `PRIMARY KEY` / `UNIQUE KEY` / `KEY` 定義、単純な MySQL index DDL、よく使う `ALTER TABLE` / `RENAME TABLE` variants を、可能な範囲で SQLite-compatible SQL に変換します
-`DROP DATABASE` / `DROP SCHEMA` は teardown 用の no-op statement として受け付けます
+`CREATE DATABASE` / `CREATE SCHEMA` は setup 用、`DROP DATABASE` / `DROP SCHEMA` は teardown 用の no-op statement として受け付けます
 `CREATE TABLE ... PARTITION BY ...` の partition clause は SQLite 実行時に strip します
 `ZEROFILL` が付いた integer column は、単純な result-set value について declared display width に合わせて zero padding します
 `AUTO_INCREMENT` column が複合 primary key に含まれる場合、mysqlmock は複合 key を維持して SQLite `AUTOINCREMENT` を削除します。SQLite の自動 rowid 採番は単一の `INTEGER PRIMARY KEY` でのみ使えるため、元の MySQL metadata を保持し、対応している `INSERT ... VALUES` では omitted、`NULL`、`0`、`DEFAULT` の値を MySQL-like sequence value で補完します

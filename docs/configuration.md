@@ -295,8 +295,9 @@ random sequence behavior.
 The fallback also translates MySQL backslash escapes in string literals, adds
 MySQL's default backslash escape behavior for `LIKE` patterns when no explicit
 `ESCAPE` clause is present, and removes table qualifiers from
-`UPDATE ... SET table.column = ...` targets. `DROP DATABASE` and `DROP SCHEMA`
-are accepted as no-op teardown statements.
+`UPDATE ... SET table.column = ...` targets. `CREATE DATABASE` and
+`CREATE SCHEMA` are accepted as no-op setup statements, and `DROP DATABASE` and
+`DROP SCHEMA` are accepted as no-op teardown statements.
 For `CREATE TABLE` statements, mysqlmock strips MySQL partition clauses before
 SQLite execution and applies `ZEROFILL` display width padding to simple
 result-set values for declared integer columns.

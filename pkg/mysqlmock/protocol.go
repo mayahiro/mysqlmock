@@ -392,6 +392,9 @@ func (c *mysqlConn) executeQuery(ctx context.Context, command, sqlText string, a
 	case isInformationSchemaQuery(upper):
 		c.logQuery(command, "compat", sqlText, normalized)
 		return c.queryInformationSchemaText(ctx, trimmed, command == "COM_QUERY", args...)
+	case isCreateDatabaseStatement(trimmed):
+		c.logQuery(command, "compat", sqlText, normalized)
+		return okResult{}, nil
 	case upper == "BEGIN" || upper == "START TRANSACTION":
 		c.logQuery(command, "sqlite", sqlText, normalized)
 		return c.execSQLite(ctx, "BEGIN")

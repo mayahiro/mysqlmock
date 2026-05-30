@@ -3518,6 +3518,20 @@ CREATE TABLE ddl_users (
 	}
 	assertShowKeyColumns(t, ctx, db, "ddl_users", "idx_ddl_users_display_name", nil)
 
+	if _, err := db.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS `rspec_test` DEFAULT CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci"); err != nil {
+		t.Fatalf("create database no-op: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CREATE SCHEMA `rspec_schema` ENCRYPTION = 'N'"); err != nil {
+		t.Fatalf("create schema no-op: %v", err)
+	}
+	var currentDB string
+	if err := db.QueryRowContext(ctx, "SELECT DATABASE()").Scan(&currentDB); err != nil {
+		t.Fatalf("select database after create database no-op: %v", err)
+	}
+	if currentDB != "mysqlmock" {
+		t.Fatalf("current database after create database no-op = %q, want mysqlmock", currentDB)
+	}
+
 	if _, err := db.ExecContext(ctx, "ALTER TABLE ddl_users CHANGE COLUMN display_name nickname VARCHAR(20) NOT NULL"); err != nil {
 		t.Fatalf("alter change column: %v", err)
 	}
@@ -3541,7 +3555,20 @@ CREATE TABLE ddl_users (
 	if _, err := db.ExecContext(ctx, "DROP DATABASE IF EXISTS `teardown_db`"); err != nil {
 		t.Fatalf("drop database teardown: %v", err)
 	}
+	assertQueryRoute(t, server, "CREATE DATABASE ", "compat")
+	assertQueryRoute(t, server, "CREATE SCHEMA ", "compat")
 	mysqlmock.AssertNoUnsupported(t, server)
+}
+
+func assertQueryRoute(t *testing.T, server *mysqlmock.Server, normalizedPrefix, route string) {
+	t.Helper()
+
+	for _, query := range server.Queries() {
+		if strings.HasPrefix(query.NormalizedSQL, normalizedPrefix) && query.Route == route {
+			return
+		}
+	}
+	t.Fatalf("query route with normalized prefix %q and route %q not found: %#v", normalizedPrefix, route, server.Queries())
 }
 
 func assertShowKeyColumns(t *testing.T, ctx context.Context, db *sql.DB, tableName, keyName string, want []string) {
