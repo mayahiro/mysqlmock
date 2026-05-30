@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"strings"
+	"time"
 )
 
 func isAdvisoryLockQuery(upperSQL string) bool {
@@ -42,6 +43,11 @@ func isShowKeysQuery(upperSQL string) bool {
 }
 
 func (c *mysqlConn) showFullFields(ctx context.Context, sqlText string) (resultSet, error) {
+	start := time.Now()
+	defer func() {
+		c.server.stats.recordPhaseTiming("information_schema.show_full_fields", time.Since(start))
+	}()
+
 	c.server.stats.recordShowFullFieldsQuery()
 	tableName, likePattern, ok := parseShowFullFields(sqlText)
 	if !ok {

@@ -412,40 +412,52 @@ func (c *mysqlConn) executeQuery(ctx context.Context, command, sqlText string, a
 		return okResult{}, nil
 	case upper == "BEGIN" || upper == "START TRANSACTION":
 		recordRoute("sqlite")
-		return c.execSQLite(ctx, "BEGIN")
+		return c.execSQLiteTransactionPhase(ctx, "transaction.begin", "BEGIN")
 	case upper == "COMMIT":
 		recordRoute("sqlite")
-		resp, err := c.execSQLite(ctx, "COMMIT")
+		resp, err := c.execSQLiteTransactionPhase(ctx, "transaction.commit", "COMMIT")
 		c.statusFlags &^= serverStatusInTrans
 		return resp, err
 	case upper == "ROLLBACK":
 		recordRoute("sqlite")
+		transactionStart := time.Now()
 		resp, err := c.execSQLite(ctx, "ROLLBACK")
 		if err == nil {
-			err = c.restoreMySQLAutoIncrementSequences(ctx)
+			err = c.restoreMySQLAutoIncrementSequencesWithTiming(ctx)
 		}
 		c.statusFlags &^= serverStatusInTrans
+		c.server.stats.recordPhaseTiming("transaction.rollback", time.Since(transactionStart))
 		return resp, err
 	case upper == "ROLLBACK AND CHAIN":
 		recordRoute("sqlite")
+		transactionStart := time.Now()
+		defer func() {
+			c.server.stats.recordPhaseTiming("transaction.rollback_and_chain", time.Since(transactionStart))
+		}()
 		if _, err := c.execSQLite(ctx, "ROLLBACK"); err != nil {
 			return okResult{}, err
 		}
-		if err := c.restoreMySQLAutoIncrementSequences(ctx); err != nil {
+		if err := c.restoreMySQLAutoIncrementSequencesWithTiming(ctx); err != nil {
 			return okResult{}, err
 		}
 		return c.execSQLite(ctx, "BEGIN")
 	case strings.HasPrefix(upper, "ROLLBACK TO SAVEPOINT "):
 		recordRoute("sqlite")
+		transactionStart := time.Now()
 		resp, err := c.execSQLite(ctx, trimmed)
 		if err == nil {
-			err = c.restoreMySQLAutoIncrementSequences(ctx)
+			err = c.restoreMySQLAutoIncrementSequencesWithTiming(ctx)
 		}
+		c.server.stats.recordPhaseTiming("transaction.rollback_to_savepoint", time.Since(transactionStart))
 		return resp, err
 	case strings.HasPrefix(upper, "SAVEPOINT ") ||
 		strings.HasPrefix(upper, "RELEASE SAVEPOINT "):
 		recordRoute("sqlite")
-		return c.execSQLite(ctx, trimmed)
+		phase := "transaction.savepoint"
+		if strings.HasPrefix(upper, "RELEASE SAVEPOINT ") {
+			phase = "transaction.release_savepoint"
+		}
+		return c.execSQLiteTransactionPhase(ctx, phase, trimmed)
 	}
 
 	if isReadQuery(upper) {
@@ -480,6 +492,13 @@ func (c *mysqlConn) executeQuery(ctx context.Context, command, sqlText string, a
 	route = "unsupported"
 	c.recordUnsupported(command, sqlText, normalized, "unsupported")
 	return nil, c.server.unsupportedError(sqlText)
+}
+
+func (c *mysqlConn) execSQLiteTransactionPhase(ctx context.Context, phase, query string) (okResult, error) {
+	start := time.Now()
+	resp, err := c.execSQLite(ctx, query)
+	c.server.stats.recordPhaseTiming(phase, time.Since(start))
+	return resp, err
 }
 
 func (c *mysqlConn) setAutocommit(upper string) okResult {
@@ -758,7 +777,10 @@ func (c *mysqlConn) execSQLite(ctx context.Context, query string, args ...any) (
 	if strings.EqualFold(strings.TrimSpace(query), "BEGIN") {
 		c.statusFlags |= serverStatusInTrans
 	}
-	if err := c.validateMySQLWriteValues(ctx, query, args...); err != nil {
+	validationStart := time.Now()
+	err := c.validateMySQLWriteValues(ctx, query, args...)
+	c.server.stats.recordPhaseTiming("mysql.write_validation", time.Since(validationStart))
+	if err != nil {
 		return okResult{}, err
 	}
 	sqliteStart := time.Now()
@@ -1441,6 +1463,11 @@ func consumeOptionalNumericCall(sqlText string, pos int) int {
 }
 
 func (c *mysqlConn) logQuery(command, route, sqlText, normalizedSQL string) {
+	start := time.Now()
+	defer func() {
+		c.server.stats.recordPhaseTiming("query.log", time.Since(start))
+	}()
+
 	c.server.logQuery(QueryEvent{
 		Event:         "query",
 		ConnectionID:  c.connectionID,

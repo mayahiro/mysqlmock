@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"time"
 )
 
 type mysqlAutoIncrementInsertValue struct {
@@ -49,6 +50,11 @@ func (c *mysqlConn) recordMySQLAutoIncrementAllocation(ctx context.Context, quer
 	if result.LastInsertID == 0 {
 		return
 	}
+	start := time.Now()
+	defer func() {
+		c.server.stats.recordPhaseTiming("mysql.auto_increment.record_allocation", time.Since(start))
+	}()
+
 	tableName, ok := parseInsertTargetTable(query)
 	if !ok {
 		return
@@ -81,13 +87,22 @@ func (c *mysqlConn) restoreMySQLAutoIncrementSequences(ctx context.Context) erro
 	return nil
 }
 
+func (c *mysqlConn) restoreMySQLAutoIncrementSequencesWithTiming(ctx context.Context) error {
+	start := time.Now()
+	err := c.restoreMySQLAutoIncrementSequences(ctx)
+	c.server.stats.recordPhaseTiming("mysql.auto_increment.restore", time.Since(start))
+	return err
+}
+
 func (c *mysqlConn) sqliteTableUsesAutoincrement(ctx context.Context, tableName string) (bool, error) {
 	var createSQL sql.NullString
+	start := time.Now()
 	err := c.sqliteConn.QueryRowContext(ctx, `
 SELECT sql
 FROM main.sqlite_master
 WHERE type = 'table'
   AND name = ?`, unquoteSQLWord(tableName)).Scan(&createSQL)
+	c.server.stats.recordPhaseTiming("mysql.auto_increment.sqlite_table_lookup", time.Since(start))
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -98,6 +113,11 @@ WHERE type = 'table'
 }
 
 func (c *mysqlConn) setSQLiteSequenceAtLeast(ctx context.Context, tableName string, value uint64) error {
+	start := time.Now()
+	defer func() {
+		c.server.stats.recordPhaseTiming("mysql.auto_increment.sequence_update", time.Since(start))
+	}()
+
 	if value > math.MaxInt64 {
 		value = math.MaxInt64
 	}
@@ -203,6 +223,11 @@ func (c *mysqlConn) applyMySQLAutoIncrementInsertValue(ctx context.Context, tabl
 }
 
 func (c *mysqlConn) nextMySQLAutoIncrementValue(ctx context.Context, tableName, columnName string) (uint64, error) {
+	start := time.Now()
+	defer func() {
+		c.server.stats.recordPhaseTiming("mysql.auto_increment.next_value", time.Since(start))
+	}()
+
 	query := fmt.Sprintf("SELECT MAX(%s) FROM %s", quoteIdent(unquoteSQLWord(columnName)), quoteIdent(unquoteSQLWord(tableName)))
 	var maxValue sql.NullInt64
 	if err := c.sqliteConn.QueryRowContext(ctx, query).Scan(&maxValue); err != nil {

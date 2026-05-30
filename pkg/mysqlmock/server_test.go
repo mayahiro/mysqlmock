@@ -4068,6 +4068,16 @@ func TestServerStatsDoNotStoreSQLText(t *testing.T) {
 	if _, err := db.ExecContext(ctx, "CREATE USER stats_unsupported"); err == nil {
 		t.Fatal("expected unsupported query")
 	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin stats transaction: %v", err)
+	}
+	if _, err := tx.ExecContext(ctx, "INSERT INTO users (name, email) VALUES (?, ?)", "Stats Rollback", "stats-rollback@example.com"); err != nil {
+		t.Fatalf("insert in stats transaction: %v", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("rollback stats transaction: %v", err)
+	}
 	if err := server.Reset(ctx); err != nil {
 		t.Fatalf("reset: %v", err)
 	}
@@ -4107,8 +4117,20 @@ func TestServerStatsDoNotStoreSQLText(t *testing.T) {
 		t.Fatalf("query timing buckets = %#v, want compat, sqlite, and select timings", stats.Timings.Queries)
 	}
 	for _, phase := range []string{
+		"query.log",
 		"sqlite.query",
+		"mysql.write_validation",
+		"mysql.upsert_compat",
+		"mysql.insert_compat",
+		"mysql.auto_increment.record_allocation",
+		"mysql.auto_increment.restore",
+		"mysql.auto_increment.sqlite_table_lookup",
+		"mysql.auto_increment.sequence_update",
+		"metadata.table_columns",
+		"transaction.begin",
+		"transaction.rollback",
 		"protocol.result_set_text",
+		"information_schema.show_full_fields",
 		"information_schema.target_table_refresh",
 		"reset.data_only",
 	} {

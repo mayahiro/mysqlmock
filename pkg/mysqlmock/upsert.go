@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"time"
 )
 
 type mysqlUpsertStatement struct {
@@ -78,6 +79,11 @@ type cachedUniqueKeys struct {
 }
 
 func (c *mysqlConn) execMySQLUpsert(ctx context.Context, sqlText string, args ...any) (okResult, bool, error) {
+	start := time.Now()
+	defer func() {
+		c.server.stats.recordPhaseTiming("mysql.upsert_compat", time.Since(start))
+	}()
+
 	stmt, ok, err := c.server.parseMySQLUpsertStatementCached(sqlText, args)
 	if err != nil || !ok {
 		return okResult{}, ok, err
@@ -154,6 +160,11 @@ func (c *mysqlConn) execMySQLUpsert(ctx context.Context, sqlText string, args ..
 }
 
 func (c *mysqlConn) execMySQLInsertCompatibility(ctx context.Context, sqlText string, args ...any) (okResult, bool, error) {
+	start := time.Now()
+	defer func() {
+		c.server.stats.recordPhaseTiming("mysql.insert_compat", time.Since(start))
+	}()
+
 	stmt, ok, err := c.server.parseMySQLInsertStatementCached(sqlText, args)
 	if err != nil || !ok {
 		return okResult{}, ok, err
@@ -1082,6 +1093,11 @@ func (c *mysqlConn) indexColumns(ctx context.Context, indexName string) ([]strin
 }
 
 func (c *mysqlConn) tableColumns(ctx context.Context, tableName string) ([]sqliteTableColumn, error) {
+	start := time.Now()
+	defer func() {
+		c.server.stats.recordPhaseTiming("metadata.table_columns", time.Since(start))
+	}()
+
 	version := c.server.currentSchemaVersion()
 	cacheKey := normalizedTableCacheKey(tableName)
 	c.server.metadataMu.Lock()
