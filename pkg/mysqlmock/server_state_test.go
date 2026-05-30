@@ -43,7 +43,8 @@ func TestStatsStoreSnapshotsAreCopies(t *testing.T) {
 	store.recordQuery("COM_QUERY", "sqlite", "SELECT 1")
 	store.recordQuery("COM_STMT_EXECUTE", "compat", "SHOW FULL FIELDS FROM users")
 	store.recordUnsupported()
-	store.recordInformationSchemaQuery(true)
+	store.recordInformationSchemaQuery(true, "")
+	store.recordInformationSchemaQuery(false, informationSchemaBroadReasonNoTableNameFilter)
 	store.recordShowFullFieldsQuery()
 	store.recordInformationSchemaTargetTableRefresh(true)
 	store.recordReset("data_only")
@@ -68,8 +69,10 @@ func TestStatsStoreSnapshotsAreCopies(t *testing.T) {
 	if stats.Unsupported != 1 || stats.SchemaChanges != 1 {
 		t.Fatalf("unsupported/schema changes = %d/%d, want 1/1", stats.Unsupported, stats.SchemaChanges)
 	}
-	if stats.Metadata.InformationSchemaQueries != 1 ||
+	if stats.Metadata.InformationSchemaQueries != 2 ||
 		stats.Metadata.TargetedInformationSchemaQueries != 1 ||
+		stats.Metadata.BroadInformationSchemaQueries != 1 ||
+		stats.Metadata.BroadInformationSchemaQueryReasons[informationSchemaBroadReasonNoTableNameFilter] != 1 ||
 		stats.Metadata.ShowFullFieldsQueries != 1 ||
 		stats.Metadata.TargetTableRefreshes != 1 ||
 		stats.Metadata.TablesLoaded != 0 {
@@ -97,6 +100,7 @@ func TestStatsStoreSnapshotsAreCopies(t *testing.T) {
 	stats.Queries.ByKind["select"] = 99
 	stats.Timings.Queries.ByRoute["sqlite"] = TimingBucket{Count: 99, TotalNanos: 99, MaxNanos: 99}
 	stats.Timings.Phases.ByPhase["sqlite.exec"] = TimingBucket{Count: 99, TotalNanos: 99, MaxNanos: 99}
+	stats.Metadata.BroadInformationSchemaQueryReasons[informationSchemaBroadReasonNoTableNameFilter] = 99
 	again := store.snapshot()
 	if again.Queries.ByCommand["COM_QUERY"] != 1 ||
 		again.Queries.ByRoute["sqlite"] != 1 ||
@@ -106,6 +110,9 @@ func TestStatsStoreSnapshotsAreCopies(t *testing.T) {
 	if again.Timings.Queries.ByRoute["sqlite"].Count != 1 ||
 		again.Timings.Phases.ByPhase["sqlite.exec"].Count != 1 {
 		t.Fatalf("timing snapshot mutation changed store: %#v", again.Timings)
+	}
+	if again.Metadata.BroadInformationSchemaQueryReasons[informationSchemaBroadReasonNoTableNameFilter] != 1 {
+		t.Fatalf("metadata snapshot mutation changed store: %#v", again.Metadata)
 	}
 }
 

@@ -29,8 +29,8 @@ func (c *mysqlConn) queryInformationSchema(ctx context.Context, sqlText string, 
 }
 
 func (c *mysqlConn) queryInformationSchemaText(ctx context.Context, sqlText string, stream bool, args ...any) (any, error) {
-	tableName, targeted := informationSchemaTargetTable(sqlText, args)
-	c.server.stats.recordInformationSchemaQuery(targeted)
+	tableName, targeted, broadReason := informationSchemaTargetTable(sqlText, args)
+	c.server.stats.recordInformationSchemaQuery(targeted, broadReason)
 
 	version := c.server.currentSchemaVersion()
 	query := c.server.translateSQLCached(rewriteInformationSchemaSQL(sqlText, c.currentDB))
@@ -379,6 +379,21 @@ func (c *mysqlConn) createInformationSchemaTables(ctx context.Context) error {
 	for _, stmt := range statements {
 		if _, err := c.sqliteConn.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("create information_schema table: %w", err)
+		}
+	}
+	indexes := []string{
+		`CREATE INDEX IF NOT EXISTS "information_schema"."idx_information_schema_tables_name" ON "tables" (TABLE_SCHEMA, TABLE_NAME)`,
+		`CREATE INDEX IF NOT EXISTS "information_schema"."idx_information_schema_columns_table" ON "columns" (TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION)`,
+		`CREATE INDEX IF NOT EXISTS "information_schema"."idx_information_schema_columns_name" ON "columns" (TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME)`,
+		`CREATE INDEX IF NOT EXISTS "information_schema"."idx_information_schema_statistics_column" ON "statistics" (TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, INDEX_NAME, NON_UNIQUE)`,
+		`CREATE INDEX IF NOT EXISTS "information_schema"."idx_information_schema_statistics_table" ON "statistics" (TABLE_SCHEMA, TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX)`,
+		`CREATE INDEX IF NOT EXISTS "information_schema"."idx_information_schema_key_column_usage_table" ON "key_column_usage" (TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME)`,
+		`CREATE INDEX IF NOT EXISTS "information_schema"."idx_information_schema_table_constraints_table" ON "table_constraints" (TABLE_SCHEMA, TABLE_NAME, CONSTRAINT_NAME)`,
+		`CREATE INDEX IF NOT EXISTS "information_schema"."idx_information_schema_referential_constraints_table" ON "referential_constraints" (CONSTRAINT_SCHEMA, TABLE_NAME, CONSTRAINT_NAME)`,
+	}
+	for _, stmt := range indexes {
+		if _, err := c.sqliteConn.ExecContext(ctx, stmt); err != nil {
+			return fmt.Errorf("create information_schema index: %w", err)
 		}
 	}
 	return nil
@@ -831,9 +846,19 @@ func informationSchemaColumnTypes(declaredType string) (dataType, columnType str
 	return dataType, columnType
 }
 
-func informationSchemaTargetTable(sqlText string, args []any) (string, bool) {
-	if containsSQLIdentifier(sqlText, "OR") || informationSchemaReferencesSchemata(sqlText) {
-		return "", false
+const (
+	informationSchemaBroadReasonContainsOr             = "contains_or"
+	informationSchemaBroadReasonReferencesSchemata     = "references_schemata"
+	informationSchemaBroadReasonNoTableNameFilter      = "no_table_name_filter"
+	informationSchemaBroadReasonUnsupportedTableFilter = "unsupported_table_filter"
+)
+
+func informationSchemaTargetTable(sqlText string, args []any) (string, bool, string) {
+	if containsSQLIdentifier(sqlText, "OR") {
+		return "", false, informationSchemaBroadReasonContainsOr
+	}
+	if informationSchemaReferencesSchemata(sqlText) {
+		return "", false, informationSchemaBroadReasonReferencesSchemata
 	}
 	for i := 0; i < len(sqlText); {
 		if sqlText[i] == '\'' {
@@ -861,22 +886,26 @@ func informationSchemaTargetTable(sqlText string, args []any) (string, bool) {
 		}
 		valueStart := skipSQLSpaces(sqlText, next+1)
 		if valueStart >= len(sqlText) {
-			return "", false
+			return "", false, informationSchemaBroadReasonUnsupportedTableFilter
 		}
 		if sqlText[valueStart] == '?' {
 			index := countPlaceholders(sqlText[:valueStart])
-			return informationSchemaTableNameArg(args, index)
+			tableName, ok := informationSchemaTableNameArg(args, index)
+			if !ok {
+				return "", false, informationSchemaBroadReasonUnsupportedTableFilter
+			}
+			return tableName, true, ""
 		}
 		if sqlText[valueStart] == '\'' || sqlText[valueStart] == '"' {
 			valueEnd, ok := quotedSQLSpan(sqlText, valueStart)
 			if !ok {
-				return "", false
+				return "", false, informationSchemaBroadReasonUnsupportedTableFilter
 			}
-			return unquoteSQLWord(sqlText[valueStart:valueEnd]), true
+			return unquoteSQLWord(sqlText[valueStart:valueEnd]), true, ""
 		}
-		return "", false
+		return "", false, informationSchemaBroadReasonUnsupportedTableFilter
 	}
-	return "", false
+	return "", false, informationSchemaBroadReasonNoTableNameFilter
 }
 
 func informationSchemaReferencesSchemata(sqlText string) bool {

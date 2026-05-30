@@ -3,6 +3,7 @@ package mysqlmock
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -264,7 +265,7 @@ ORDER BY ORDINAL_POSITION`, "target_users")
 	}
 }
 
-func TestShowFullFieldsAndShowKeysUseTargetTableRefresh(t *testing.T) {
+func TestShowFullFieldsUsesDirectMetadataAndShowKeysUsesTargetTableRefresh(t *testing.T) {
 	ctx := context.Background()
 	conn := newInformationSchemaTestConn(t, ctx)
 
@@ -288,7 +289,10 @@ CREATE TABLE other_users (
 	if got, want := resultColumnValues(fields, 0), []any{"id", "email"}; !equalAnySlices(got, want) {
 		t.Fatalf("SHOW FULL FIELDS result = %#v, want %#v", got, want)
 	}
-	assertInformationSchemaTableNames(t, ctx, conn, "columns", []string{"target_users"})
+	stats := conn.server.Stats().Metadata
+	if stats.TargetTableRefreshes != 0 || stats.TablesLoaded != 0 {
+		t.Fatalf("SHOW FULL FIELDS metadata stats = %#v, want no information_schema refresh", stats)
+	}
 
 	keys, err := conn.showKeys(ctx, "SHOW KEYS FROM `target_users`")
 	if err != nil {
@@ -419,6 +423,76 @@ CREATE TABLE target_users (
 		t.Fatalf("full refresh stats = refreshes:%d hits:%d, want 1/1", stats.FullRefreshes, stats.FullRefreshCacheHits)
 	}
 	assertInformationSchemaColumnNames(t, ctx, conn2, "target_users", []string{"id"})
+}
+
+func TestInformationSchemaBroadQueryReasonStats(t *testing.T) {
+	ctx := context.Background()
+	conn := newInformationSchemaTestConn(t, ctx)
+
+	if _, err := conn.sqliteConn.ExecContext(ctx, `
+CREATE TABLE target_users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  email TEXT NOT NULL
+);
+CREATE TABLE other_users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT
+);`); err != nil {
+		t.Fatalf("create test tables: %v", err)
+	}
+
+	queries := []struct {
+		name string
+		sql  string
+		args []any
+	}{
+		{
+			name: "references_schemata",
+			sql:  `SELECT SCHEMA_NAME FROM information_schema.schemata`,
+		},
+		{
+			name: "no_table_name_filter",
+			sql:  `SELECT TABLE_NAME FROM information_schema.tables ORDER BY TABLE_NAME`,
+		},
+		{
+			name: "unsupported_table_filter",
+			sql:  `SELECT TABLE_NAME FROM information_schema.tables WHERE TABLE_NAME = LOWER('target_users')`,
+		},
+		{
+			name: "contains_or",
+			sql:  `SELECT COLUMN_NAME FROM information_schema.columns WHERE TABLE_NAME = ? OR TABLE_NAME = ?`,
+			args: []any{"target_users", "other_users"},
+		},
+	}
+	for _, query := range queries {
+		if _, err := conn.queryInformationSchema(ctx, query.sql, query.args...); err != nil {
+			t.Fatalf("query %s: %v", query.name, err)
+		}
+	}
+
+	stats := conn.server.Stats().Metadata
+	if stats.BroadInformationSchemaQueries != uint64(len(queries)) {
+		t.Fatalf("broad information_schema queries = %d, want %d", stats.BroadInformationSchemaQueries, len(queries))
+	}
+	wantReasons := map[string]uint64{
+		informationSchemaBroadReasonReferencesSchemata:     1,
+		informationSchemaBroadReasonNoTableNameFilter:      1,
+		informationSchemaBroadReasonUnsupportedTableFilter: 1,
+		informationSchemaBroadReasonContainsOr:             1,
+	}
+	for reason, want := range wantReasons {
+		if got := stats.BroadInformationSchemaQueryReasons[reason]; got != want {
+			t.Fatalf("broad reason %s = %d, want %d in %#v", reason, got, want, stats.BroadInformationSchemaQueryReasons)
+		}
+	}
+	statsJSON, err := json.Marshal(conn.server.Stats())
+	if err != nil {
+		t.Fatalf("marshal stats: %v", err)
+	}
+	for _, secret := range []string{"target_users", "other_users", "email", "SCHEMA_NAME"} {
+		if strings.Contains(string(statsJSON), secret) {
+			t.Fatalf("stats JSON contains SQL text or object name %q: %s", secret, statsJSON)
+		}
+	}
 }
 
 func newInformationSchemaTestConn(t testing.TB, ctx context.Context) *mysqlConn {

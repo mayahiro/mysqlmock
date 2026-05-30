@@ -57,65 +57,268 @@ func (c *mysqlConn) showFullFields(ctx context.Context, sqlText string) (resultS
 	if cached, ok := c.server.cachedShowFullFieldsResult(c.currentDB, tableName, likePattern, c.collationConnection, version); ok {
 		return cached, nil
 	}
-	exists, err := c.refreshInformationSchemaTable(ctx, tableName)
-	if err != nil {
-		return resultSet{}, err
-	}
-	if !exists {
-		return resultSet{}, errPacket(mysqlErrNoSuchTable, "42S02", "Table '"+c.currentDB+"."+tableName+"' doesn't exist")
-	}
-
-	query := `
-SELECT
-  c.COLUMN_NAME AS "Field",
-  c.COLUMN_TYPE AS "Type",
-  CASE
-    WHEN c.DATA_TYPE IN ('text', 'varchar', 'char') OR c.COLUMN_TYPE LIKE '%char%' THEN ?
-    ELSE NULL
-  END AS "Collation",
-  c.IS_NULLABLE AS "Null",
-  CASE
-    WHEN EXISTS (
-      SELECT 1 FROM "information_schema"."statistics" s
-      WHERE s.TABLE_SCHEMA = c.TABLE_SCHEMA
-        AND s.TABLE_NAME = c.TABLE_NAME
-        AND s.COLUMN_NAME = c.COLUMN_NAME
-        AND s.INDEX_NAME = 'PRIMARY'
-    ) THEN 'PRI'
-    WHEN EXISTS (
-      SELECT 1 FROM "information_schema"."statistics" s
-      WHERE s.TABLE_SCHEMA = c.TABLE_SCHEMA
-        AND s.TABLE_NAME = c.TABLE_NAME
-        AND s.COLUMN_NAME = c.COLUMN_NAME
-        AND s.NON_UNIQUE = 0
-    ) THEN 'UNI'
-    WHEN EXISTS (
-      SELECT 1 FROM "information_schema"."statistics" s
-      WHERE s.TABLE_SCHEMA = c.TABLE_SCHEMA
-        AND s.TABLE_NAME = c.TABLE_NAME
-        AND s.COLUMN_NAME = c.COLUMN_NAME
-    ) THEN 'MUL'
-    ELSE c.COLUMN_KEY
-  END AS "Key",
-  c.COLUMN_DEFAULT AS "Default",
-  c.EXTRA AS "Extra",
-  'select,insert,update,references' AS "Privileges",
-  '' AS "Comment"
-FROM "information_schema"."columns" c
-WHERE c.TABLE_SCHEMA = ?
-  AND c.TABLE_NAME = ?`
-	args := []any{c.collationConnection, c.currentDB, tableName}
-	if likePattern != "" {
-		query += "\n  AND c.COLUMN_NAME LIKE ?"
-		args = append(args, likePattern)
-	}
-	query += "\nORDER BY c.ORDINAL_POSITION"
-	result, err := c.querySQLite(ctx, query, args...)
+	result, err := c.showFullFieldsDirect(ctx, tableName, likePattern)
 	if err != nil {
 		return resultSet{}, err
 	}
 	c.server.markShowFullFieldsResult(c.currentDB, tableName, likePattern, c.collationConnection, version, result)
 	return result, nil
+}
+
+type showFullFieldColumn struct {
+	name       string
+	dataType   string
+	columnType string
+	isNullable string
+	columnKey  string
+	defaultVal any
+	extra      string
+}
+
+func (c *mysqlConn) showFullFieldsDirect(ctx context.Context, tableName, likePattern string) (resultSet, error) {
+	var createSQL sql.NullString
+	err := c.sqliteConn.QueryRowContext(ctx, `
+SELECT sql
+FROM main.sqlite_master
+WHERE type IN ('table', 'view')
+  AND name = ?
+  AND name NOT LIKE 'sqlite_%'`, tableName).Scan(&createSQL)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return resultSet{}, errPacket(mysqlErrNoSuchTable, "42S02", "Table '"+c.currentDB+"."+tableName+"' doesn't exist")
+		}
+		return resultSet{}, err
+	}
+	columns, err := c.showFullFieldColumns(ctx, tableName, createSQL.String)
+	if err != nil {
+		return resultSet{}, err
+	}
+	keys, err := c.showFullFieldIndexKeys(ctx, tableName)
+	if err != nil {
+		return resultSet{}, err
+	}
+
+	rows := make([][]any, 0, len(columns))
+	for _, column := range columns {
+		if likePattern != "" && !sqlLikeMatch(column.name, likePattern) {
+			continue
+		}
+		collation := any(nil)
+		if columnUsesTextCollation(column.dataType, column.columnType) {
+			collation = c.collationConnection
+		}
+		columnKey := column.columnKey
+		if key, ok := keys[showFullFieldColumnKey(column.name)]; ok && columnKey != "PRI" {
+			columnKey = key
+		}
+		rows = append(rows, []any{
+			column.name,
+			column.columnType,
+			collation,
+			column.isNullable,
+			columnKey,
+			column.defaultVal,
+			column.extra,
+			"select,insert,update,references",
+			"",
+		})
+	}
+	return resultSet{
+		Columns: showFullFieldsResultColumns(),
+		Rows:    rows,
+	}, nil
+}
+
+func (c *mysqlConn) showFullFieldColumns(ctx context.Context, tableName, createSQL string) ([]showFullFieldColumn, error) {
+	rows, err := c.sqliteConn.QueryContext(ctx, "PRAGMA main.table_info("+quoteIdent(tableName)+")")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	upperCreateSQL := strings.ToUpper(createSQL)
+	columns := []showFullFieldColumn{}
+	for rows.Next() {
+		var cid int
+		var columnName string
+		var declaredType string
+		var notNull int
+		var defaultValue sql.NullString
+		var primaryKey int
+		if err := rows.Scan(&cid, &columnName, &declaredType, &notNull, &defaultValue, &primaryKey); err != nil {
+			return nil, err
+		}
+		dataType, columnType := informationSchemaColumnTypes(declaredType)
+		isNullable := "YES"
+		if notNull != 0 || primaryKey != 0 {
+			isNullable = "NO"
+		}
+		columnKey := ""
+		if primaryKey != 0 {
+			columnKey = "PRI"
+		}
+		extra := ""
+		if primaryKey != 0 && strings.Contains(upperCreateSQL, "AUTOINCREMENT") {
+			extra = "auto_increment"
+		}
+		var defaultArg any
+		if defaultValue.Valid {
+			defaultArg = mysqlColumnDefaultMetadataValue(defaultValue.String)
+		}
+		columns = append(columns, showFullFieldColumn{
+			name:       columnName,
+			dataType:   dataType,
+			columnType: columnType,
+			isNullable: isNullable,
+			columnKey:  columnKey,
+			defaultVal: defaultArg,
+			extra:      extra,
+		})
+		_ = cid
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return columns, nil
+}
+
+func (c *mysqlConn) showFullFieldIndexKeys(ctx context.Context, tableName string) (map[string]string, error) {
+	indexRows, err := c.sqliteConn.QueryContext(ctx, "PRAGMA main.index_list("+quoteIdent(tableName)+")")
+	if err != nil {
+		return nil, err
+	}
+	defer indexRows.Close()
+
+	keys := map[string]string{}
+	for indexRows.Next() {
+		var seq int
+		var sqliteIndexName string
+		var unique int
+		var origin string
+		var partial int
+		if err := indexRows.Scan(&seq, &sqliteIndexName, &unique, &origin, &partial); err != nil {
+			return nil, err
+		}
+		_ = seq
+		_ = origin
+		_ = partial
+		if sqliteIndexName == "" {
+			continue
+		}
+		if err := c.addShowFullFieldIndexKeys(ctx, keys, tableName, sqliteIndexName, unique); err != nil {
+			return nil, err
+		}
+	}
+	if err := indexRows.Err(); err != nil {
+		return nil, err
+	}
+	return keys, nil
+}
+
+func (c *mysqlConn) addShowFullFieldIndexKeys(ctx context.Context, keys map[string]string, tableName, sqliteIndexName string, unique int) error {
+	metadata, hasMetadata := c.server.lookupMySQLIndexMetadataBySQLiteName(tableName, sqliteIndexName)
+	columnRows, err := c.sqliteConn.QueryContext(ctx, "PRAGMA main.index_info("+quoteIdent(sqliteIndexName)+")")
+	if err != nil {
+		return err
+	}
+	defer columnRows.Close()
+
+	for columnRows.Next() {
+		var seqno int
+		var cid int
+		var columnName sql.NullString
+		if err := columnRows.Scan(&seqno, &cid, &columnName); err != nil {
+			return err
+		}
+		_ = cid
+		insertColumnName := columnName.String
+		if hasMetadata && seqno < len(metadata.Columns) && metadata.Columns[seqno].ColumnName != "" {
+			insertColumnName = metadata.Columns[seqno].ColumnName
+		}
+		if insertColumnName == "" {
+			continue
+		}
+		key := showFullFieldColumnKey(insertColumnName)
+		current := keys[key]
+		if current == "PRI" || current == "UNI" {
+			continue
+		}
+		if unique != 0 {
+			keys[key] = "UNI"
+		} else if current == "" {
+			keys[key] = "MUL"
+		}
+	}
+	return columnRows.Err()
+}
+
+func showFullFieldsResultColumns() []resultColumn {
+	return []resultColumn{
+		{Name: "Field", Type: fieldTypeVarString},
+		{Name: "Type", Type: fieldTypeVarString},
+		{Name: "Collation", Type: fieldTypeVarString},
+		{Name: "Null", Type: fieldTypeVarString},
+		{Name: "Key", Type: fieldTypeVarString},
+		{Name: "Default", Type: fieldTypeVarString},
+		{Name: "Extra", Type: fieldTypeVarString},
+		{Name: "Privileges", Type: fieldTypeVarString},
+		{Name: "Comment", Type: fieldTypeVarString},
+	}
+}
+
+func columnUsesTextCollation(dataType, columnType string) bool {
+	return dataType == "text" || dataType == "varchar" || dataType == "char" || strings.Contains(columnType, "char")
+}
+
+func showFullFieldColumnKey(columnName string) string {
+	return strings.ToLower(columnName)
+}
+
+func sqlLikeMatch(value, pattern string) bool {
+	return sqlLikeMatchAt(value, pattern, 0, 0)
+}
+
+func sqlLikeMatchAt(value, pattern string, valuePos, patternPos int) bool {
+	for patternPos < len(pattern) {
+		switch pattern[patternPos] {
+		case '%':
+			for patternPos < len(pattern) && pattern[patternPos] == '%' {
+				patternPos++
+			}
+			if patternPos == len(pattern) {
+				return true
+			}
+			for i := valuePos; i <= len(value); i++ {
+				if sqlLikeMatchAt(value, pattern, i, patternPos) {
+					return true
+				}
+			}
+			return false
+		case '_':
+			if valuePos >= len(value) {
+				return false
+			}
+			valuePos++
+			patternPos++
+		default:
+			if valuePos >= len(value) || !equalASCIIFoldByte(value[valuePos], pattern[patternPos]) {
+				return false
+			}
+			valuePos++
+			patternPos++
+		}
+	}
+	return valuePos == len(value)
+}
+
+func equalASCIIFoldByte(a, b byte) bool {
+	if 'A' <= a && a <= 'Z' {
+		a += 'a' - 'A'
+	}
+	if 'A' <= b && b <= 'Z' {
+		b += 'a' - 'A'
+	}
+	return a == b
 }
 
 func (c *mysqlConn) showCreateTable(ctx context.Context, sqlText string) (resultSet, error) {

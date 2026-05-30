@@ -26,18 +26,19 @@ type QueryStats struct {
 
 // MetadataStats summarizes schema metadata work without storing object names.
 type MetadataStats struct {
-	InformationSchemaQueries         uint64 `json:"information_schema_queries"`
-	TargetedInformationSchemaQueries uint64 `json:"targeted_information_schema_queries"`
-	BroadInformationSchemaQueries    uint64 `json:"broad_information_schema_queries"`
-	ShowFullFieldsQueries            uint64 `json:"show_full_fields_queries"`
-	ShowCreateTableQueries           uint64 `json:"show_create_table_queries"`
-	ShowKeysQueries                  uint64 `json:"show_keys_queries"`
-	TargetTableRefreshes             uint64 `json:"target_table_refreshes"`
-	TargetTableCacheHits             uint64 `json:"target_table_cache_hits"`
-	TargetTableMisses                uint64 `json:"target_table_misses"`
-	FullRefreshes                    uint64 `json:"full_refreshes"`
-	FullRefreshCacheHits             uint64 `json:"full_refresh_cache_hits"`
-	TablesLoaded                     uint64 `json:"tables_loaded"`
+	InformationSchemaQueries           uint64            `json:"information_schema_queries"`
+	TargetedInformationSchemaQueries   uint64            `json:"targeted_information_schema_queries"`
+	BroadInformationSchemaQueries      uint64            `json:"broad_information_schema_queries"`
+	BroadInformationSchemaQueryReasons map[string]uint64 `json:"broad_information_schema_query_reasons,omitempty"`
+	ShowFullFieldsQueries              uint64            `json:"show_full_fields_queries"`
+	ShowCreateTableQueries             uint64            `json:"show_create_table_queries"`
+	ShowKeysQueries                    uint64            `json:"show_keys_queries"`
+	TargetTableRefreshes               uint64            `json:"target_table_refreshes"`
+	TargetTableCacheHits               uint64            `json:"target_table_cache_hits"`
+	TargetTableMisses                  uint64            `json:"target_table_misses"`
+	FullRefreshes                      uint64            `json:"full_refreshes"`
+	FullRefreshCacheHits               uint64            `json:"full_refresh_cache_hits"`
+	TablesLoaded                       uint64            `json:"tables_loaded"`
 }
 
 // ResetStats summarizes successful Server.Reset calls.
@@ -99,7 +100,7 @@ func (s *statsStore) snapshot() Stats {
 			ByRoute:   cloneCountMap(s.queries.ByRoute),
 			ByKind:    cloneCountMap(s.queries.ByKind),
 		},
-		Metadata: s.metadata,
+		Metadata: cloneMetadataStats(s.metadata),
 		Resets:   s.resets,
 		Timings: TimingStats{
 			Queries: QueryTimingStats{
@@ -184,7 +185,7 @@ func (s *statsStore) recordSchemaChange() {
 	s.schemaChanges++
 }
 
-func (s *statsStore) recordInformationSchemaQuery(targeted bool) {
+func (s *statsStore) recordInformationSchemaQuery(targeted bool, broadReason string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -193,6 +194,7 @@ func (s *statsStore) recordInformationSchemaQuery(targeted bool) {
 		s.metadata.TargetedInformationSchemaQueries++
 	} else {
 		s.metadata.BroadInformationSchemaQueries++
+		incrementCount(&s.metadata.BroadInformationSchemaQueryReasons, broadReason)
 	}
 }
 
@@ -270,6 +272,12 @@ func cloneCountMap(in map[string]uint64) map[string]uint64 {
 	for key, value := range in {
 		out[key] = value
 	}
+	return out
+}
+
+func cloneMetadataStats(in MetadataStats) MetadataStats {
+	out := in
+	out.BroadInformationSchemaQueryReasons = cloneCountMap(in.BroadInformationSchemaQueryReasons)
 	return out
 }
 

@@ -4053,7 +4053,6 @@ func TestServerStatsDoNotStoreSQLText(t *testing.T) {
 		stats.Metadata.InformationSchemaQueries != 1 ||
 		stats.Metadata.TargetedInformationSchemaQueries != 1 ||
 		stats.Metadata.TargetTableRefreshes != 1 ||
-		stats.Metadata.TargetTableCacheHits == 0 ||
 		stats.Metadata.TablesLoaded == 0 {
 		t.Fatalf("metadata stats = %#v, want show and targeted information_schema counts", stats.Metadata)
 	}
