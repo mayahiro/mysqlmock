@@ -101,18 +101,20 @@ type Server struct {
 	stats             statsStore
 	advisoryLocks     advisoryLockStore
 
-	mu             sync.Mutex
-	ruleOnceUsed   map[int]bool
-	indexMetadata  map[string]mysqlIndexMetadata
-	columnMetadata map[string]mysqlColumnMetadata
-	autoIncrement  map[string]uint64
-	tableDDL       map[string]string
-	translation    sqlTranslationCache
+	mu                   sync.Mutex
+	ruleOnceUsed         map[int]bool
+	indexMetadata        map[string]mysqlIndexMetadata
+	columnMetadata       map[string]mysqlColumnMetadata
+	autoIncrementColumns map[string]mysqlColumnMetadata
+	autoIncrement        map[string]uint64
+	tableDDL             map[string]string
+	translation          sqlTranslationCache
 
-	preparedSchema []preparedSchemaStatement
-	preparedSeed   []map[string][]map[string]any
-	tableColumns   map[string]cachedTableColumns
-	uniqueKeys     map[string]cachedUniqueKeys
+	preparedSchema            []preparedSchemaStatement
+	preparedSeed              []map[string][]map[string]any
+	tableColumns              map[string]cachedTableColumns
+	uniqueKeys                map[string]cachedUniqueKeys
+	sqliteAutoIncrementTables map[string]cachedSQLiteAutoIncrementTable
 }
 
 // UnsupportedQuery records a query that mysqlmock could not execute.
@@ -181,17 +183,19 @@ func New(opts ...Option) (*Server, error) {
 	}
 
 	s := &Server{
-		cfg:            cfg,
-		rules:          preparedRules,
-		done:           make(chan struct{}),
-		logWriter:      options.logWriter,
-		logFormat:      logFormat,
-		indexMetadata:  map[string]mysqlIndexMetadata{},
-		columnMetadata: map[string]mysqlColumnMetadata{},
-		autoIncrement:  map[string]uint64{},
-		tableDDL:       map[string]string{},
-		tableColumns:   map[string]cachedTableColumns{},
-		uniqueKeys:     map[string]cachedUniqueKeys{},
+		cfg:                       cfg,
+		rules:                     preparedRules,
+		done:                      make(chan struct{}),
+		logWriter:                 options.logWriter,
+		logFormat:                 logFormat,
+		indexMetadata:             map[string]mysqlIndexMetadata{},
+		columnMetadata:            map[string]mysqlColumnMetadata{},
+		autoIncrementColumns:      map[string]mysqlColumnMetadata{},
+		autoIncrement:             map[string]uint64{},
+		tableDDL:                  map[string]string{},
+		tableColumns:              map[string]cachedTableColumns{},
+		uniqueKeys:                map[string]cachedUniqueKeys{},
+		sqliteAutoIncrementTables: map[string]cachedSQLiteAutoIncrementTable{},
 	}
 	s.nextConnectionID.Store(cfg.Server.ConnectionIDStart)
 	return s, nil
@@ -293,6 +297,7 @@ func (s *Server) bumpSchemaVersion() {
 	s.metadataMu.Lock()
 	s.tableColumns = map[string]cachedTableColumns{}
 	s.uniqueKeys = map[string]cachedUniqueKeys{}
+	s.sqliteAutoIncrementTables = map[string]cachedSQLiteAutoIncrementTable{}
 	s.metadataMu.Unlock()
 }
 
@@ -318,6 +323,7 @@ func (s *Server) Reset(ctx context.Context) error {
 		s.mu.Lock()
 		s.indexMetadata = map[string]mysqlIndexMetadata{}
 		s.columnMetadata = map[string]mysqlColumnMetadata{}
+		s.autoIncrementColumns = map[string]mysqlColumnMetadata{}
 		s.tableDDL = map[string]string{}
 		s.autoIncrement = map[string]uint64{}
 		s.mu.Unlock()

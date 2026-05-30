@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"time"
 )
@@ -15,9 +16,14 @@ type mysqlAutoIncrementInsertValue struct {
 	Generated bool
 }
 
-func (s *Server) recordMySQLAutoIncrementAllocation(tableName string, value uint64) {
+type cachedSQLiteAutoIncrementTable struct {
+	SchemaVersion uint64
+	Uses          bool
+}
+
+func (s *Server) recordMySQLAutoIncrementAllocation(tableName string, value uint64) bool {
 	if tableName == "" || value == 0 {
-		return
+		return false
 	}
 	key := tableMetadataKey(tableName)
 	s.mu.Lock()
@@ -25,19 +31,11 @@ func (s *Server) recordMySQLAutoIncrementAllocation(tableName string, value uint
 	if s.autoIncrement == nil {
 		s.autoIncrement = map[string]uint64{}
 	}
-	if value > s.autoIncrement[key] {
-		s.autoIncrement[key] = value
+	if value <= s.autoIncrement[key] {
+		return false
 	}
-}
-
-func (s *Server) mysqlAutoIncrementAllocations() map[string]uint64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make(map[string]uint64, len(s.autoIncrement))
-	for tableName, value := range s.autoIncrement {
-		out[tableName] = value
-	}
-	return out
+	s.autoIncrement[key] = value
+	return true
 }
 
 func (s *Server) mysqlAutoIncrementAllocation(tableName string) uint64 {
@@ -59,17 +57,19 @@ func (c *mysqlConn) recordMySQLAutoIncrementAllocation(ctx context.Context, quer
 	if !ok {
 		return
 	}
-	if _, ok := c.server.lookupMySQLAutoIncrementColumn(tableName); ok {
-		usesAutoIncrement, err := c.sqliteTableUsesAutoincrement(ctx, tableName)
-		if err != nil || !usesAutoIncrement {
-			return
-		}
+	usesAutoIncrement, err := c.sqliteTableUsesAutoincrement(ctx, tableName)
+	if err != nil || !usesAutoIncrement {
+		return
 	}
-	c.server.recordMySQLAutoIncrementAllocation(tableName, result.LastInsertID)
+	if c.server.recordMySQLAutoIncrementAllocation(tableName, result.LastInsertID) {
+		c.markMySQLAutoIncrementRestoreTable(tableName)
+	}
 }
 
 func (c *mysqlConn) restoreMySQLAutoIncrementSequences(ctx context.Context) error {
-	for tableName, value := range c.server.mysqlAutoIncrementAllocations() {
+	tableNames := c.mysqlAutoIncrementRestoreTableNames()
+	for _, tableName := range tableNames {
+		value := c.server.mysqlAutoIncrementAllocation(tableName)
 		if value == 0 {
 			continue
 		}
@@ -95,6 +95,15 @@ func (c *mysqlConn) restoreMySQLAutoIncrementSequencesWithTiming(ctx context.Con
 }
 
 func (c *mysqlConn) sqliteTableUsesAutoincrement(ctx context.Context, tableName string) (bool, error) {
+	version := c.server.currentSchemaVersion()
+	cacheKey := normalizedTableCacheKey(tableName)
+	c.server.metadataMu.Lock()
+	if cached, ok := c.server.sqliteAutoIncrementTables[cacheKey]; ok && cached.SchemaVersion == version {
+		c.server.metadataMu.Unlock()
+		return cached.Uses, nil
+	}
+	c.server.metadataMu.Unlock()
+
 	var createSQL sql.NullString
 	start := time.Now()
 	err := c.sqliteConn.QueryRowContext(ctx, `
@@ -104,12 +113,50 @@ WHERE type = 'table'
   AND name = ?`, unquoteSQLWord(tableName)).Scan(&createSQL)
 	c.server.stats.recordPhaseTiming("mysql.auto_increment.sqlite_table_lookup", time.Since(start))
 	if errors.Is(err, sql.ErrNoRows) {
+		c.server.cacheSQLiteTableAutoincrement(cacheKey, version, false)
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
-	return createSQL.Valid && containsSQLIdentifier(createSQL.String, "AUTOINCREMENT"), nil
+	uses := createSQL.Valid && containsSQLIdentifier(createSQL.String, "AUTOINCREMENT")
+	c.server.cacheSQLiteTableAutoincrement(cacheKey, version, uses)
+	return uses, nil
+}
+
+func (s *Server) cacheSQLiteTableAutoincrement(cacheKey string, version uint64, uses bool) {
+	s.metadataMu.Lock()
+	defer s.metadataMu.Unlock()
+	if s.sqliteAutoIncrementTables == nil {
+		s.sqliteAutoIncrementTables = map[string]cachedSQLiteAutoIncrementTable{}
+	}
+	s.sqliteAutoIncrementTables[cacheKey] = cachedSQLiteAutoIncrementTable{
+		SchemaVersion: version,
+		Uses:          uses,
+	}
+}
+
+func (c *mysqlConn) markMySQLAutoIncrementRestoreTable(tableName string) {
+	if c.statusFlags&serverStatusInTrans == 0 {
+		return
+	}
+	if c.autoIncrementRestoreTables == nil {
+		c.autoIncrementRestoreTables = map[string]string{}
+	}
+	c.autoIncrementRestoreTables[tableMetadataKey(tableName)] = unquoteSQLWord(tableName)
+}
+
+func (c *mysqlConn) mysqlAutoIncrementRestoreTableNames() []string {
+	tableNames := make([]string, 0, len(c.autoIncrementRestoreTables))
+	for _, tableName := range c.autoIncrementRestoreTables {
+		tableNames = append(tableNames, tableName)
+	}
+	sort.Strings(tableNames)
+	return tableNames
+}
+
+func (c *mysqlConn) clearMySQLAutoIncrementRestoreTables() {
+	c.autoIncrementRestoreTables = nil
 }
 
 func (c *mysqlConn) setSQLiteSequenceAtLeast(ctx context.Context, tableName string, value uint64) error {

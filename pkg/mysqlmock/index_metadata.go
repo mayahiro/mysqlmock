@@ -37,7 +37,13 @@ func (s *Server) recordMySQLColumnMetadata(sqlText string) {
 		if s.columnMetadata == nil {
 			s.columnMetadata = map[string]mysqlColumnMetadata{}
 		}
+		if s.autoIncrementColumns == nil {
+			s.autoIncrementColumns = map[string]mysqlColumnMetadata{}
+		}
 		s.columnMetadata[columnMetadataKey(metadata.TableName, metadata.ColumnName)] = metadata
+		if metadata.AutoIncrement {
+			s.autoIncrementColumns[tableMetadataKey(metadata.TableName)] = metadata
+		}
 		s.mu.Unlock()
 	}
 }
@@ -52,28 +58,31 @@ func (s *Server) lookupMySQLColumnMetadata(tableName, columnName string) (mysqlC
 func (s *Server) lookupMySQLAutoIncrementColumn(tableName string) (mysqlColumnMetadata, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	key := tableMetadataKey(tableName)
-	for _, metadata := range s.columnMetadata {
-		if metadata.AutoIncrement && tableMetadataKey(metadata.TableName) == key {
-			return metadata, true
-		}
-	}
-	return mysqlColumnMetadata{}, false
+	metadata, ok := s.autoIncrementColumns[tableMetadataKey(tableName)]
+	return metadata, ok
 }
 
 func (s *Server) renameMySQLTableColumnMetadata(oldName, newName string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	renamed := map[string]mysqlColumnMetadata{}
+	renamedAutoIncrement := map[string]mysqlColumnMetadata{}
 	for key, metadata := range s.columnMetadata {
 		if !strings.EqualFold(metadata.TableName, oldName) {
 			renamed[key] = metadata
+			if metadata.AutoIncrement {
+				renamedAutoIncrement[tableMetadataKey(metadata.TableName)] = metadata
+			}
 			continue
 		}
 		metadata.TableName = newName
 		renamed[columnMetadataKey(newName, metadata.ColumnName)] = metadata
+		if metadata.AutoIncrement {
+			renamedAutoIncrement[tableMetadataKey(newName)] = metadata
+		}
 	}
 	s.columnMetadata = renamed
+	s.autoIncrementColumns = renamedAutoIncrement
 }
 
 func (s *Server) recordMySQLIndexMetadata(sqlText string) {

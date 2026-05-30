@@ -100,7 +100,8 @@ type mysqlConn struct {
 	nextStatementID uint32
 	statements      map[uint32]*preparedStatement
 
-	informationSchemaCache informationSchemaCache
+	informationSchemaCache     informationSchemaCache
+	autoIncrementRestoreTables map[string]string
 }
 
 type resultColumn struct {
@@ -416,16 +417,23 @@ func (c *mysqlConn) executeQuery(ctx context.Context, command, sqlText string, a
 	case upper == "COMMIT":
 		recordRoute("sqlite")
 		resp, err := c.execSQLiteTransactionPhase(ctx, "transaction.commit", "COMMIT")
-		c.statusFlags &^= serverStatusInTrans
+		if err == nil {
+			c.clearMySQLAutoIncrementRestoreTables()
+			c.statusFlags &^= serverStatusInTrans
+		}
 		return resp, err
 	case upper == "ROLLBACK":
 		recordRoute("sqlite")
 		transactionStart := time.Now()
 		resp, err := c.execSQLite(ctx, "ROLLBACK")
 		if err == nil {
-			err = c.restoreMySQLAutoIncrementSequencesWithTiming(ctx)
+			restoreErr := c.restoreMySQLAutoIncrementSequencesWithTiming(ctx)
+			c.statusFlags &^= serverStatusInTrans
+			if restoreErr == nil {
+				c.clearMySQLAutoIncrementRestoreTables()
+			}
+			err = restoreErr
 		}
-		c.statusFlags &^= serverStatusInTrans
 		c.server.stats.recordPhaseTiming("transaction.rollback", time.Since(transactionStart))
 		return resp, err
 	case upper == "ROLLBACK AND CHAIN":
@@ -437,9 +445,11 @@ func (c *mysqlConn) executeQuery(ctx context.Context, command, sqlText string, a
 		if _, err := c.execSQLite(ctx, "ROLLBACK"); err != nil {
 			return okResult{}, err
 		}
+		c.statusFlags &^= serverStatusInTrans
 		if err := c.restoreMySQLAutoIncrementSequencesWithTiming(ctx); err != nil {
 			return okResult{}, err
 		}
+		c.clearMySQLAutoIncrementRestoreTables()
 		return c.execSQLite(ctx, "BEGIN")
 	case strings.HasPrefix(upper, "ROLLBACK TO SAVEPOINT "):
 		recordRoute("sqlite")

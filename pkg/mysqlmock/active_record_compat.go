@@ -53,6 +53,10 @@ func (c *mysqlConn) showFullFields(ctx context.Context, sqlText string) (resultS
 	if !ok {
 		return resultSet{}, c.server.unsupportedError(sqlText)
 	}
+	version := c.server.currentSchemaVersion()
+	if cached, ok := c.informationSchemaCache.showFullFieldsResult(c.currentDB, tableName, likePattern, c.collationConnection, version); ok {
+		return cached, nil
+	}
 	exists, err := c.refreshInformationSchemaTable(ctx, tableName)
 	if err != nil {
 		return resultSet{}, err
@@ -106,7 +110,12 @@ WHERE c.TABLE_SCHEMA = ?
 		args = append(args, likePattern)
 	}
 	query += "\nORDER BY c.ORDINAL_POSITION"
-	return c.querySQLite(ctx, query, args...)
+	result, err := c.querySQLite(ctx, query, args...)
+	if err != nil {
+		return resultSet{}, err
+	}
+	c.informationSchemaCache.markShowFullFieldsResult(c.currentDB, tableName, likePattern, c.collationConnection, version, result)
+	return result, nil
 }
 
 func (c *mysqlConn) showCreateTable(ctx context.Context, sqlText string) (resultSet, error) {
