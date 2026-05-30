@@ -258,6 +258,7 @@ mysqlmock dump-config-schema
 
 Source checkout から実行する場合は、`mysqlmock` を `go run ./cmd/mysqlmock` に置き換えてください
 
+`serve` は schema と seed の setup が完了し、listener が client connection を受け付けられる状態になった後に readiness line を stderr に出力します
 `serve --fail-on-unsupported` は unsupported SQL を観測した時点で error exit します
 `--verbose --log-format=json` は route-aware query log を JSON Lines として出力します
 `--print-stats` は server shutdown 時に SQL 本文を含まない実行 stats JSON を stderr に出力します

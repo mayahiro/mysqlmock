@@ -88,6 +88,31 @@ func TestWriteServeStats(t *testing.T) {
 	}
 }
 
+func TestWriteServeReadyText(t *testing.T) {
+	var out bytes.Buffer
+	if err := writeServeReady(&out, "text", "127.0.0.1:3306"); err != nil {
+		t.Fatalf("write serve ready: %v", err)
+	}
+	if got, want := out.String(), "mysqlmock ready addr=127.0.0.1:3306\n"; got != want {
+		t.Fatalf("ready output = %q, want %q", got, want)
+	}
+}
+
+func TestWriteServeReadyJSON(t *testing.T) {
+	var out bytes.Buffer
+	if err := writeServeReady(&out, "json", "127.0.0.1:3306"); err != nil {
+		t.Fatalf("write serve ready: %v", err)
+	}
+
+	var event map[string]string
+	if err := json.Unmarshal(out.Bytes(), &event); err != nil {
+		t.Fatalf("decode ready JSON: %v", err)
+	}
+	if event["event"] != "ready" || event["addr"] != "127.0.0.1:3306" {
+		t.Fatalf("ready event = %#v", event)
+	}
+}
+
 func TestWaitForServeStopFailsOnUnsupported(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

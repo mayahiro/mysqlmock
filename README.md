@@ -318,11 +318,13 @@ mysqlmock dump-config-schema
 
 From a source checkout, replace `mysqlmock` with `go run ./cmd/mysqlmock`.
 
-Use `serve --fail-on-unsupported` to exit with an error when the server observes
-unsupported SQL. Use `--verbose --log-format=json` to emit route-aware query
-logs as JSON Lines. Use `--print-stats` to print SQL-body-free execution stats
-as JSON to stderr when the server shuts down. Use `dump-config-schema` to print
-a JSON Schema for config files.
+`serve` prints a readiness line to stderr after schema and seed setup complete
+and the listener is accepting client connections. Use `serve --fail-on-unsupported`
+to exit with an error when the server observes unsupported SQL. Use
+`--verbose --log-format=json` to emit route-aware query logs as JSON Lines.
+Use `--print-stats` to print SQL-body-free execution stats as JSON to stderr
+when the server shuts down. Use `dump-config-schema` to print a JSON Schema for
+config files.
 
 ## Documentation
 

@@ -229,6 +229,9 @@ Fail a long-running server when unsupported SQL is observed:
 mysqlmock serve --config testdb.yaml --fail-on-unsupported
 ```
 
+`serve` prints a readiness line to stderr after schema and seed setup complete
+and the listener is accepting client connections.
+
 Emit query logs:
 
 ```sh

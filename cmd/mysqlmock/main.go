@@ -86,6 +86,9 @@ func serve(args []string) error {
 	}
 	defer server.Close()
 
+	if err := writeServeReady(os.Stderr, *logFormat, server.Addr()); err != nil {
+		return err
+	}
 	if *printDSN {
 		fmt.Println(server.DSN())
 	}
@@ -166,4 +169,20 @@ func waitForServeStop(ctx context.Context, server *mysqlmock.Server, failOnUnsup
 
 func writeServeStats(w io.Writer, server *mysqlmock.Server) error {
 	return json.NewEncoder(w).Encode(server.Stats())
+}
+
+type serveReadyEvent struct {
+	Event string `json:"event"`
+	Addr  string `json:"addr"`
+}
+
+func writeServeReady(w io.Writer, format, addr string) error {
+	if format == "json" {
+		return json.NewEncoder(w).Encode(serveReadyEvent{
+			Event: "ready",
+			Addr:  addr,
+		})
+	}
+	_, err := fmt.Fprintf(w, "mysqlmock ready addr=%s\n", addr)
+	return err
 }
