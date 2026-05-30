@@ -144,6 +144,11 @@ before being applied. The translator handles common Repository-test DDL such as
 `AUTO_RANDOM_BASE`, table-level `PRIMARY KEY` / `UNIQUE KEY` / `KEY`
 definitions, simple MySQL index DDL, and common `ALTER TABLE` / `RENAME TABLE`
 variants. It does not try to implement a full MySQL parser.
+DDL translation is intended to load repository-test schemas and tolerate common
+framework setup/teardown SQL. It is not a migration validator and does not aim
+to reproduce database lifecycle changes or destructive DDL side effects. Cover
+production migrations and engine-specific DDL behavior with real MySQL/TiDB
+regression tests.
 If an `AUTO_INCREMENT` column is part of a composite primary key, mysqlmock
 keeps the composite key and removes SQLite `AUTOINCREMENT`; SQLite can only
 auto-assign rowid values for a single `INTEGER PRIMARY KEY`. mysqlmock keeps the
@@ -295,23 +300,27 @@ random sequence behavior.
 The fallback also translates MySQL backslash escapes in string literals, adds
 MySQL's default backslash escape behavior for `LIKE` patterns when no explicit
 `ESCAPE` clause is present, and removes table qualifiers from
-`UPDATE ... SET table.column = ...` targets. `CREATE DATABASE` and
-`CREATE SCHEMA` are accepted as no-op setup statements, and `DROP DATABASE` and
-`DROP SCHEMA` are accepted as no-op teardown statements. Runtime `DROP TABLE`
-statements are also accepted as no-ops so ORM test setup does not remove the
-configured schema; `schema_files` still apply `DROP TABLE` while loading dumps.
+`UPDATE ... SET table.column = ...` targets.
+
+Runtime schema-changing DDL is intentionally not applied. Single-statement
+schema-changing DDL is accepted as a no-op so ORM test setup does not remove or
+rewrite the configured schema. This includes `CREATE/DROP DATABASE`,
+`CREATE/DROP TABLE`, `CREATE/DROP INDEX`, `ALTER TABLE`, and `RENAME TABLE`.
+Multi-statement schema-changing queries are still reported as unsupported.
+These runtime compatibility handlers assume the post-initialization schema is
+represented by config; they do not validate schema migration correctness or
+MySQL/TiDB database lifecycle behavior.
 For `CREATE TABLE` statements, mysqlmock strips MySQL partition clauses before
 SQLite execution and applies `ZEROFILL` display width padding to simple
 result-set values for declared integer columns.
 
-For MySQL-compatible DDL that creates indexes, mysqlmock also keeps lightweight
-index metadata so `SHOW KEYS` can expose prefix length, expression, and
-visibility fields used by ORM schema introspection.
+For MySQL-compatible DDL that creates indexes during schema setup, mysqlmock
+also keeps lightweight index metadata so `SHOW KEYS` can expose prefix length,
+expression, and visibility fields used by ORM schema introspection.
 
 When `SHOW CREATE TABLE` is requested, mysqlmock returns the original configured
-MySQL/TiDB `CREATE TABLE` statement while that table has not been changed at
-runtime. After table-altering DDL, the cached original DDL is invalidated and
-the response falls back to the current SQLite definition with MySQL-style table
+MySQL/TiDB `CREATE TABLE` statement when available. If no configured DDL is
+available, it falls back to the current SQLite definition with MySQL-style table
 options.
 
 ## JSON Schema

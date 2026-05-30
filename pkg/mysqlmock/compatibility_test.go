@@ -35,7 +35,9 @@ func TestRealMySQLCompatibilityScenario(t *testing.T) {
 	defer realDB.Close()
 	realDB.SetMaxOpenConns(1)
 
-	server := mysqlmock.Start(t, mysqlmock.WithConfig(mysqlmock.DefaultConfig()))
+	cfg := mysqlmock.DefaultConfig()
+	cfg.Schema = compatibilityScenarioSchema(table)
+	server := mysqlmock.Start(t, mysqlmock.WithConfig(cfg))
 	mockDB, err := sql.Open("mysql", server.DSN())
 	if err != nil {
 		t.Fatalf("open mysqlmock: %v", err)
@@ -43,11 +45,11 @@ func TestRealMySQLCompatibilityScenario(t *testing.T) {
 	defer mockDB.Close()
 	mockDB.SetMaxOpenConns(1)
 
-	realObs, err := runCompatibilityScenario(ctx, realDB, table)
+	realObs, err := runCompatibilityScenario(ctx, realDB, table, true)
 	if err != nil {
 		t.Fatalf("real MySQL scenario: %v", err)
 	}
-	mockObs, err := runCompatibilityScenario(ctx, mockDB, table)
+	mockObs, err := runCompatibilityScenario(ctx, mockDB, table, false)
 	if err != nil {
 		t.Fatalf("mysqlmock scenario: %v", err)
 	}
@@ -75,7 +77,9 @@ func TestRealTiDBCompatibilityScenario(t *testing.T) {
 	defer realDB.Close()
 	realDB.SetMaxOpenConns(1)
 
-	server := mysqlmock.Start(t, mysqlmock.WithConfig(mysqlmock.DefaultConfig()))
+	cfg := mysqlmock.DefaultConfig()
+	cfg.Schema = compatibilityScenarioSchema(table)
+	server := mysqlmock.Start(t, mysqlmock.WithConfig(cfg))
 	mockDB, err := sql.Open("mysql", server.DSN())
 	if err != nil {
 		t.Fatalf("open mysqlmock: %v", err)
@@ -83,11 +87,11 @@ func TestRealTiDBCompatibilityScenario(t *testing.T) {
 	defer mockDB.Close()
 	mockDB.SetMaxOpenConns(1)
 
-	realObs, err := runCompatibilityScenario(ctx, realDB, table)
+	realObs, err := runCompatibilityScenario(ctx, realDB, table, true)
 	if err != nil {
 		t.Fatalf("real TiDB scenario: %v", err)
 	}
-	mockObs, err := runCompatibilityScenario(ctx, mockDB, table)
+	mockObs, err := runCompatibilityScenario(ctx, mockDB, table, false)
 	if err != nil {
 		t.Fatalf("mysqlmock scenario: %v", err)
 	}
@@ -123,28 +127,38 @@ type compatibilityObservation struct {
 	JSONExtractValue     string
 	ForeignKeyChecksTx   string
 	ForeignKeyInsertOK   bool
-	AlteredColumnName    string
 }
 
-func runCompatibilityScenario(ctx context.Context, db *sql.DB, table string) (compatibilityObservation, error) {
+func compatibilityScenarioSchema(table string) []string {
 	quotedTable := quoteMySQLCompatIdent(table)
-	_, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS "+quotedTable)
-
-	createSQL := fmt.Sprintf(`CREATE TABLE %s (
+	parent := quoteMySQLCompatIdent(table + "_parents")
+	child := quoteMySQLCompatIdent(table + "_children")
+	prefixIndex := quoteMySQLCompatIdent(table + "_name_prefix")
+	return []string{
+		fmt.Sprintf(`CREATE TABLE %s (
   id INTEGER PRIMARY KEY AUTO_INCREMENT,
   name VARCHAR(64) NOT NULL UNIQUE,
   visits INT NOT NULL DEFAULT 0,
   created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
   payload JSON NULL
-)`, quotedTable)
-	if _, err := db.ExecContext(ctx, createSQL); err != nil {
-		return compatibilityObservation{}, fmt.Errorf("create table: %w", err)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`, quotedTable),
+		"CREATE INDEX " + prefixIndex + " ON " + quotedTable + " (name(8))",
+		"CREATE TABLE " + parent + " (id INTEGER PRIMARY KEY AUTO_INCREMENT) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+		"CREATE TABLE " + child + " (id INTEGER PRIMARY KEY AUTO_INCREMENT, parent_id INTEGER NOT NULL, FOREIGN KEY (parent_id) REFERENCES " + parent + "(id)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
 	}
-	defer db.ExecContext(ctx, "DROP TABLE IF EXISTS "+quotedTable)
+}
 
-	prefixIndex := quoteMySQLCompatIdent(table + "_name_prefix")
-	if _, err := db.ExecContext(ctx, "CREATE INDEX "+prefixIndex+" ON "+quotedTable+" (name(8))"); err != nil {
-		return compatibilityObservation{}, fmt.Errorf("create prefix index: %w", err)
+func runCompatibilityScenario(ctx context.Context, db *sql.DB, table string, setupSchema bool) (compatibilityObservation, error) {
+	quotedTable := quoteMySQLCompatIdent(table)
+
+	if setupSchema {
+		_, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS "+quotedTable)
+		for _, stmt := range compatibilityScenarioSchema(table)[:2] {
+			if _, err := db.ExecContext(ctx, stmt); err != nil {
+				return compatibilityObservation{}, fmt.Errorf("setup schema: %w", err)
+			}
+		}
+		defer db.ExecContext(ctx, "DROP TABLE IF EXISTS "+quotedTable)
 	}
 
 	result, err := db.ExecContext(ctx, "INSERT INTO "+quotedTable+" (name, visits, created_at, payload) VALUES (?, ?, ?, ?)", "Alice", 0, "2026-05-28 10:11:12", `{"role":"admin"}`)
@@ -247,7 +261,7 @@ VALUES (?, ?), (?, ?)
 		return compatibilityObservation{}, fmt.Errorf("select function compatibility values: %w", err)
 	}
 
-	foreignKeyChecksTx, foreignKeyInsertOK, err := runForeignKeyChecksTransactionScenario(ctx, db, table)
+	foreignKeyChecksTx, foreignKeyInsertOK, err := runForeignKeyChecksTransactionScenario(ctx, db, table, setupSchema)
 	if err != nil {
 		return compatibilityObservation{}, err
 	}
@@ -288,17 +302,6 @@ VALUES (?, ?), (?, ?)
 		return compatibilityObservation{}, fmt.Errorf("read names: %w", err)
 	}
 
-	if _, err := db.ExecContext(ctx, "ALTER TABLE "+quotedTable+" CHANGE COLUMN visits visit_count INT NOT NULL DEFAULT 0"); err != nil {
-		return compatibilityObservation{}, fmt.Errorf("alter change column: %w", err)
-	}
-	if _, err := db.ExecContext(ctx, "ALTER TABLE "+quotedTable+" MODIFY COLUMN visit_count INT NOT NULL DEFAULT 0"); err != nil {
-		return compatibilityObservation{}, fmt.Errorf("alter modify column: %w", err)
-	}
-	alteredColumnName, err := compatibilityColumnName(ctx, db, table, "visit_count")
-	if err != nil {
-		return compatibilityObservation{}, err
-	}
-
 	return compatibilityObservation{
 		FirstInsertID:        firstInsertID,
 		FirstRowsAffected:    firstRowsAffected,
@@ -325,7 +328,6 @@ VALUES (?, ?), (?, ?)
 		JSONExtractValue:     jsonExtractValue,
 		ForeignKeyChecksTx:   foreignKeyChecksTx,
 		ForeignKeyInsertOK:   foreignKeyInsertOK,
-		AlteredColumnName:    alteredColumnName,
 	}, nil
 }
 
@@ -411,18 +413,19 @@ func compatibilityShowKeySubPart(ctx context.Context, db *sql.DB, quotedTable, i
 	return 0, fmt.Errorf("prefix index %s was not found in SHOW KEYS", indexName)
 }
 
-func runForeignKeyChecksTransactionScenario(ctx context.Context, db *sql.DB, table string) (string, bool, error) {
+func runForeignKeyChecksTransactionScenario(ctx context.Context, db *sql.DB, table string, setupSchema bool) (string, bool, error) {
 	parent := quoteMySQLCompatIdent(table + "_parents")
 	child := quoteMySQLCompatIdent(table + "_children")
-	_, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS "+child)
-	_, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS "+parent)
-	if _, err := db.ExecContext(ctx, "CREATE TABLE "+parent+" (id INTEGER PRIMARY KEY AUTO_INCREMENT)"); err != nil {
-		return "", false, fmt.Errorf("create fk parent table: %w", err)
-	}
-	defer db.ExecContext(ctx, "DROP TABLE IF EXISTS "+child)
-	defer db.ExecContext(ctx, "DROP TABLE IF EXISTS "+parent)
-	if _, err := db.ExecContext(ctx, "CREATE TABLE "+child+" (id INTEGER PRIMARY KEY AUTO_INCREMENT, parent_id INTEGER NOT NULL, FOREIGN KEY (parent_id) REFERENCES "+parent+"(id))"); err != nil {
-		return "", false, fmt.Errorf("create fk child table: %w", err)
+	if setupSchema {
+		_, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS "+child)
+		_, _ = db.ExecContext(ctx, "DROP TABLE IF EXISTS "+parent)
+		for _, stmt := range compatibilityScenarioSchema(table)[2:] {
+			if _, err := db.ExecContext(ctx, stmt); err != nil {
+				return "", false, fmt.Errorf("create fk tables: %w", err)
+			}
+		}
+		defer db.ExecContext(ctx, "DROP TABLE IF EXISTS "+child)
+		defer db.ExecContext(ctx, "DROP TABLE IF EXISTS "+parent)
 	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -445,20 +448,6 @@ func runForeignKeyChecksTransactionScenario(ctx context.Context, db *sql.DB, tab
 		return "", false, fmt.Errorf("rollback fk transaction: %w", err)
 	}
 	return checks, insertOK, nil
-}
-
-func compatibilityColumnName(ctx context.Context, db *sql.DB, table, column string) (string, error) {
-	var columnName string
-	if err := db.QueryRowContext(ctx, `
-SELECT column_name
-FROM information_schema.columns
-WHERE table_schema = DATABASE()
-  AND table_name = ?
-  AND column_name = ?
-`, table, column).Scan(&columnName); err != nil {
-		return "", fmt.Errorf("select altered column metadata: %w", err)
-	}
-	return columnName, nil
 }
 
 func mysqlErrorCodeState(err error) (uint16, string) {

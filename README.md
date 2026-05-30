@@ -248,11 +248,11 @@ SQLite schema.
 
 ActiveRecord-style schema introspection supports `SHOW FULL FIELDS`,
 `SHOW CREATE TABLE`, and `SHOW KEYS`. `SHOW CREATE TABLE` prefers the original
-configured MySQL/TiDB DDL while the table is unchanged, then falls back to the
-runtime SQLite definition after table-altering DDL. Advisory lock functions such
-as `GET_LOCK` and `RELEASE_LOCK` emulate simple connection-owned lock conflicts.
+configured MySQL/TiDB DDL and falls back to the SQLite definition only when no
+configured DDL is available. Advisory lock functions such as `GET_LOCK` and
+`RELEASE_LOCK` emulate simple connection-owned lock conflicts.
 `SHOW KEYS` includes prefix length, expression, and visibility metadata when
-the index was created through mysqlmock's MySQL-compatible DDL path.
+the index was loaded through mysqlmock's MySQL-compatible schema setup path.
 
 Write validation maps common repository-test failures to MySQL-like errors,
 including duplicate keys, foreign keys, NOT NULL, CHECK constraints, data too
@@ -265,15 +265,19 @@ Set `compat.write_validation: basic` to skip value pre-validation on successful
 writes while keeping SQLite constraint error mapping, or `off` to return raw
 SQLite errors as generic MySQL errors.
 
-Schema and query fallback translate `TRUE`, `FALSE`, `NOW()`,
+Schema setup and query fallback translate `TRUE`, `FALSE`, `NOW()`,
 `CURRENT_TIMESTAMP()`, `AUTO_INCREMENT`, TiDB `AUTO_RANDOM`, common MySQL and
 TiDB DDL options, table-level `PRIMARY KEY` / `UNIQUE KEY` / `KEY` definitions,
-simple MySQL index DDL, and common `ALTER TABLE` / `RENAME TABLE` variants into
-SQLite-compatible SQL where possible. `CREATE DATABASE` / `CREATE SCHEMA` are
-accepted as no-op setup statements, and `DROP DATABASE` / `DROP SCHEMA` are
-accepted as no-op teardown statements. Runtime `DROP TABLE` statements are also
-accepted as no-ops so Rails/RSpec setup does not remove the configured schema;
-`schema_files` still apply `DROP TABLE` while loading dumps.
+simple MySQL index DDL, and common `ALTER TABLE` / `RENAME TABLE` variants
+while loading configured schema. At runtime, single-statement schema-changing
+DDL is accepted as a no-op so Rails/RSpec setup does not remove or rewrite the
+configured schema. This includes `CREATE/DROP DATABASE`, `CREATE/DROP TABLE`,
+`CREATE/DROP INDEX`, `ALTER TABLE`, and `RENAME TABLE`. Multi-statement
+schema-changing queries are still reported as unsupported.
+DDL compatibility is intentionally setup-oriented; mysqlmock expects the
+post-initialization schema to be represented by config. Cover migrations,
+schema compatibility, and engine-specific DDL behavior with real MySQL/TiDB
+regression tests.
 `CREATE TABLE ... PARTITION BY ...` partition clauses are stripped for SQLite
 execution. Integer columns declared with `ZEROFILL` use the declared display
 width for simple result-set values.
@@ -379,6 +383,8 @@ See [examples/active_record_smoke](examples/active_record_smoke).
   exactly match every MySQL regular expression edge case.
 - `RAND(seed)` is deterministic for equal seeds but does not reproduce MySQL's
   full per-statement random sequence behavior.
+- DDL compatibility is setup-oriented; migration correctness and
+  engine-specific DDL semantics should be covered by real MySQL/TiDB tests.
 - TLS, compression, `multiStatements=true`, and `LOAD DATA LOCAL INFILE` are
   not supported.
 - MySQL-specific SQL compatibility is intentionally small and should be expanded

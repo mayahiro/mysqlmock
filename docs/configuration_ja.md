@@ -132,6 +132,9 @@ mysqlmock は dump file を SQL statements に分割し、`DROP TABLE`、`CREATE
 
 各 statement は、適用前に mysqlmock の小さな MySQL-to-SQLite translator を通ります
 translator は Repository test でよく出る `AUTO_INCREMENT`、TiDB `AUTO_RANDOM`、TiDB clustered-index comment、`TRUE`、`FALSE`、`NOW()`、`CURRENT_TIMESTAMP(n)`、common table options、`AUTO_RANDOM_BASE`、table-level `PRIMARY KEY` / `UNIQUE KEY` / `KEY` 定義、単純な MySQL index DDL、よく使う `ALTER TABLE` / `RENAME TABLE` variants を扱います
+DDL translation は repository-test schema を読み込み、framework の setup/teardown SQL を通すためのものです
+migration validator ではなく、database lifecycle change や destructive DDL の副作用を再現することは目標にしていません
+production migration と engine 固有の DDL behavior は real MySQL/TiDB の回帰テストで確認してください
 `AUTO_INCREMENT` column が複合 primary key に含まれる場合、mysqlmock は複合 key を維持して SQLite `AUTOINCREMENT` を削除します。SQLite が rowid を自動採番できるのは単一の `INTEGER PRIMARY KEY` のみなので、元の MySQL metadata を保持し、対応している `INSERT ... VALUES` では omitted、`NULL`、`0`、`DEFAULT` の値を MySQL-like sequence value で補完します
 単一 column の `AUTO_INCREMENT` では、`ROLLBACK` や `ROLLBACK TO SAVEPOINT` 後も消費済みの採番値を再利用しないようにし、SQLite の default rollback behavior より InnoDB に近い挙動にします
 MySQL-visible index name は table scoped として扱い、SQLite 内部では private index name に変換するため、schema dump 内の複数 table で同じ index name を使えます
@@ -262,14 +265,18 @@ ORM や repository query でよく使う scalar function/operator として `CHA
 `REGEXP` は Go regular expression を使うため、MySQL regular expression dialect との完全一致は保証しません
 `RAND(seed)` は同じ seed に対して deterministic ですが、MySQL の per-statement random sequence behavior までは再現しません
 SQLite fallback は MySQL string literal の backslash escape、明示的な `ESCAPE` 句がない `LIKE` pattern の MySQL default backslash escape、`UPDATE ... SET table.column = ...` target の table qualifier 除去も扱います
-`CREATE DATABASE` と `CREATE SCHEMA` は setup 用、`DROP DATABASE` と `DROP SCHEMA` は teardown 用の no-op statement として受け付けます
-runtime の `DROP TABLE` も ORM test setup が設定済み schema を削除しないよう no-op として受け付けます。`schema_files` 読み込み時の `DROP TABLE` は従来通り dump loading に適用されます
+
+runtime の schema-changing DDL は適用しません
+single statement の schema-changing DDL は、ORM test setup が設定済み schema を削除または書き換えないよう no-op として受け付けます
+対象には `CREATE/DROP DATABASE`、`CREATE/DROP TABLE`、`CREATE/DROP INDEX`、`ALTER TABLE`、`RENAME TABLE` が含まれます
+schema-changing multi-statement query は unsupported として記録します
+これらの runtime compatibility handler は、初期化後の schema が config で表現されている前提で動作し、schema migration の正しさや MySQL/TiDB の database lifecycle behavior は検証しません
 `CREATE TABLE` statement では、MySQL partition clause を SQLite 実行前に strip し、`ZEROFILL` が付いた declared integer column の単純な result-set value に display width padding を適用します
 
-MySQL-compatible DDL で index を作成した場合、mysqlmock は軽量な index metadata も保持し、ORM schema introspection が使う `SHOW KEYS` の prefix length、expression、visibility fields を返します
+schema setup 中に MySQL-compatible DDL で index を作成した場合、mysqlmock は軽量な index metadata も保持し、ORM schema introspection が使う `SHOW KEYS` の prefix length、expression、visibility fields を返します
 
-`SHOW CREATE TABLE` が要求された場合、mysqlmock は対象 table が runtime で変更されていない間、設定で読み込んだ original MySQL/TiDB `CREATE TABLE` statement を返します
-table-altering DDL 後は cached original DDL を invalidation し、MySQL-style table option を付けた現在の SQLite definition に fallback します
+`SHOW CREATE TABLE` が要求された場合、mysqlmock は設定で読み込んだ original MySQL/TiDB `CREATE TABLE` statement があればそれを返します
+configured DDL がない場合は、MySQL-style table option を付けた現在の SQLite definition に fallback します
 
 ## JSON Schema
 

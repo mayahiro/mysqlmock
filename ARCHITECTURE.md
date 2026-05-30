@@ -95,12 +95,15 @@ as `SET NAMES`, `SET autocommit`, version variables, `SHOW VARIABLES`, `SHOW
 TABLES`, scalar compatibility functions, and a small `information_schema`
 subset.
 
-SQLite fallback handles normal CRUD and DDL after lightweight translation. The
-translator is token-oriented and deliberately small. It includes focused
-repository-test compatibility for TiDB DDL, common MySQL upsert syntax including
-insert-side `DEFAULT` values, and lock-clause stripping; unsupported
-MySQL-specific SQL should be captured through diagnostics and handled by a rule
-or another focused compatibility addition.
+SQLite fallback handles normal CRUD after lightweight translation. Configured
+schema setup uses the same focused translator for repository-test DDL, including
+TiDB DDL, while single-statement runtime schema-changing DDL is accepted as a
+no-op to preserve the configured schema during framework setup. Multi-statement
+schema-changing queries remain unsupported. The translator is token-oriented
+and deliberately small. It includes focused compatibility for common MySQL
+upsert syntax including insert-side `DEFAULT` values and lock-clause stripping;
+unsupported MySQL-specific SQL should be captured through diagnostics and
+handled by a rule or another focused compatibility addition.
 
 ### SQLite Backend
 

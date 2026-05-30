@@ -219,18 +219,22 @@ Built-in scalar compatibility function として、`DATABASE()`、`SCHEMA()`、`
 `information_schema.schemata`、`tables`、`columns`、`key_column_usage`、`statistics`、`table_constraints`、`referential_constraints`、`check_constraints` は、SQLite schema から派生した小さな metadata subset として利用できます
 
 ActiveRecord-style schema introspection として、`SHOW FULL FIELDS`、`SHOW CREATE TABLE`、`SHOW KEYS` を扱います
-`SHOW CREATE TABLE` は table が変更されていない間は設定で読み込んだ original MySQL/TiDB DDL を優先し、table-altering DDL 後は runtime SQLite definition に fallback します
+`SHOW CREATE TABLE` は設定で読み込んだ original MySQL/TiDB DDL を優先し、configured DDL がない場合のみ SQLite definition に fallback します
 `GET_LOCK` と `RELEASE_LOCK` などの advisory lock function は、connection が保持する単純な lock conflict を再現します
-`SHOW KEYS` は、mysqlmock の MySQL-compatible DDL path で作成された index について prefix length、expression、visibility metadata も返します
+`SHOW KEYS` は、mysqlmock の MySQL-compatible schema setup path で読み込まれた index について prefix length、expression、visibility metadata も返します
 
 Write validation は、duplicate key、foreign key、NOT NULL、CHECK constraint、character column の data too long、incorrect integer value、incorrect datetime value など、Repository test でよく使う失敗を MySQL-like error に map します
 legacy data のために `'0000-00-00'` や `'0001-00-00 00:00:00'` のような zero date part を許容する場合は `compat.allow_zero_dates: true` を設定します
 非 strict MySQL の、明示 default を持たない `NOT NULL` column への implicit default を再現する場合は `compat.implicit_defaults: true` を設定します
 成功系 write の事前 value validation を省略しつつ SQLite constraint error mapping を残す場合は `compat.write_validation: basic`、SQLite error を generic MySQL error として返す場合は `off` を設定します
 
-Schema と query fallback は、`TRUE`、`FALSE`、`NOW()`、`CURRENT_TIMESTAMP()`、`AUTO_INCREMENT`、TiDB `AUTO_RANDOM`、よく使われる MySQL/TiDB DDL option、table-level `PRIMARY KEY` / `UNIQUE KEY` / `KEY` 定義、単純な MySQL index DDL、よく使う `ALTER TABLE` / `RENAME TABLE` variants を、可能な範囲で SQLite-compatible SQL に変換します
-`CREATE DATABASE` / `CREATE SCHEMA` は setup 用、`DROP DATABASE` / `DROP SCHEMA` は teardown 用の no-op statement として受け付けます
-runtime の `DROP TABLE` も Rails/RSpec setup が設定済み schema を削除しないよう no-op として受け付けます。`schema_files` 読み込み時の `DROP TABLE` は従来通り dump loading に適用されます
+Schema setup と query fallback は、`TRUE`、`FALSE`、`NOW()`、`CURRENT_TIMESTAMP()`、`AUTO_INCREMENT`、TiDB `AUTO_RANDOM`、よく使われる MySQL/TiDB DDL option、table-level `PRIMARY KEY` / `UNIQUE KEY` / `KEY` 定義、単純な MySQL index DDL、よく使う `ALTER TABLE` / `RENAME TABLE` variants を、configured schema 読み込み時に SQLite-compatible SQL へ変換します
+runtime の schema-changing DDL は適用しません
+single statement の schema-changing DDL は、Rails/RSpec setup が設定済み schema を削除または書き換えないよう no-op として受け付けます
+対象には `CREATE/DROP DATABASE`、`CREATE/DROP TABLE`、`CREATE/DROP INDEX`、`ALTER TABLE`、`RENAME TABLE` が含まれます
+schema-changing multi-statement query は unsupported として記録します
+DDL compatibility は schema setup を通すためのものです。mysqlmock は初期化後の schema が config で表現されている前提で動作します
+schema migration、schema compatibility、engine 固有の DDL behavior は real MySQL/TiDB の回帰テストで確認してください
 `CREATE TABLE ... PARTITION BY ...` の partition clause は SQLite 実行時に strip します
 `ZEROFILL` が付いた integer column は、単純な result-set value について declared display width に合わせて zero padding します
 `AUTO_INCREMENT` column が複合 primary key に含まれる場合、mysqlmock は複合 key を維持して SQLite `AUTOINCREMENT` を削除します。SQLite の自動 rowid 採番は単一の `INTEGER PRIMARY KEY` でのみ使えるため、元の MySQL metadata を保持し、対応している `INSERT ... VALUES` では omitted、`NULL`、`0`、`DEFAULT` の値を MySQL-like sequence value で補完します
@@ -308,6 +312,7 @@ Ruby dependencies が利用できる環境では、この hook で Rails / Activ
 - `SET NAMES` は connection character set variable を記録しますが、query data や result data の transcoding は行いません
 - `REGEXP` compatibility は Go regular expression を使うため、MySQL regular expression の edge case までは完全一致しません
 - `RAND(seed)` は同じ seed に対して deterministic ですが、MySQL の per-statement random sequence behavior までは再現しません
+- DDL compatibility は schema setup 向けです。migration の正しさや engine 固有の DDL semantics は real MySQL/TiDB test で確認してください
 - TLS、compression、`multiStatements=true`、`LOAD DATA LOCAL INFILE` は未対応です
 - MySQL-specific SQL compatibility は意図的に小さく保っており、実際の unsupported-query report から拡張する前提です
 

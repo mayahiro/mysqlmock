@@ -2174,18 +2174,6 @@ WHERE TABLE_SCHEMA = DATABASE()
 	assertIndexCount("index_scope_users", "idx_status", 1)
 	assertIndexCount("index_scope_posts", "idx_status", 1)
 
-	if _, err := db.ExecContext(ctx, "ALTER TABLE index_scope_posts DROP INDEX idx_status"); err != nil {
-		t.Fatalf("drop table-scoped duplicate index: %v", err)
-	}
-	assertIndexCount("index_scope_users", "idx_status", 1)
-	assertIndexCount("index_scope_posts", "idx_status", 0)
-
-	if _, err := db.ExecContext(ctx, "ALTER TABLE index_scope_users RENAME INDEX idx_status TO idx_state"); err != nil {
-		t.Fatalf("rename table-scoped duplicate index: %v", err)
-	}
-	assertIndexCount("index_scope_users", "idx_status", 0)
-	assertIndexCount("index_scope_users", "idx_state", 1)
-
 	mysqlmock.AssertNoUnsupported(t, server)
 }
 
@@ -3275,45 +3263,6 @@ func TestActiveRecordStyleMySQLCompatibility(t *testing.T) {
 		t.Fatalf("invisible index visibility = %q, want NO", visibleByKey["index_ar_users_on_active_invisible"])
 	}
 
-	if _, err := db.ExecContext(ctx, "ALTER TABLE `ar_users` ALTER INDEX `index_ar_users_on_active_invisible` VISIBLE"); err != nil {
-		t.Fatalf("alter index visible: %v", err)
-	}
-	visibleByKey = map[string]string{}
-	visibleRows, err := db.QueryContext(ctx, "SHOW KEYS FROM `ar_users`")
-	if err != nil {
-		t.Fatalf("show keys after visibility change: %v", err)
-	}
-	for visibleRows.Next() {
-		var table string
-		var nonUnique int
-		var keyName string
-		var seqInIndex int
-		var columnName sql.NullString
-		var collation sql.NullString
-		var cardinality sql.NullString
-		var subPart sql.NullString
-		var packed sql.NullString
-		var nullValue sql.NullString
-		var indexType string
-		var comment string
-		var indexComment string
-		var visible string
-		var expression sql.NullString
-		if err := visibleRows.Scan(&table, &nonUnique, &keyName, &seqInIndex, &columnName, &collation, &cardinality, &subPart, &packed, &nullValue, &indexType, &comment, &indexComment, &visible, &expression); err != nil {
-			t.Fatalf("scan visible key row: %v", err)
-		}
-		visibleByKey[keyName] = visible
-	}
-	if err := visibleRows.Err(); err != nil {
-		t.Fatalf("read visible key rows: %v", err)
-	}
-	if err := visibleRows.Close(); err != nil {
-		t.Fatalf("close visible key rows: %v", err)
-	}
-	if visibleByKey["index_ar_users_on_active_invisible"] != "YES" {
-		t.Fatalf("index visibility after ALTER = %q, want YES", visibleByKey["index_ar_users_on_active_invisible"])
-	}
-
 	var tableName string
 	var createSQL string
 	if err := db.QueryRowContext(ctx, "SHOW CREATE TABLE `ar_users`").Scan(&tableName, &createSQL); err != nil {
@@ -3460,7 +3409,7 @@ func TestActiveRecordAdvisoryLockCompatibility(t *testing.T) {
 	mysqlmock.AssertNoUnsupported(t, server)
 }
 
-func TestShowCreateTableInvalidatesConfiguredDDLAfterRuntimeAlter(t *testing.T) {
+func TestShowCreateTableKeepsConfiguredDDLAfterRuntimeSchemaChangeNoOp(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -3489,20 +3438,21 @@ CREATE TABLE show_create_originals (
 	}
 
 	if _, err := db.ExecContext(ctx, "ALTER TABLE `show_create_originals` ADD COLUMN `nickname` VARCHAR(64) DEFAULT 'none'"); err != nil {
-		t.Fatalf("alter table add nickname: %v", err)
+		t.Fatalf("alter table add nickname no-op: %v", err)
 	}
 	if err := db.QueryRowContext(ctx, "SHOW CREATE TABLE `show_create_originals`").Scan(&tableName, &createSQL); err != nil {
-		t.Fatalf("show altered create table: %v", err)
+		t.Fatalf("show create table after no-op alter: %v", err)
 	}
-	if !strings.Contains(createSQL, "nickname") {
-		t.Fatalf("altered SHOW CREATE TABLE = %q, want runtime SQLite definition after invalidation", createSQL)
+	if strings.Contains(createSQL, "nickname") {
+		t.Fatalf("SHOW CREATE TABLE after no-op ALTER = %q, should keep configured schema", createSQL)
 	}
-	if strings.Contains(createSQL, "ON UPDATE CURRENT_TIMESTAMP") {
-		t.Fatalf("altered SHOW CREATE TABLE = %q, should not return stale configured DDL", createSQL)
+	if !strings.Contains(createSQL, "ON UPDATE CURRENT_TIMESTAMP") || !strings.Contains(createSQL, "COLLATE=utf8mb4_bin") {
+		t.Fatalf("SHOW CREATE TABLE after no-op ALTER = %q, want configured MySQL DDL", createSQL)
 	}
+	mysqlmock.AssertNoUnsupported(t, server)
 }
 
-func TestMySQLDDLCompatibility(t *testing.T) {
+func TestRuntimeDDLCompatibilityNoOpsSchemaChanges(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -3511,7 +3461,8 @@ func TestMySQLDDLCompatibility(t *testing.T) {
 CREATE TABLE ddl_users (
   id INTEGER PRIMARY KEY AUTO_INCREMENT,
   email VARCHAR(255) NOT NULL UNIQUE,
-  name VARCHAR(255) NOT NULL
+  name VARCHAR(255) NOT NULL,
+  nickname VARCHAR(40) NOT NULL DEFAULT ''
 );`}
 	server := mysqlmock.Start(t, mysqlmock.WithConfig(cfg))
 	db, err := sql.Open("mysql", server.DSN())
@@ -3520,30 +3471,6 @@ CREATE TABLE ddl_users (
 	}
 	defer db.Close()
 	db.SetMaxOpenConns(1)
-
-	if _, err := db.ExecContext(ctx, "ALTER TABLE ddl_users ADD COLUMN display_name VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT 'none'"); err != nil {
-		t.Fatalf("alter add column: %v", err)
-	}
-	if _, err := db.ExecContext(ctx, "ALTER TABLE ddl_users ADD INDEX idx_ddl_users_name (name) USING BTREE"); err != nil {
-		t.Fatalf("alter add index: %v", err)
-	}
-	if _, err := db.ExecContext(ctx, "ALTER TABLE ddl_users RENAME INDEX idx_ddl_users_name TO idx_ddl_users_name_new"); err != nil {
-		t.Fatalf("alter rename index: %v", err)
-	}
-	assertShowKeyColumns(t, ctx, db, "ddl_users", "idx_ddl_users_name_new", []string{"name"})
-
-	if _, err := db.ExecContext(ctx, "ALTER TABLE ddl_users DROP INDEX idx_ddl_users_name_new"); err != nil {
-		t.Fatalf("alter drop index: %v", err)
-	}
-	assertShowKeyColumns(t, ctx, db, "ddl_users", "idx_ddl_users_name_new", nil)
-
-	if _, err := db.ExecContext(ctx, "CREATE INDEX idx_ddl_users_display_name ON ddl_users (display_name)"); err != nil {
-		t.Fatalf("create display name index: %v", err)
-	}
-	if _, err := db.ExecContext(ctx, "DROP INDEX idx_ddl_users_display_name ON ddl_users"); err != nil {
-		t.Fatalf("drop index on table: %v", err)
-	}
-	assertShowKeyColumns(t, ctx, db, "ddl_users", "idx_ddl_users_display_name", nil)
 
 	if _, err := db.ExecContext(ctx, "CREATE DATABASE IF NOT EXISTS `rspec_test` DEFAULT CHARACTER SET = utf8mb4 COLLATE = utf8mb4_unicode_ci"); err != nil {
 		t.Fatalf("create database no-op: %v", err)
@@ -3559,32 +3486,70 @@ CREATE TABLE ddl_users (
 		t.Fatalf("current database after create database no-op = %q, want mysqlmock", currentDB)
 	}
 
-	if _, err := db.ExecContext(ctx, "ALTER TABLE ddl_users CHANGE COLUMN display_name nickname VARCHAR(20) NOT NULL"); err != nil {
-		t.Fatalf("alter change column: %v", err)
+	if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS `ddl_users`, `missing_ddl_users` CASCADE"); err != nil {
+		t.Fatalf("drop table no-op: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "ALTER TABLE ddl_users CHANGE COLUMN nickname nickname VARCHAR(20) NOT NULL"); err != nil {
+		t.Fatalf("same-name alter change column no-op: %v", err)
 	}
 	if _, err := db.ExecContext(ctx, "ALTER TABLE ddl_users MODIFY COLUMN nickname VARCHAR(40) NOT NULL"); err != nil {
-		t.Fatalf("alter modify column: %v", err)
+		t.Fatalf("alter modify column no-op: %v", err)
 	}
 	if _, err := db.ExecContext(ctx, "INSERT INTO ddl_users (email, name, nickname) VALUES (?, ?, ?)", "ddl@example.com", "DDL", "Nick"); err != nil {
-		t.Fatalf("insert after ddl changes: %v", err)
+		t.Fatalf("insert after no-op ddl compatibility: %v", err)
 	}
 
-	if _, err := db.ExecContext(ctx, "RENAME TABLE ddl_users TO ddl_people"); err != nil {
-		t.Fatalf("rename table: %v", err)
-	}
 	var nickname string
-	if err := db.QueryRowContext(ctx, "SELECT nickname FROM ddl_people WHERE email = ?", "ddl@example.com").Scan(&nickname); err != nil {
-		t.Fatalf("select renamed table: %v", err)
+	if err := db.QueryRowContext(ctx, "SELECT nickname FROM ddl_users WHERE email = ?", "ddl@example.com").Scan(&nickname); err != nil {
+		t.Fatalf("select after no-op ddl compatibility: %v", err)
 	}
 	if nickname != "Nick" {
-		t.Fatalf("renamed table nickname = %q, want Nick", nickname)
+		t.Fatalf("nickname = %q, want Nick", nickname)
 	}
 	if _, err := db.ExecContext(ctx, "DROP DATABASE IF EXISTS `teardown_db`"); err != nil {
 		t.Fatalf("drop database teardown: %v", err)
 	}
+
+	noOpSQL := []string{
+		"CREATE TABLE runtime_ddl_users (id INTEGER PRIMARY KEY AUTO_INCREMENT)",
+		"ALTER TABLE ddl_users ADD COLUMN display_name VARCHAR(20) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin DEFAULT 'none'",
+		"ALTER TABLE ddl_users ADD INDEX idx_ddl_users_name (name) USING BTREE",
+		"ALTER TABLE ddl_users RENAME INDEX idx_ddl_users_name TO idx_ddl_users_name_new",
+		"ALTER TABLE ddl_users DROP INDEX idx_ddl_users_name_new",
+		"CREATE INDEX idx_ddl_users_nickname ON ddl_users (nickname)",
+		"DROP INDEX idx_ddl_users_nickname ON ddl_users",
+		"ALTER TABLE ddl_users CHANGE COLUMN nickname display_name VARCHAR(20) NOT NULL",
+		"RENAME TABLE ddl_users TO ddl_people",
+	}
+	for _, sqlText := range noOpSQL {
+		if _, err := db.ExecContext(ctx, sqlText); err != nil {
+			t.Fatalf("%s no-op failed: %v", sqlText, err)
+		}
+	}
+
+	if _, err := db.ExecContext(ctx, "INSERT INTO ddl_users (email, name, nickname) VALUES (?, ?, ?)", "after-noop@example.com", "After", "Noop"); err != nil {
+		t.Fatalf("insert after schema-changing no-ops: %v", err)
+	}
+	if rows, err := db.QueryContext(ctx, "SELECT display_name FROM ddl_users"); err == nil {
+		_ = rows.Close()
+		t.Fatal("select display_name succeeded, want schema to remain unchanged")
+	}
+
 	assertQueryRoute(t, server, "CREATE DATABASE ", "compat")
 	assertQueryRoute(t, server, "CREATE SCHEMA ", "compat")
+	assertQueryRoute(t, server, "DROP TABLE ", "compat")
+	assertQueryRoute(t, server, "ALTER TABLE ", "compat")
+	assertQueryRoute(t, server, "CREATE TABLE ", "compat")
+	assertQueryRoute(t, server, "RENAME TABLE ", "compat")
 	mysqlmock.AssertNoUnsupported(t, server)
+
+	if _, err := db.ExecContext(ctx, "CREATE TABLE multi_statement_ddl (id INTEGER); INSERT INTO ddl_users (email, name, nickname) VALUES ('multi@example.com', 'Multi', 'Stmt')"); err == nil {
+		t.Fatal("multi-statement runtime DDL succeeded, want unsupported error")
+	}
+	unsupported := server.Unsupported()
+	if len(unsupported) != 1 || unsupported[0].RouteStage != "runtime_schema_change_multi_statement" {
+		t.Fatalf("unsupported queries = %#v, want one runtime_schema_change_multi_statement entry", unsupported)
+	}
 }
 
 func assertQueryRoute(t *testing.T, server *mysqlmock.Server, normalizedPrefix, route string) {
@@ -3816,21 +3781,13 @@ seed_files:
 	}
 	assertTableCount(t, ctx, db, "cached_users", 1)
 
-	if _, err := db.ExecContext(ctx, "CREATE TABLE runtime_only (id INTEGER PRIMARY KEY AUTO_INCREMENT)"); err != nil {
-		t.Fatalf("create runtime table: %v", err)
-	}
 	if err := server.Reset(ctx); err != nil {
-		t.Fatalf("full reset with removed config files: %v", err)
+		t.Fatalf("second reset with removed config files: %v", err)
 	}
 	assertTableCount(t, ctx, db, "cached_users", 1)
-	var tableName string
-	err = db.QueryRowContext(ctx, "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'runtime_only'").Scan(&tableName)
-	if !errors.Is(err, sql.ErrNoRows) {
-		t.Fatalf("runtime table after full reset = %q, err=%v, want no rows", tableName, err)
-	}
 }
 
-func TestUpsertMetadataCacheInvalidatesAfterSchemaChange(t *testing.T) {
+func TestUpsertUsesConfiguredUniqueIndexAfterMetadataCacheWarmup(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -3840,7 +3797,8 @@ CREATE TABLE cache_upserts (
   id INTEGER PRIMARY KEY AUTO_INCREMENT,
   code TEXT NOT NULL,
   count INTEGER NOT NULL DEFAULT 0
-);`}
+);
+CREATE UNIQUE INDEX uniq_cache_upserts_code ON cache_upserts (code);`}
 	cfg.Seed = map[string][]map[string]any{
 		"cache_upserts": {
 			{"id": 1, "code": "a", "count": 1},
@@ -3861,15 +3819,12 @@ ON DUPLICATE KEY UPDATE count = VALUES(count)
 `); err != nil {
 		t.Fatalf("initial primary-key upsert: %v", err)
 	}
-	if _, err := db.ExecContext(ctx, "CREATE UNIQUE INDEX uniq_cache_upserts_code ON cache_upserts (code)"); err != nil {
-		t.Fatalf("create unique index after cache warmup: %v", err)
-	}
 	if _, err := db.ExecContext(ctx, `
 INSERT INTO cache_upserts (id, code, count)
 VALUES (2, 'a', 3)
 ON DUPLICATE KEY UPDATE count = VALUES(count)
 `); err != nil {
-		t.Fatalf("upsert after unique index schema change: %v", err)
+		t.Fatalf("upsert with configured unique index after cache warmup: %v", err)
 	}
 
 	var count int

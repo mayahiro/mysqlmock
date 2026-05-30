@@ -475,10 +475,20 @@ func (c *mysqlConn) executeQuery(ctx context.Context, command, sqlText string, a
 		return c.querySQLiteText(ctx, c.server.translateSQLCached(trimmed), command == "COM_QUERY", args...)
 	}
 	if isWriteQuery(upper) {
-		recordRoute("sqlite")
 		if resp, handled, err := c.execMySQLDDLCompatibility(ctx, trimmed); handled || err != nil {
+			recordRoute("compat")
 			return resp, err
 		}
+		if isRuntimeSchemaChangingStatement(trimmed) {
+			recordRoute("compat")
+			return okResult{}, nil
+		}
+		if isRuntimeSchemaChangingQuery(upper) {
+			route = "unsupported"
+			c.recordUnsupported(command, sqlText, normalized, "runtime_schema_change_multi_statement")
+			return nil, c.server.unsupportedError(sqlText)
+		}
+		recordRoute("sqlite")
 		if strings.HasPrefix(upper, "INSERT ") {
 			if resp, handled, err := c.execMySQLUpsert(ctx, trimmed, args...); handled || err != nil {
 				return resp, err
@@ -1030,6 +1040,29 @@ func isWriteQuery(upper string) bool {
 		strings.HasPrefix(upper, "DROP DATABASE ") ||
 		strings.HasPrefix(upper, "DROP SCHEMA ") ||
 		strings.HasPrefix(upper, "DROP INDEX ")
+}
+
+func isRuntimeSchemaChangingQuery(upper string) bool {
+	return strings.HasPrefix(upper, "CREATE TABLE ") ||
+		strings.HasPrefix(upper, "CREATE TEMPORARY TABLE ") ||
+		strings.HasPrefix(upper, "CREATE TEMP TABLE ") ||
+		strings.HasPrefix(upper, "CREATE INDEX ") ||
+		strings.HasPrefix(upper, "CREATE UNIQUE INDEX ") ||
+		strings.HasPrefix(upper, "ALTER TABLE ") ||
+		strings.HasPrefix(upper, "RENAME TABLE ") ||
+		strings.HasPrefix(upper, "DROP DATABASE ") ||
+		strings.HasPrefix(upper, "DROP SCHEMA ") ||
+		strings.HasPrefix(upper, "DROP TABLE ") ||
+		strings.HasPrefix(upper, "DROP INDEX ")
+}
+
+func isRuntimeSchemaChangingStatement(sqlText string) bool {
+	statements := splitSQLStatements(sqlText)
+	if len(statements) != 1 {
+		return false
+	}
+	upper := strings.ToUpper(normalizeSQL(statements[0]))
+	return isRuntimeSchemaChangingQuery(upper)
 }
 
 func isSchemaChangingQuery(sqlText string) bool {
