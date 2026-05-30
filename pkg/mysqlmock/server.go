@@ -16,6 +16,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -302,6 +303,7 @@ func (s *Server) Reset(ctx context.Context) error {
 	if s.keepConn == nil {
 		return errors.New("mysqlmock server not started")
 	}
+	resetStart := time.Now()
 	resetKind := "data_only"
 	canResetDataOnly, err := s.canResetBackendData(ctx, s.keepConn)
 	if err != nil {
@@ -332,6 +334,7 @@ func (s *Server) Reset(ctx context.Context) error {
 	s.autoIncrement = map[string]uint64{}
 	s.mu.Unlock()
 	s.stats.recordReset(resetKind)
+	s.stats.recordPhaseTiming("reset."+resetKind, time.Since(resetStart))
 	return nil
 }
 

@@ -1,6 +1,9 @@
 package mysqlmock
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestDiagnosticsStoreSnapshotsAreCopies(t *testing.T) {
 	var store diagnosticsStore
@@ -45,6 +48,9 @@ func TestStatsStoreSnapshotsAreCopies(t *testing.T) {
 	store.recordInformationSchemaTargetTableRefresh(true)
 	store.recordReset("data_only")
 	store.recordSchemaChange()
+	store.recordQueryTiming("COM_QUERY", "sqlite", "SELECT 1", 10*time.Millisecond)
+	store.recordQueryTiming("COM_STMT_EXECUTE", "compat", "SHOW FULL FIELDS FROM users", 20*time.Millisecond)
+	store.recordPhaseTiming("sqlite.exec", 5*time.Millisecond)
 
 	stats := store.snapshot()
 	if stats.Queries.Total != 2 {
@@ -72,15 +78,34 @@ func TestStatsStoreSnapshotsAreCopies(t *testing.T) {
 	if stats.Resets.Total != 1 || stats.Resets.DataOnly != 1 || stats.Resets.Full != 0 {
 		t.Fatalf("reset stats = %#v, want one data-only reset", stats.Resets)
 	}
+	if stats.Timings.Queries.Count != 2 ||
+		stats.Timings.Queries.TotalNanos != uint64(30*time.Millisecond) ||
+		stats.Timings.Queries.MaxNanos != uint64(20*time.Millisecond) {
+		t.Fatalf("query timing stats = %#v, want two query durations", stats.Timings.Queries)
+	}
+	if stats.Timings.Queries.ByRoute["sqlite"].TotalNanos != uint64(10*time.Millisecond) ||
+		stats.Timings.Queries.ByKind["show_full_fields"].MaxNanos != uint64(20*time.Millisecond) {
+		t.Fatalf("query timing buckets = %#v, want route and kind durations", stats.Timings.Queries)
+	}
+	if stats.Timings.Phases.Count != 1 ||
+		stats.Timings.Phases.ByPhase["sqlite.exec"].TotalNanos != uint64(5*time.Millisecond) {
+		t.Fatalf("phase timing stats = %#v, want sqlite.exec duration", stats.Timings.Phases)
+	}
 
 	stats.Queries.ByCommand["COM_QUERY"] = 99
 	stats.Queries.ByRoute["sqlite"] = 99
 	stats.Queries.ByKind["select"] = 99
+	stats.Timings.Queries.ByRoute["sqlite"] = TimingBucket{Count: 99, TotalNanos: 99, MaxNanos: 99}
+	stats.Timings.Phases.ByPhase["sqlite.exec"] = TimingBucket{Count: 99, TotalNanos: 99, MaxNanos: 99}
 	again := store.snapshot()
 	if again.Queries.ByCommand["COM_QUERY"] != 1 ||
 		again.Queries.ByRoute["sqlite"] != 1 ||
 		again.Queries.ByKind["select"] != 1 {
 		t.Fatalf("stats snapshot mutation changed store: %#v", again.Queries)
+	}
+	if again.Timings.Queries.ByRoute["sqlite"].Count != 1 ||
+		again.Timings.Phases.ByPhase["sqlite.exec"].Count != 1 {
+		t.Fatalf("timing snapshot mutation changed store: %#v", again.Timings)
 	}
 }
 

@@ -3,6 +3,7 @@ package mysqlmock
 import (
 	"strings"
 	"sync"
+	"time"
 )
 
 // Stats is a SQL-body-free snapshot of server execution counters.
@@ -10,6 +11,7 @@ type Stats struct {
 	Queries       QueryStats    `json:"queries"`
 	Metadata      MetadataStats `json:"metadata"`
 	Resets        ResetStats    `json:"resets"`
+	Timings       TimingStats   `json:"timings"`
 	SchemaChanges uint64        `json:"schema_changes"`
 	Unsupported   uint64        `json:"unsupported"`
 }
@@ -45,11 +47,43 @@ type ResetStats struct {
 	Full     uint64 `json:"full"`
 }
 
+// TimingStats summarizes elapsed time without storing SQL text or object names.
+type TimingStats struct {
+	Queries QueryTimingStats `json:"queries"`
+	Phases  PhaseTimingStats `json:"phases"`
+}
+
+// QueryTimingStats summarizes query execution durations by SQL-safe categories.
+type QueryTimingStats struct {
+	Count      uint64                  `json:"count"`
+	TotalNanos uint64                  `json:"total_ns"`
+	MaxNanos   uint64                  `json:"max_ns"`
+	ByCommand  map[string]TimingBucket `json:"by_command"`
+	ByRoute    map[string]TimingBucket `json:"by_route"`
+	ByKind     map[string]TimingBucket `json:"by_kind"`
+}
+
+// PhaseTimingStats summarizes internal phase durations by fixed phase name.
+type PhaseTimingStats struct {
+	Count      uint64                  `json:"count"`
+	TotalNanos uint64                  `json:"total_ns"`
+	MaxNanos   uint64                  `json:"max_ns"`
+	ByPhase    map[string]TimingBucket `json:"by_phase"`
+}
+
+// TimingBucket stores aggregate duration values in nanoseconds.
+type TimingBucket struct {
+	Count      uint64 `json:"count"`
+	TotalNanos uint64 `json:"total_ns"`
+	MaxNanos   uint64 `json:"max_ns"`
+}
+
 type statsStore struct {
 	mu            sync.Mutex
 	queries       QueryStats
 	metadata      MetadataStats
 	resets        ResetStats
+	timings       TimingStats
 	schemaChanges uint64
 	unsupported   uint64
 }
@@ -65,8 +99,24 @@ func (s *statsStore) snapshot() Stats {
 			ByRoute:   cloneCountMap(s.queries.ByRoute),
 			ByKind:    cloneCountMap(s.queries.ByKind),
 		},
-		Metadata:      s.metadata,
-		Resets:        s.resets,
+		Metadata: s.metadata,
+		Resets:   s.resets,
+		Timings: TimingStats{
+			Queries: QueryTimingStats{
+				Count:      s.timings.Queries.Count,
+				TotalNanos: s.timings.Queries.TotalNanos,
+				MaxNanos:   s.timings.Queries.MaxNanos,
+				ByCommand:  cloneTimingBucketMap(s.timings.Queries.ByCommand),
+				ByRoute:    cloneTimingBucketMap(s.timings.Queries.ByRoute),
+				ByKind:     cloneTimingBucketMap(s.timings.Queries.ByKind),
+			},
+			Phases: PhaseTimingStats{
+				Count:      s.timings.Phases.Count,
+				TotalNanos: s.timings.Phases.TotalNanos,
+				MaxNanos:   s.timings.Phases.MaxNanos,
+				ByPhase:    cloneTimingBucketMap(s.timings.Phases.ByPhase),
+			},
+		},
 		SchemaChanges: s.schemaChanges,
 		Unsupported:   s.unsupported,
 	}
@@ -80,6 +130,31 @@ func (s *statsStore) recordQuery(command, route, normalizedSQL string) {
 	incrementCount(&s.queries.ByCommand, command)
 	incrementCount(&s.queries.ByRoute, route)
 	incrementCount(&s.queries.ByKind, queryKindFromNormalizedSQL(normalizedSQL))
+}
+
+func (s *statsStore) recordQueryTiming(command, route, normalizedSQL string, duration time.Duration) {
+	nanos := durationNanos(duration)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	recordTimingBucket(&s.timings.Queries.Count, &s.timings.Queries.TotalNanos, &s.timings.Queries.MaxNanos, nanos)
+	incrementTimingBucket(&s.timings.Queries.ByCommand, command, nanos)
+	incrementTimingBucket(&s.timings.Queries.ByRoute, route, nanos)
+	incrementTimingBucket(&s.timings.Queries.ByKind, queryKindFromNormalizedSQL(normalizedSQL), nanos)
+}
+
+func (s *statsStore) recordPhaseTiming(phase string, duration time.Duration) {
+	if phase == "" {
+		return
+	}
+	nanos := durationNanos(duration)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	recordTimingBucket(&s.timings.Phases.Count, &s.timings.Phases.TotalNanos, &s.timings.Phases.MaxNanos, nanos)
+	incrementTimingBucket(&s.timings.Phases.ByPhase, phase, nanos)
 }
 
 func (s *statsStore) recordUnsupported() {
@@ -196,6 +271,41 @@ func cloneCountMap(in map[string]uint64) map[string]uint64 {
 		out[key] = value
 	}
 	return out
+}
+
+func incrementTimingBucket(counts *map[string]TimingBucket, key string, nanos uint64) {
+	if key == "" {
+		return
+	}
+	if *counts == nil {
+		*counts = map[string]TimingBucket{}
+	}
+	bucket := (*counts)[key]
+	recordTimingBucket(&bucket.Count, &bucket.TotalNanos, &bucket.MaxNanos, nanos)
+	(*counts)[key] = bucket
+}
+
+func recordTimingBucket(count, total, max *uint64, nanos uint64) {
+	(*count)++
+	(*total) += nanos
+	if nanos > *max {
+		*max = nanos
+	}
+}
+
+func cloneTimingBucketMap(in map[string]TimingBucket) map[string]TimingBucket {
+	out := make(map[string]TimingBucket, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
+}
+
+func durationNanos(duration time.Duration) uint64 {
+	if duration <= 0 {
+		return 0
+	}
+	return uint64(duration)
 }
 
 func queryKindFromNormalizedSQL(sqlText string) string {

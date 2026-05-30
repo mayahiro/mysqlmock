@@ -182,9 +182,14 @@ unsupportedSnapshot, err := server.UnsupportedSnapshotJSON()
 ```
 
 `Stats()` returns counters for routed queries, metadata work, resets, schema
-changes, and unsupported SQL. It does not store SQL text, normalized SQL,
-parameters, table names, or column names. `Server.Reset` does not clear stats;
-take snapshots before and after a workflow when per-workflow counts are needed.
+changes, unsupported SQL, and aggregate timings. Timings are reported in
+nanoseconds as query totals by command, route, and kind, plus fixed internal
+phases such as `sqlite.query`, `sqlite.exec`, `protocol.result_set_text`,
+`protocol.result_set_sqlite_text`, `information_schema.target_table_refresh`,
+and `reset.data_only`. It does not store SQL text, normalized SQL, parameters,
+table names, or column names.
+`Server.Reset` does not clear stats; take snapshots before and after a workflow
+when per-workflow counts or timings are needed.
 
 For the common assertion that repository tests must not emit unsupported SQL,
 use:

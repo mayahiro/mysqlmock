@@ -11,6 +11,11 @@ import (
 )
 
 func (c *mysqlConn) writeResultSet(seq byte, rs resultSet) error {
+	start := time.Now()
+	defer func() {
+		c.server.stats.recordPhaseTiming("protocol.result_set_text", time.Since(start))
+	}()
+
 	if err := c.writePacket(seq, appendLenEncInt(nil, uint64(len(rs.Columns)))); err != nil {
 		return err
 	}
@@ -36,6 +41,10 @@ func (c *mysqlConn) writeResultSet(seq byte, rs resultSet) error {
 }
 
 func (c *mysqlConn) writeSQLiteTextResultSet(seq byte, rs *sqliteResultSet) error {
+	start := time.Now()
+	defer func() {
+		c.server.stats.recordPhaseTiming("protocol.result_set_sqlite_text", time.Since(start))
+	}()
 	defer rs.Close()
 
 	if err := c.writePacket(seq, appendLenEncInt(nil, uint64(len(rs.Columns)))); err != nil {
@@ -70,6 +79,11 @@ func (c *mysqlConn) writeSQLiteTextResultSet(seq byte, rs *sqliteResultSet) erro
 }
 
 func (c *mysqlConn) writeBinaryResultSet(seq byte, rs resultSet) error {
+	start := time.Now()
+	defer func() {
+		c.server.stats.recordPhaseTiming("protocol.result_set_binary", time.Since(start))
+	}()
+
 	rows := make([][]byte, len(rs.Rows))
 	for i, row := range rs.Rows {
 		payload, err := binaryRow(rs.Columns, row)
@@ -104,6 +118,11 @@ func (c *mysqlConn) writeBinaryResultSet(seq byte, rs resultSet) error {
 }
 
 func (c *mysqlConn) writeOK(seq byte, ok okResult) error {
+	start := time.Now()
+	defer func() {
+		c.server.stats.recordPhaseTiming("protocol.ok", time.Since(start))
+	}()
+
 	payload := []byte{0x00}
 	payload = appendLenEncInt(payload, ok.AffectedRows)
 	payload = appendLenEncInt(payload, ok.LastInsertID)
@@ -146,6 +165,11 @@ func (c *mysqlConn) writeEOFAsOK(seq byte) error {
 }
 
 func (c *mysqlConn) writeErr(seq byte, err *mysqlError) error {
+	start := time.Now()
+	defer func() {
+		c.server.stats.recordPhaseTiming("protocol.err", time.Since(start))
+	}()
+
 	payload := []byte{0xff}
 	payload = appendUint16(payload, err.Code)
 	payload = append(payload, '#')

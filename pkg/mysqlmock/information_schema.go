@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 )
 
 func isInformationSchemaQuery(upperSQL string) bool {
@@ -49,6 +50,10 @@ func (c *mysqlConn) refreshInformationSchema(ctx context.Context) error {
 		c.server.stats.recordInformationSchemaFullRefreshCacheHit()
 		return nil
 	}
+	refreshStart := time.Now()
+	defer func() {
+		c.server.stats.recordPhaseTiming("information_schema.full_refresh", time.Since(refreshStart))
+	}()
 	if err := c.prepareInformationSchema(ctx); err != nil {
 		return err
 	}
@@ -104,6 +109,10 @@ func (c *mysqlConn) refreshInformationSchemaTable(ctx context.Context, tableName
 		c.server.stats.recordInformationSchemaTargetTableCacheHit()
 		return c.informationSchemaCachedTableExists(ctx, tableName)
 	}
+	refreshStart := time.Now()
+	defer func() {
+		c.server.stats.recordPhaseTiming("information_schema.target_table_refresh", time.Since(refreshStart))
+	}()
 	if err := c.prepareInformationSchema(ctx); err != nil {
 		return false, err
 	}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"strings"
+	"time"
 )
 
 type sqliteResultSet struct {
@@ -28,7 +29,9 @@ func (c *mysqlConn) querySQLite(ctx context.Context, query string, args ...any) 
 }
 
 func (c *mysqlConn) querySQLiteText(ctx context.Context, query string, stream bool, args ...any) (any, error) {
+	sqliteStart := time.Now()
 	rows, err := c.sqliteConn.QueryContext(ctx, query, args...)
+	c.server.stats.recordPhaseTiming("sqlite.query", time.Since(sqliteStart))
 	if err != nil {
 		return nil, err
 	}
@@ -43,7 +46,10 @@ func (c *mysqlConn) querySQLiteText(ctx context.Context, query string, stream bo
 	if stream && streamable {
 		return rs, nil
 	}
-	return rs.materialize()
+	materializeStart := time.Now()
+	result, err := rs.materialize()
+	c.server.stats.recordPhaseTiming("sqlite.materialize", time.Since(materializeStart))
+	return result, err
 }
 
 func (c *mysqlConn) sqliteResultColumns(query string, rows *sql.Rows) ([]resultColumn, bool, error) {

@@ -4071,6 +4071,24 @@ func TestServerStatsDoNotStoreSQLText(t *testing.T) {
 	if stats.Resets.Total != 1 || stats.Resets.DataOnly != 1 || stats.Resets.Full != 0 {
 		t.Fatalf("reset stats = %#v, want one data-only reset", stats.Resets)
 	}
+	if stats.Timings.Queries.Count == 0 || stats.Timings.Queries.TotalNanos == 0 {
+		t.Fatalf("query timings = %#v, want recorded durations", stats.Timings.Queries)
+	}
+	if stats.Timings.Queries.ByRoute["compat"].Count == 0 ||
+		stats.Timings.Queries.ByRoute["sqlite"].Count == 0 ||
+		stats.Timings.Queries.ByKind["select"].Count == 0 {
+		t.Fatalf("query timing buckets = %#v, want compat, sqlite, and select timings", stats.Timings.Queries)
+	}
+	for _, phase := range []string{
+		"sqlite.query",
+		"protocol.result_set_text",
+		"information_schema.target_table_refresh",
+		"reset.data_only",
+	} {
+		if stats.Timings.Phases.ByPhase[phase].Count == 0 {
+			t.Fatalf("phase timings = %#v, want %s", stats.Timings.Phases, phase)
+		}
+	}
 
 	statsJSON, err := json.Marshal(stats)
 	if err != nil {

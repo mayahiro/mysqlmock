@@ -179,9 +179,10 @@ snapshot, err := server.QuerySnapshotJSON()
 unsupportedSnapshot, err := server.UnsupportedSnapshotJSON()
 ```
 
-`Stats()` は routed query、metadata work、reset、schema change、unsupported SQL の counter を返します
+`Stats()` は routed query、metadata work、reset、schema change、unsupported SQL の counter と aggregate timings を返します
+timings は nanoseconds 単位で、query totals を command、route、kind 別に、internal phase を `sqlite.query`、`sqlite.exec`、`protocol.result_set_text`、`protocol.result_set_sqlite_text`、`information_schema.target_table_refresh`、`reset.data_only` のような固定名別に出力します
 SQL 本文、normalized SQL、parameters、table names、column names は保持しません
-`Server.Reset` は stats を消さないため、workflow 単位の件数が必要な場合は前後の snapshot を比較してください
+`Server.Reset` は stats を消さないため、workflow 単位の件数や timings が必要な場合は前後の snapshot を比較してください
 
 Repository test が unsupported SQL を出していないことを確認する標準 assertion には次を使えます
 

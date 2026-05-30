@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
@@ -314,97 +315,111 @@ func (c *mysqlConn) handleQuery(ctx context.Context, sqlText string) error {
 }
 
 func (c *mysqlConn) executeQuery(ctx context.Context, command, sqlText string, args ...any) (any, error) {
+	start := time.Now()
+	route := ""
+	normalized := ""
+	defer func() {
+		if route != "" {
+			c.server.stats.recordQueryTiming(command, route, normalized, time.Since(start))
+		}
+	}()
+	recordRoute := func(nextRoute string) {
+		route = nextRoute
+		c.logQuery(command, nextRoute, sqlText, normalized)
+	}
+
 	trimmed := strings.TrimSpace(sqlText)
 	if trimmed == "" {
 		return nil, errPacket(mysqlErrUnknown, "HY000", "Unsupported query: empty SQL")
 	}
-	normalized := normalizeSQL(trimmed)
+	normalized = normalizeSQL(trimmed)
 	upper := strings.ToUpper(normalized)
 	versionColumn, isVersionQuery := selectVersionColumnName(trimmed)
 
 	if resp, matched, err := c.server.executeRule(ctx, sqlText, args); matched || err != nil {
-		c.logQuery(command, "rules", sqlText, normalized)
+		recordRoute("rules")
 		return resp, err
 	}
 
 	switch {
 	case strings.HasPrefix(upper, "SET NAMES "):
-		c.logQuery(command, "compat", sqlText, normalized)
+		recordRoute("compat")
 		resp := c.setNames(normalized)
 		c.setVariables(ctx, trimmed)
 		return resp, nil
 	case strings.HasPrefix(upper, "SET AUTOCOMMIT"):
-		c.logQuery(command, "compat", sqlText, normalized)
+		recordRoute("compat")
 		return c.setAutocommit(upper), nil
 	case strings.HasPrefix(upper, "SET TRANSACTION "):
-		c.logQuery(command, "compat", sqlText, normalized)
+		recordRoute("compat")
 		return okResult{}, nil
 	case strings.HasPrefix(upper, "SET "):
-		c.logQuery(command, "compat", sqlText, normalized)
+		recordRoute("compat")
 		return c.setVariables(ctx, trimmed), nil
 	case isVersionQuery:
-		c.logQuery(command, "compat", sqlText, normalized)
+		recordRoute("compat")
 		return oneRow(versionColumn, c.server.cfg.Server.MySQLVersion), nil
 	case isAdvisoryLockQuery(upper):
-		c.logQuery(command, "compat", sqlText, normalized)
+		recordRoute("compat")
 		return c.advisoryLockResult(trimmed), nil
 	case upper == "SELECT DATABASE()":
-		c.logQuery(command, "compat", sqlText, normalized)
+		recordRoute("compat")
 		return oneRow("DATABASE()", c.currentDB), nil
 	case upper == "SELECT SCHEMA()":
-		c.logQuery(command, "compat", sqlText, normalized)
+		recordRoute("compat")
 		return oneRow("SCHEMA()", c.currentDB), nil
 	case upper == "SELECT USER()":
-		c.logQuery(command, "compat", sqlText, normalized)
+		recordRoute("compat")
 		return oneRow("USER()", c.currentUser()), nil
 	case upper == "SELECT CURRENT_USER()" || upper == "SELECT CURRENT_USER":
-		c.logQuery(command, "compat", sqlText, normalized)
+		recordRoute("compat")
 		return oneRow("CURRENT_USER()", c.currentUser()), nil
 	case upper == "SELECT CONNECTION_ID()":
-		c.logQuery(command, "compat", sqlText, normalized)
+		recordRoute("compat")
 		return oneRow("CONNECTION_ID()", c.connectionID), nil
 	case upper == "SELECT LAST_INSERT_ID()":
-		c.logQuery(command, "compat", sqlText, normalized)
+		recordRoute("compat")
 		return oneRow("LAST_INSERT_ID()", c.lastInsertID), nil
 	case upper == "SELECT ROW_COUNT()":
-		c.logQuery(command, "compat", sqlText, normalized)
+		recordRoute("compat")
 		return oneRow("ROW_COUNT()", c.lastAffectedRows), nil
 	case upper == "SELECT @@VERSION" || upper == "SELECT @@SESSION.VERSION" || upper == "SELECT @@GLOBAL.VERSION":
-		c.logQuery(command, "compat", sqlText, normalized)
+		recordRoute("compat")
 		return oneRow("@@version", c.server.cfg.Server.MySQLVersion), nil
 	case strings.HasPrefix(upper, "SELECT @@"):
+		route = "compat"
 		return c.selectVariable(command, sqlText, normalized)
 	case upper == "SHOW VARIABLES":
-		c.logQuery(command, "compat", sqlText, normalized)
+		recordRoute("compat")
 		return c.showVariables(), nil
 	case upper == "SHOW TABLES":
-		c.logQuery(command, "compat", sqlText, normalized)
+		recordRoute("compat")
 		return c.showTables(ctx)
 	case isShowFullFieldsQuery(upper):
-		c.logQuery(command, "compat", sqlText, normalized)
+		recordRoute("compat")
 		return c.showFullFields(ctx, trimmed)
 	case isShowCreateTableQuery(upper):
-		c.logQuery(command, "compat", sqlText, normalized)
+		recordRoute("compat")
 		return c.showCreateTable(ctx, trimmed)
 	case isShowKeysQuery(upper):
-		c.logQuery(command, "compat", sqlText, normalized)
+		recordRoute("compat")
 		return c.showKeys(ctx, trimmed)
 	case isInformationSchemaQuery(upper):
-		c.logQuery(command, "compat", sqlText, normalized)
+		recordRoute("compat")
 		return c.queryInformationSchemaText(ctx, trimmed, command == "COM_QUERY", args...)
 	case isCreateDatabaseStatement(trimmed):
-		c.logQuery(command, "compat", sqlText, normalized)
+		recordRoute("compat")
 		return okResult{}, nil
 	case upper == "BEGIN" || upper == "START TRANSACTION":
-		c.logQuery(command, "sqlite", sqlText, normalized)
+		recordRoute("sqlite")
 		return c.execSQLite(ctx, "BEGIN")
 	case upper == "COMMIT":
-		c.logQuery(command, "sqlite", sqlText, normalized)
+		recordRoute("sqlite")
 		resp, err := c.execSQLite(ctx, "COMMIT")
 		c.statusFlags &^= serverStatusInTrans
 		return resp, err
 	case upper == "ROLLBACK":
-		c.logQuery(command, "sqlite", sqlText, normalized)
+		recordRoute("sqlite")
 		resp, err := c.execSQLite(ctx, "ROLLBACK")
 		if err == nil {
 			err = c.restoreMySQLAutoIncrementSequences(ctx)
@@ -412,7 +427,7 @@ func (c *mysqlConn) executeQuery(ctx context.Context, command, sqlText string, a
 		c.statusFlags &^= serverStatusInTrans
 		return resp, err
 	case upper == "ROLLBACK AND CHAIN":
-		c.logQuery(command, "sqlite", sqlText, normalized)
+		recordRoute("sqlite")
 		if _, err := c.execSQLite(ctx, "ROLLBACK"); err != nil {
 			return okResult{}, err
 		}
@@ -421,7 +436,7 @@ func (c *mysqlConn) executeQuery(ctx context.Context, command, sqlText string, a
 		}
 		return c.execSQLite(ctx, "BEGIN")
 	case strings.HasPrefix(upper, "ROLLBACK TO SAVEPOINT "):
-		c.logQuery(command, "sqlite", sqlText, normalized)
+		recordRoute("sqlite")
 		resp, err := c.execSQLite(ctx, trimmed)
 		if err == nil {
 			err = c.restoreMySQLAutoIncrementSequences(ctx)
@@ -429,16 +444,16 @@ func (c *mysqlConn) executeQuery(ctx context.Context, command, sqlText string, a
 		return resp, err
 	case strings.HasPrefix(upper, "SAVEPOINT ") ||
 		strings.HasPrefix(upper, "RELEASE SAVEPOINT "):
-		c.logQuery(command, "sqlite", sqlText, normalized)
+		recordRoute("sqlite")
 		return c.execSQLite(ctx, trimmed)
 	}
 
 	if isReadQuery(upper) {
-		c.logQuery(command, "sqlite", sqlText, normalized)
+		recordRoute("sqlite")
 		return c.querySQLiteText(ctx, c.server.translateSQLCached(trimmed), command == "COM_QUERY", args...)
 	}
 	if isWriteQuery(upper) {
-		c.logQuery(command, "sqlite", sqlText, normalized)
+		recordRoute("sqlite")
 		if resp, handled, err := c.execMySQLDDLCompatibility(ctx, trimmed); handled || err != nil {
 			return resp, err
 		}
@@ -462,6 +477,7 @@ func (c *mysqlConn) executeQuery(ctx context.Context, command, sqlText string, a
 		return resp, err
 	}
 
+	route = "unsupported"
 	c.recordUnsupported(command, sqlText, normalized, "unsupported")
 	return nil, c.server.unsupportedError(sqlText)
 }
@@ -745,7 +761,9 @@ func (c *mysqlConn) execSQLite(ctx context.Context, query string, args ...any) (
 	if err := c.validateMySQLWriteValues(ctx, query, args...); err != nil {
 		return okResult{}, err
 	}
+	sqliteStart := time.Now()
 	res, err := c.sqliteConn.ExecContext(ctx, query, args...)
+	c.server.stats.recordPhaseTiming("sqlite.exec", time.Since(sqliteStart))
 	if err != nil {
 		return okResult{}, err
 	}
