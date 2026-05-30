@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -65,6 +66,25 @@ func TestRunDumpConfigSchema(t *testing.T) {
 	}
 	if schema["title"] != "mysqlmock config" {
 		t.Fatalf("schema title = %#v", schema["title"])
+	}
+}
+
+func TestWriteServeStats(t *testing.T) {
+	server, err := mysqlmock.New(mysqlmock.WithConfig(mysqlmock.DefaultConfig()))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if err := writeServeStats(&out, server); err != nil {
+		t.Fatalf("write serve stats: %v", err)
+	}
+	var stats mysqlmock.Stats
+	if err := json.Unmarshal(out.Bytes(), &stats); err != nil {
+		t.Fatalf("decode stats JSON: %v", err)
+	}
+	if strings.Contains(out.String(), "SELECT") {
+		t.Fatalf("stats JSON contains SQL text: %s", out.String())
 	}
 }
 

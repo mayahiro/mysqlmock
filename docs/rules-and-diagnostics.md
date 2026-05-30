@@ -176,9 +176,15 @@ Library tests can inspect diagnostics:
 ```go
 unsupported := server.Unsupported()
 queries := server.Queries()
+stats := server.Stats()
 snapshot, err := server.QuerySnapshotJSON()
 unsupportedSnapshot, err := server.UnsupportedSnapshotJSON()
 ```
+
+`Stats()` returns counters for routed queries, metadata work, resets, schema
+changes, and unsupported SQL. It does not store SQL text, normalized SQL,
+parameters, table names, or column names. `Server.Reset` does not clear stats;
+take snapshots before and after a workflow when per-workflow counts are needed.
 
 For the common assertion that repository tests must not emit unsupported SQL,
 use:
@@ -222,6 +228,13 @@ Emit query logs:
 
 ```sh
 mysqlmock serve --config testdb.yaml --verbose --log-format json
+```
+
+Print SQL-body-free execution stats as JSON to stderr when the server shuts
+down:
+
+```sh
+mysqlmock serve --config testdb.yaml --print-stats
 ```
 
 `--log-format` supports `text` and `json`.

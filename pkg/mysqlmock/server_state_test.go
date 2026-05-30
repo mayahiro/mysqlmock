@@ -35,6 +35,55 @@ func TestDiagnosticsStoreSnapshotsAreCopies(t *testing.T) {
 	}
 }
 
+func TestStatsStoreSnapshotsAreCopies(t *testing.T) {
+	var store statsStore
+	store.recordQuery("COM_QUERY", "sqlite", "SELECT 1")
+	store.recordQuery("COM_STMT_EXECUTE", "compat", "SHOW FULL FIELDS FROM users")
+	store.recordUnsupported()
+	store.recordInformationSchemaQuery(true)
+	store.recordShowFullFieldsQuery()
+	store.recordInformationSchemaTargetTableRefresh(true)
+	store.recordReset("data_only")
+	store.recordSchemaChange()
+
+	stats := store.snapshot()
+	if stats.Queries.Total != 2 {
+		t.Fatalf("query total = %d, want 2", stats.Queries.Total)
+	}
+	if stats.Queries.ByCommand["COM_QUERY"] != 1 || stats.Queries.ByCommand["COM_STMT_EXECUTE"] != 1 {
+		t.Fatalf("query commands = %#v, want COM_QUERY and COM_STMT_EXECUTE counts", stats.Queries.ByCommand)
+	}
+	if stats.Queries.ByRoute["sqlite"] != 1 || stats.Queries.ByRoute["compat"] != 1 {
+		t.Fatalf("query routes = %#v, want sqlite and compat counts", stats.Queries.ByRoute)
+	}
+	if stats.Queries.ByKind["select"] != 1 || stats.Queries.ByKind["show_full_fields"] != 1 {
+		t.Fatalf("query kinds = %#v, want select and show_full_fields counts", stats.Queries.ByKind)
+	}
+	if stats.Unsupported != 1 || stats.SchemaChanges != 1 {
+		t.Fatalf("unsupported/schema changes = %d/%d, want 1/1", stats.Unsupported, stats.SchemaChanges)
+	}
+	if stats.Metadata.InformationSchemaQueries != 1 ||
+		stats.Metadata.TargetedInformationSchemaQueries != 1 ||
+		stats.Metadata.ShowFullFieldsQueries != 1 ||
+		stats.Metadata.TargetTableRefreshes != 1 ||
+		stats.Metadata.TablesLoaded != 0 {
+		t.Fatalf("metadata stats = %#v, want targeted information_schema and show counts", stats.Metadata)
+	}
+	if stats.Resets.Total != 1 || stats.Resets.DataOnly != 1 || stats.Resets.Full != 0 {
+		t.Fatalf("reset stats = %#v, want one data-only reset", stats.Resets)
+	}
+
+	stats.Queries.ByCommand["COM_QUERY"] = 99
+	stats.Queries.ByRoute["sqlite"] = 99
+	stats.Queries.ByKind["select"] = 99
+	again := store.snapshot()
+	if again.Queries.ByCommand["COM_QUERY"] != 1 ||
+		again.Queries.ByRoute["sqlite"] != 1 ||
+		again.Queries.ByKind["select"] != 1 {
+		t.Fatalf("stats snapshot mutation changed store: %#v", again.Queries)
+	}
+}
+
 func TestAdvisoryLockStoreTracksOwnership(t *testing.T) {
 	var store advisoryLockStore
 

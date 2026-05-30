@@ -29,10 +29,12 @@ func (c *mysqlConn) queryInformationSchema(ctx context.Context, sqlText string, 
 
 func (c *mysqlConn) queryInformationSchemaText(ctx context.Context, sqlText string, stream bool, args ...any) (any, error) {
 	if tableName, ok := informationSchemaTargetTable(sqlText, args); ok {
+		c.server.stats.recordInformationSchemaQuery(true)
 		if _, err := c.refreshInformationSchemaTable(ctx, tableName); err != nil {
 			return nil, err
 		}
 	} else {
+		c.server.stats.recordInformationSchemaQuery(false)
 		if err := c.refreshInformationSchema(ctx); err != nil {
 			return nil, err
 		}
@@ -44,6 +46,7 @@ func (c *mysqlConn) queryInformationSchemaText(ctx context.Context, sqlText stri
 func (c *mysqlConn) refreshInformationSchema(ctx context.Context) error {
 	version := c.server.currentSchemaVersion()
 	if c.informationSchemaCache.hasFullRefresh(version) {
+		c.server.stats.recordInformationSchemaFullRefreshCacheHit()
 		return nil
 	}
 	if err := c.prepareInformationSchema(ctx); err != nil {
@@ -86,6 +89,7 @@ ORDER BY name`)
 	}); err != nil {
 		return err
 	}
+	c.server.stats.recordInformationSchemaFullRefresh()
 	c.informationSchemaCache.markFullRefresh(version)
 	return nil
 }
@@ -93,9 +97,11 @@ ORDER BY name`)
 func (c *mysqlConn) refreshInformationSchemaTable(ctx context.Context, tableName string) (bool, error) {
 	version := c.server.currentSchemaVersion()
 	if exists, ok := c.informationSchemaCache.tableExists(tableName, version); ok {
+		c.server.stats.recordInformationSchemaTargetTableCacheHit()
 		return exists, nil
 	}
 	if c.informationSchemaCache.hasFullRefresh(version) {
+		c.server.stats.recordInformationSchemaTargetTableCacheHit()
 		return c.informationSchemaCachedTableExists(ctx, tableName)
 	}
 	if err := c.prepareInformationSchema(ctx); err != nil {
@@ -134,6 +140,7 @@ WHERE type IN ('table', 'view')
 	}); err != nil {
 		return false, err
 	}
+	c.server.stats.recordInformationSchemaTargetTableRefresh(exists)
 	c.informationSchemaCache.markTable(tableName, version, exists)
 	return exists, nil
 }
@@ -372,6 +379,7 @@ func (c *mysqlConn) insertInformationSchemaTableMetadata(ctx context.Context, ta
 	if err := c.insertInformationSchemaKeys(ctx, tableName); err != nil {
 		return err
 	}
+	c.server.stats.recordInformationSchemaTableLoaded()
 	return nil
 }
 

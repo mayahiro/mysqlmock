@@ -3977,6 +3977,91 @@ func TestQuerySnapshotRecordsQueriesWithoutLogWriter(t *testing.T) {
 	}
 }
 
+func TestServerStatsDoNotStoreSQLText(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	server := mysqlmock.Start(t, mysqlmock.WithConfig(testConfig()))
+	db, err := sql.Open("mysql", server.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	var version string
+	if err := db.QueryRowContext(ctx, "SELECT VERSION()").Scan(&version); err != nil {
+		t.Fatalf("select version: %v", err)
+	}
+	var name string
+	if err := db.QueryRowContext(ctx, "SELECT name FROM users WHERE email = ?", "alice@example.com").Scan(&name); err != nil {
+		t.Fatalf("select user: %v", err)
+	}
+	fieldRows, err := db.QueryContext(ctx, "SHOW FULL FIELDS FROM users")
+	if err != nil {
+		t.Fatalf("show full fields: %v", err)
+	}
+	if err := fieldRows.Close(); err != nil {
+		t.Fatalf("close show full fields rows: %v", err)
+	}
+	rows, err := db.QueryContext(ctx, "SELECT COLUMN_NAME FROM information_schema.columns WHERE TABLE_NAME = ?", "users")
+	if err != nil {
+		t.Fatalf("query information_schema: %v", err)
+	}
+	if err := rows.Close(); err != nil {
+		t.Fatalf("close information_schema rows: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "CREATE USER stats_unsupported"); err == nil {
+		t.Fatal("expected unsupported query")
+	}
+	if err := server.Reset(ctx); err != nil {
+		t.Fatalf("reset: %v", err)
+	}
+
+	stats := server.Stats()
+	if stats.Queries.Total < 5 {
+		t.Fatalf("stats query total = %d, want at least 5", stats.Queries.Total)
+	}
+	if stats.Queries.ByRoute["compat"] == 0 || stats.Queries.ByRoute["sqlite"] == 0 || stats.Queries.ByRoute["unsupported"] == 0 {
+		t.Fatalf("stats routes = %#v, want compat, sqlite, and unsupported", stats.Queries.ByRoute)
+	}
+	if stats.Queries.ByKind["select"] == 0 ||
+		stats.Queries.ByKind["show_full_fields"] == 0 ||
+		stats.Queries.ByKind["information_schema"] == 0 {
+		t.Fatalf("stats query kinds = %#v, want select, show_full_fields, and information_schema", stats.Queries.ByKind)
+	}
+	if stats.Metadata.ShowFullFieldsQueries != 1 ||
+		stats.Metadata.InformationSchemaQueries != 1 ||
+		stats.Metadata.TargetedInformationSchemaQueries != 1 ||
+		stats.Metadata.TargetTableRefreshes != 1 ||
+		stats.Metadata.TargetTableCacheHits == 0 ||
+		stats.Metadata.TablesLoaded == 0 {
+		t.Fatalf("metadata stats = %#v, want show and targeted information_schema counts", stats.Metadata)
+	}
+	if stats.Unsupported != 1 {
+		t.Fatalf("unsupported stats = %d, want 1", stats.Unsupported)
+	}
+	if stats.Resets.Total != 1 || stats.Resets.DataOnly != 1 || stats.Resets.Full != 0 {
+		t.Fatalf("reset stats = %#v, want one data-only reset", stats.Resets)
+	}
+
+	statsJSON, err := json.Marshal(stats)
+	if err != nil {
+		t.Fatalf("marshal stats: %v", err)
+	}
+	for _, secret := range []string{
+		"alice@example.com",
+		"stats_unsupported",
+		"SELECT name FROM users",
+		"SHOW FULL FIELDS FROM users",
+		"users",
+	} {
+		if strings.Contains(string(statsJSON), secret) {
+			t.Fatalf("stats JSON contains SQL text or object name %q: %s", secret, statsJSON)
+		}
+	}
+}
+
 func TestLogFormatValidation(t *testing.T) {
 	if _, err := mysqlmock.New(mysqlmock.LogFormat("yaml")); err == nil {
 		t.Fatal("expected unsupported log format error")

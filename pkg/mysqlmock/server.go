@@ -97,6 +97,7 @@ type Server struct {
 	preparedMu        sync.Mutex
 	metadataMu        sync.Mutex
 	diagnostics       diagnosticsStore
+	stats             statsStore
 	advisoryLocks     advisoryLockStore
 
 	mu             sync.Mutex
@@ -276,12 +277,18 @@ func (s *Server) Queries() []QueryEvent {
 	return s.diagnostics.queriesSnapshot()
 }
 
+// Stats returns a SQL-body-free snapshot of execution counters.
+func (s *Server) Stats() Stats {
+	return s.stats.snapshot()
+}
+
 func (s *Server) currentSchemaVersion() uint64 {
 	return s.schemaVersion.Load()
 }
 
 func (s *Server) bumpSchemaVersion() {
 	s.schemaVersion.Add(1)
+	s.stats.recordSchemaChange()
 	s.metadataMu.Lock()
 	s.tableColumns = map[string]cachedTableColumns{}
 	s.uniqueKeys = map[string]cachedUniqueKeys{}
@@ -295,6 +302,7 @@ func (s *Server) Reset(ctx context.Context) error {
 	if s.keepConn == nil {
 		return errors.New("mysqlmock server not started")
 	}
+	resetKind := "data_only"
 	canResetDataOnly, err := s.canResetBackendData(ctx, s.keepConn)
 	if err != nil {
 		return err
@@ -304,6 +312,7 @@ func (s *Server) Reset(ctx context.Context) error {
 			return err
 		}
 	} else {
+		resetKind = "full"
 		s.mu.Lock()
 		s.indexMetadata = map[string]mysqlIndexMetadata{}
 		s.columnMetadata = map[string]mysqlColumnMetadata{}
@@ -322,6 +331,7 @@ func (s *Server) Reset(ctx context.Context) error {
 	s.ruleOnceUsed = nil
 	s.autoIncrement = map[string]uint64{}
 	s.mu.Unlock()
+	s.stats.recordReset(resetKind)
 	return nil
 }
 
@@ -872,6 +882,7 @@ func (s *Server) recordUnsupported(u UnsupportedQuery) {
 	}
 	u.Suggestion = s.suggestedRule(u)
 
+	s.stats.recordUnsupported()
 	s.diagnostics.recordUnsupported(u)
 	s.logQuery(QueryEvent{
 		Event:         "query",
@@ -920,6 +931,7 @@ func (s *Server) logQuery(event QueryEvent) {
 		event.Event = "query"
 	}
 
+	s.stats.recordQuery(event.Command, event.Route, event.NormalizedSQL)
 	s.diagnostics.recordQuery(event)
 
 	if s.logWriter == nil {

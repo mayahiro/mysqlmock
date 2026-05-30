@@ -174,9 +174,14 @@ Library test では diagnostics を取得できます
 ```go
 unsupported := server.Unsupported()
 queries := server.Queries()
+stats := server.Stats()
 snapshot, err := server.QuerySnapshotJSON()
 unsupportedSnapshot, err := server.UnsupportedSnapshotJSON()
 ```
+
+`Stats()` は routed query、metadata work、reset、schema change、unsupported SQL の counter を返します
+SQL 本文、normalized SQL、parameters、table names、column names は保持しません
+`Server.Reset` は stats を消さないため、workflow 単位の件数が必要な場合は前後の snapshot を比較してください
 
 Repository test が unsupported SQL を出していないことを確認する標準 assertion には次を使えます
 
@@ -219,6 +224,12 @@ Query log を出力します
 
 ```sh
 mysqlmock serve --config testdb.yaml --verbose --log-format json
+```
+
+server shutdown 時に SQL 本文を含まない実行 stats JSON を stderr に出力します
+
+```sh
+mysqlmock serve --config testdb.yaml --print-stats
 ```
 
 `--log-format` は `text` と `json` に対応しています

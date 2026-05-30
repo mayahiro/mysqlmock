@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -51,6 +53,7 @@ func serve(args []string) error {
 	configPath := fs.String("config", "", "YAML config path")
 	listen := fs.String("listen", "", "listen address override")
 	printDSN := fs.Bool("print-dsn", false, "print DSN after startup")
+	printStats := fs.Bool("print-stats", false, "print SQL-body-free stats JSON to stderr on shutdown")
 	verbose := fs.Bool("verbose", false, "enable query logs")
 	failOnUnsupported := fs.Bool("fail-on-unsupported", false, "exit with an error if unsupported queries were observed")
 	logFormat := fs.String("log-format", "text", "log format: text or json")
@@ -87,7 +90,13 @@ func serve(args []string) error {
 		fmt.Println(server.DSN())
 	}
 
-	return waitForServeStop(ctx, server, *failOnUnsupported, 100*time.Millisecond)
+	err = waitForServeStop(ctx, server, *failOnUnsupported, 100*time.Millisecond)
+	if *printStats {
+		if statsErr := writeServeStats(os.Stderr, server); err == nil {
+			err = statsErr
+		}
+	}
+	return err
 }
 
 func check(args []string) error {
@@ -153,4 +162,8 @@ func waitForServeStop(ctx context.Context, server *mysqlmock.Server, failOnUnsup
 		case <-ticker.C:
 		}
 	}
+}
+
+func writeServeStats(w io.Writer, server *mysqlmock.Server) error {
+	return json.NewEncoder(w).Encode(server.Stats())
 }

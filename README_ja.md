@@ -249,6 +249,7 @@ mysqlmock は本物の MySQL row lock は再現しません
 mysqlmock serve --config testdb.yaml --listen 127.0.0.1:0 --print-dsn
 mysqlmock serve --config testdb.yaml --verbose --log-format json
 mysqlmock serve --config testdb.yaml --fail-on-unsupported
+mysqlmock serve --config testdb.yaml --print-stats
 mysqlmock check --config testdb.yaml
 mysqlmock dump-unsupported-template
 mysqlmock dump-config-schema
@@ -258,6 +259,7 @@ Source checkout から実行する場合は、`mysqlmock` を `go run ./cmd/mysq
 
 `serve --fail-on-unsupported` は unsupported SQL を観測した時点で error exit します
 `--verbose --log-format=json` は route-aware query log を JSON Lines として出力します
+`--print-stats` は server shutdown 時に SQL 本文を含まない実行 stats JSON を stderr に出力します
 `dump-config-schema` は config file 向け JSON Schema を出力します
 
 ## ドキュメント

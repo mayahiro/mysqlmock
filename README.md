@@ -307,6 +307,7 @@ From an installed CLI:
 mysqlmock serve --config testdb.yaml --listen 127.0.0.1:0 --print-dsn
 mysqlmock serve --config testdb.yaml --verbose --log-format json
 mysqlmock serve --config testdb.yaml --fail-on-unsupported
+mysqlmock serve --config testdb.yaml --print-stats
 mysqlmock check --config testdb.yaml
 mysqlmock dump-unsupported-template
 mysqlmock dump-config-schema
@@ -316,8 +317,9 @@ From a source checkout, replace `mysqlmock` with `go run ./cmd/mysqlmock`.
 
 Use `serve --fail-on-unsupported` to exit with an error when the server observes
 unsupported SQL. Use `--verbose --log-format=json` to emit route-aware query
-logs as JSON Lines. Use `dump-config-schema` to print a JSON Schema for config
-files.
+logs as JSON Lines. Use `--print-stats` to print SQL-body-free execution stats
+as JSON to stderr when the server shuts down. Use `dump-config-schema` to print
+a JSON Schema for config files.
 
 ## Documentation
 

@@ -42,6 +42,7 @@ func isShowKeysQuery(upperSQL string) bool {
 }
 
 func (c *mysqlConn) showFullFields(ctx context.Context, sqlText string) (resultSet, error) {
+	c.server.stats.recordShowFullFieldsQuery()
 	tableName, likePattern, ok := parseShowFullFields(sqlText)
 	if !ok {
 		return resultSet{}, c.server.unsupportedError(sqlText)
@@ -103,6 +104,7 @@ WHERE c.TABLE_SCHEMA = ?
 }
 
 func (c *mysqlConn) showCreateTable(ctx context.Context, sqlText string) (resultSet, error) {
+	c.server.stats.recordShowCreateTableQuery()
 	tableName, ok := parseShowCreateTable(sqlText)
 	if !ok {
 		return resultSet{}, c.server.unsupportedError(sqlText)
@@ -154,6 +156,7 @@ func (c *mysqlConn) mysqlShowCreateTableSQL(createSQL string) string {
 }
 
 func (c *mysqlConn) showKeys(ctx context.Context, sqlText string) (resultSet, error) {
+	c.server.stats.recordShowKeysQuery()
 	tableName, ok := parseShowKeys(sqlText)
 	if !ok {
 		return resultSet{}, c.server.unsupportedError(sqlText)
