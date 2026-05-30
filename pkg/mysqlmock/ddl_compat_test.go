@@ -58,3 +58,55 @@ func TestIsCreateDatabaseStatement(t *testing.T) {
 		})
 	}
 }
+
+func TestIsDropTableStatement(t *testing.T) {
+	tests := []struct {
+		name string
+		sql  string
+		want bool
+	}{
+		{
+			name: "drop table",
+			sql:  "DROP TABLE `rspec_users`",
+			want: true,
+		},
+		{
+			name: "drop table with if exists and cascade",
+			sql:  "DROP TABLE IF EXISTS `rspec_users` CASCADE",
+			want: true,
+		},
+		{
+			name: "drop temporary table with multiple names and restrict",
+			sql:  "DROP TEMPORARY TABLE IF EXISTS `rspec_users`, `rspec_posts` RESTRICT;",
+			want: true,
+		},
+		{
+			name: "missing table name",
+			sql:  "DROP TABLE",
+			want: false,
+		},
+		{
+			name: "invalid if clause",
+			sql:  "DROP TABLE IF NOT EXISTS rspec_users",
+			want: false,
+		},
+		{
+			name: "unexpected option",
+			sql:  "DROP TABLE rspec_users UNKNOWN option",
+			want: false,
+		},
+		{
+			name: "multiple statements",
+			sql:  "DROP TABLE rspec_users; CREATE TABLE rspec_users (id int)",
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isDropTableStatement(tt.sql); got != tt.want {
+				t.Fatalf("isDropTableStatement() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

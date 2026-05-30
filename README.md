@@ -271,7 +271,9 @@ TiDB DDL options, table-level `PRIMARY KEY` / `UNIQUE KEY` / `KEY` definitions,
 simple MySQL index DDL, and common `ALTER TABLE` / `RENAME TABLE` variants into
 SQLite-compatible SQL where possible. `CREATE DATABASE` / `CREATE SCHEMA` are
 accepted as no-op setup statements, and `DROP DATABASE` / `DROP SCHEMA` are
-accepted as no-op teardown statements.
+accepted as no-op teardown statements. Runtime `DROP TABLE` statements are also
+accepted as no-ops so Rails/RSpec setup does not remove the configured schema;
+`schema_files` still apply `DROP TABLE` while loading dumps.
 `CREATE TABLE ... PARTITION BY ...` partition clauses are stripped for SQLite
 execution. Integer columns declared with `ZEROFILL` use the declared display
 width for simple result-set values.

@@ -185,6 +185,33 @@ func TestServerWithGoSQLDriverMySQL(t *testing.T) {
 	}
 }
 
+func TestDropTableStatementIsNoOp(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	server := mysqlmock.Start(t, mysqlmock.WithConfig(testConfig()))
+
+	db, err := sql.Open("mysql", server.DSN())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+
+	if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS `users`, `rspec_missing_table` CASCADE"); err != nil {
+		t.Fatalf("drop table no-op: %v", err)
+	}
+
+	var name string
+	if err := db.QueryRowContext(ctx, "SELECT name FROM users WHERE id = ?", 1).Scan(&name); err != nil {
+		t.Fatalf("select after drop table no-op: %v", err)
+	}
+	if name != "Alice" {
+		t.Fatalf("name after drop table no-op = %q, want Alice", name)
+	}
+	mysqlmock.AssertNoUnsupported(t, server)
+}
+
 func TestAutoIncrementRollbackDoesNotReuseValue(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

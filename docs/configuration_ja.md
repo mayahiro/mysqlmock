@@ -263,6 +263,7 @@ ORM や repository query でよく使う scalar function/operator として `CHA
 `RAND(seed)` は同じ seed に対して deterministic ですが、MySQL の per-statement random sequence behavior までは再現しません
 SQLite fallback は MySQL string literal の backslash escape、明示的な `ESCAPE` 句がない `LIKE` pattern の MySQL default backslash escape、`UPDATE ... SET table.column = ...` target の table qualifier 除去も扱います
 `CREATE DATABASE` と `CREATE SCHEMA` は setup 用、`DROP DATABASE` と `DROP SCHEMA` は teardown 用の no-op statement として受け付けます
+runtime の `DROP TABLE` も ORM test setup が設定済み schema を削除しないよう no-op として受け付けます。`schema_files` 読み込み時の `DROP TABLE` は従来通り dump loading に適用されます
 `CREATE TABLE` statement では、MySQL partition clause を SQLite 実行前に strip し、`ZEROFILL` が付いた declared integer column の単純な result-set value に display width padding を適用します
 
 MySQL-compatible DDL で index を作成した場合、mysqlmock は軽量な index metadata も保持し、ORM schema introspection が使う `SHOW KEYS` の prefix length、expression、visibility fields を返します

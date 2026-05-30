@@ -10,6 +10,9 @@ func (c *mysqlConn) execMySQLDDLCompatibility(ctx context.Context, sqlText strin
 	if isDropDatabaseStatement(sqlText) {
 		return okResult{}, true, nil
 	}
+	if isDropTableStatement(sqlText) {
+		return okResult{}, true, nil
+	}
 	if oldName, newName, ok := parseRenameTable(sqlText); ok {
 		resp, err := c.execSQLite(ctx, fmt.Sprintf("ALTER TABLE %s RENAME TO %s", quoteIdent(oldName), quoteIdent(newName)))
 		if err == nil {
@@ -183,6 +186,47 @@ func isDropDatabaseStatement(sqlText string) bool {
 	if pos < len(sqlText) && sqlText[pos] == ';' {
 		pos = skipSQLSpaces(sqlText, pos+1)
 	}
+	return pos == len(sqlText)
+}
+
+func isDropTableStatement(sqlText string) bool {
+	statements := splitSQLStatements(sqlText)
+	if len(statements) != 1 {
+		return false
+	}
+	sqlText = statements[0]
+
+	pos := 0
+	if !consumeKeyword(sqlText, &pos, "DROP") {
+		return false
+	}
+	_ = consumeKeyword(sqlText, &pos, "TEMPORARY")
+	if !consumeKeyword(sqlText, &pos, "TABLE") {
+		return false
+	}
+	if consumeKeyword(sqlText, &pos, "IF") {
+		if !consumeKeyword(sqlText, &pos, "EXISTS") {
+			return false
+		}
+	}
+
+	for {
+		_, next, ok := readSQLQualifiedName(sqlText, pos)
+		if !ok {
+			return false
+		}
+		pos = skipSQLSpaces(sqlText, next)
+		if pos >= len(sqlText) || sqlText[pos] != ',' {
+			break
+		}
+		pos++
+	}
+
+	switch {
+	case consumeKeyword(sqlText, &pos, "CASCADE"):
+	case consumeKeyword(sqlText, &pos, "RESTRICT"):
+	}
+	pos = skipSQLSpaces(sqlText, pos)
 	return pos == len(sqlText)
 }
 
