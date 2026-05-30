@@ -54,7 +54,7 @@ func (c *mysqlConn) showFullFields(ctx context.Context, sqlText string) (resultS
 		return resultSet{}, c.server.unsupportedError(sqlText)
 	}
 	version := c.server.currentSchemaVersion()
-	if cached, ok := c.informationSchemaCache.showFullFieldsResult(c.currentDB, tableName, likePattern, c.collationConnection, version); ok {
+	if cached, ok := c.server.cachedShowFullFieldsResult(c.currentDB, tableName, likePattern, c.collationConnection, version); ok {
 		return cached, nil
 	}
 	exists, err := c.refreshInformationSchemaTable(ctx, tableName)
@@ -114,7 +114,7 @@ WHERE c.TABLE_SCHEMA = ?
 	if err != nil {
 		return resultSet{}, err
 	}
-	c.informationSchemaCache.markShowFullFieldsResult(c.currentDB, tableName, likePattern, c.collationConnection, version, result)
+	c.server.markShowFullFieldsResult(c.currentDB, tableName, likePattern, c.collationConnection, version, result)
 	return result, nil
 }
 

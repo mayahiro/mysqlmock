@@ -88,18 +88,19 @@ type Server struct {
 	closeOnce sync.Once
 	wg        sync.WaitGroup
 
-	nextConnectionID  atomic.Uint32
-	schemaVersion     atomic.Uint64
-	baseSchemaVersion atomic.Uint64
-	logWriter         io.Writer
-	logFormat         string
-	logMu             sync.Mutex
-	translationMu     sync.Mutex
-	preparedMu        sync.Mutex
-	metadataMu        sync.Mutex
-	diagnostics       diagnosticsStore
-	stats             statsStore
-	advisoryLocks     advisoryLockStore
+	nextConnectionID    atomic.Uint32
+	schemaVersion       atomic.Uint64
+	baseSchemaVersion   atomic.Uint64
+	logWriter           io.Writer
+	logFormat           string
+	logMu               sync.Mutex
+	translationMu       sync.Mutex
+	preparedMu          sync.Mutex
+	metadataMu          sync.Mutex
+	informationSchemaMu sync.Mutex
+	diagnostics         diagnosticsStore
+	stats               statsStore
+	advisoryLocks       advisoryLockStore
 
 	mu                   sync.Mutex
 	ruleOnceUsed         map[int]bool
@@ -109,6 +110,7 @@ type Server struct {
 	autoIncrement        map[string]uint64
 	tableDDL             map[string]string
 	translation          sqlTranslationCache
+	informationSchema    informationSchemaCache
 
 	preparedSchema            []preparedSchemaStatement
 	preparedSeed              []map[string][]map[string]any
@@ -299,6 +301,9 @@ func (s *Server) bumpSchemaVersion() {
 	s.uniqueKeys = map[string]cachedUniqueKeys{}
 	s.sqliteAutoIncrementTables = map[string]cachedSQLiteAutoIncrementTable{}
 	s.metadataMu.Unlock()
+	s.informationSchemaMu.Lock()
+	s.informationSchema = informationSchemaCache{}
+	s.informationSchemaMu.Unlock()
 }
 
 // Reset restores the configured schema and seed data and clears diagnostics.
@@ -441,6 +446,11 @@ func (s *Server) openBackend(ctx context.Context) error {
 		_ = db.Close()
 		return err
 	}
+	if err := (&mysqlConn{sqliteConn: keepConn, server: s}).prepareInformationSchema(ctx); err != nil {
+		_ = keepConn.Close()
+		_ = db.Close()
+		return err
+	}
 
 	s.db = db
 	s.keepConn = keepConn
@@ -497,6 +507,10 @@ func (s *Server) sqliteDSN() string {
 
 func (s *Server) usesPrivateMemoryDB() bool {
 	return s.cfg.Backend.Mode == "memory" && !s.cfg.Backend.Shared
+}
+
+func (s *Server) informationSchemaDSN() string {
+	return fmt.Sprintf("file:mysqlmock_information_schema_%p?mode=memory&cache=shared", s)
 }
 
 func (s *Server) applySchema(ctx context.Context, conn *sql.Conn) error {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"testing"
 
 	_ "modernc.org/sqlite"
@@ -203,7 +204,7 @@ ORDER BY ORDINAL_POSITION`, "target_users")
 	assertInformationSchemaTableNames(t, ctx, conn, "columns", []string{"target_users"})
 }
 
-func TestExecuteQueryCOMQueryStreamsInformationSchemaResultSet(t *testing.T) {
+func TestExecuteQueryCOMQueryMaterializesInformationSchemaResultSet(t *testing.T) {
 	ctx := context.Background()
 	conn := newInformationSchemaTestConn(t, ctx)
 
@@ -224,14 +225,9 @@ ORDER BY ORDINAL_POSITION`, "target_users")
 	if err != nil {
 		t.Fatalf("execute COM_QUERY information_schema: %v", err)
 	}
-	stream, ok := resp.(*sqliteResultSet)
+	rs, ok := resp.(resultSet)
 	if !ok {
-		t.Fatalf("executeQuery() returned %T, want *sqliteResultSet", resp)
-	}
-
-	rs, err := stream.materialize()
-	if err != nil {
-		t.Fatalf("materialize streaming information_schema result: %v", err)
+		t.Fatalf("executeQuery() returned %T, want resultSet", resp)
 	}
 	if got, want := resultColumnValues(rs, 0), []any{"id", "email"}; !equalAnySlices(got, want) {
 		t.Fatalf("information_schema.columns result = %#v, want %#v", got, want)
@@ -304,6 +300,127 @@ CREATE TABLE other_users (
 	assertInformationSchemaTableNames(t, ctx, conn, "statistics", []string{"target_users"})
 }
 
+func TestShowFullFieldsCacheIsSharedAcrossConnections(t *testing.T) {
+	ctx := context.Background()
+	conn1, conn2 := newSharedInformationSchemaTestConns(t, ctx)
+
+	if _, err := conn1.sqliteConn.ExecContext(ctx, `
+CREATE TABLE target_users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  email TEXT NOT NULL UNIQUE
+)`); err != nil {
+		t.Fatalf("create target_users: %v", err)
+	}
+
+	first, err := conn1.showFullFields(ctx, "SHOW FULL FIELDS FROM target_users")
+	if err != nil {
+		t.Fatalf("show full fields on first connection: %v", err)
+	}
+	if got, want := resultColumnValues(first, 0), []any{"id", "email"}; !equalAnySlices(got, want) {
+		t.Fatalf("SHOW FULL FIELDS columns = %#v, want %#v", got, want)
+	}
+	sqliteQueries := phaseTimingCount(conn1, "sqlite.query")
+	targetRefreshes := conn1.server.Stats().Metadata.TargetTableRefreshes
+
+	second, err := conn2.showFullFields(ctx, "SHOW FULL FIELDS FROM target_users")
+	if err != nil {
+		t.Fatalf("show full fields on second connection: %v", err)
+	}
+	if got, want := resultColumnValues(second, 0), []any{"id", "email"}; !equalAnySlices(got, want) {
+		t.Fatalf("cached SHOW FULL FIELDS columns = %#v, want %#v", got, want)
+	}
+	if got := phaseTimingCount(conn1, "sqlite.query"); got != sqliteQueries {
+		t.Fatalf("sqlite.query count after shared cache hit = %d, want %d", got, sqliteQueries)
+	}
+	if got := conn1.server.Stats().Metadata.TargetTableRefreshes; got != targetRefreshes {
+		t.Fatalf("target table refreshes after shared cache hit = %d, want %d", got, targetRefreshes)
+	}
+}
+
+func TestInformationSchemaQueryCacheIsSharedAcrossConnections(t *testing.T) {
+	ctx := context.Background()
+	conn1, conn2 := newSharedInformationSchemaTestConns(t, ctx)
+
+	if _, err := conn1.sqliteConn.ExecContext(ctx, `
+CREATE TABLE target_users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT
+);
+CREATE TABLE other_users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT
+)`); err != nil {
+		t.Fatalf("create test tables: %v", err)
+	}
+
+	query := `
+SELECT TABLE_NAME
+FROM information_schema.tables
+WHERE TABLE_SCHEMA = DATABASE()
+ORDER BY TABLE_NAME`
+	first, err := conn1.queryInformationSchema(ctx, query)
+	if err != nil {
+		t.Fatalf("query information_schema on first connection: %v", err)
+	}
+	if got, want := resultColumnValues(first, 0), []any{"other_users", "target_users"}; !equalAnySlices(got, want) {
+		t.Fatalf("information_schema.tables result = %#v, want %#v", got, want)
+	}
+	sqliteQueries := phaseTimingCount(conn1, "sqlite.query")
+	fullRefreshes := conn1.server.Stats().Metadata.FullRefreshes
+
+	second, err := conn2.queryInformationSchema(ctx, query)
+	if err != nil {
+		t.Fatalf("query information_schema on second connection: %v", err)
+	}
+	if got, want := resultColumnValues(second, 0), []any{"other_users", "target_users"}; !equalAnySlices(got, want) {
+		t.Fatalf("cached information_schema.tables result = %#v, want %#v", got, want)
+	}
+	if got := phaseTimingCount(conn1, "sqlite.query"); got != sqliteQueries {
+		t.Fatalf("sqlite.query count after shared query cache hit = %d, want %d", got, sqliteQueries)
+	}
+	if got := conn1.server.Stats().Metadata.FullRefreshes; got != fullRefreshes {
+		t.Fatalf("full refreshes after shared query cache hit = %d, want %d", got, fullRefreshes)
+	}
+
+	if _, err := conn1.sqliteConn.ExecContext(ctx, `CREATE TABLE fresh_users (id INTEGER PRIMARY KEY AUTOINCREMENT)`); err != nil {
+		t.Fatalf("create fresh_users: %v", err)
+	}
+	conn1.server.bumpSchemaVersion()
+	refreshed, err := conn2.queryInformationSchema(ctx, query)
+	if err != nil {
+		t.Fatalf("query information_schema after schema bump: %v", err)
+	}
+	if got, want := resultColumnValues(refreshed, 0), []any{"fresh_users", "other_users", "target_users"}; !equalAnySlices(got, want) {
+		t.Fatalf("information_schema.tables after schema bump = %#v, want %#v", got, want)
+	}
+	if got := conn1.server.Stats().Metadata.FullRefreshes; got != fullRefreshes+1 {
+		t.Fatalf("full refreshes after schema bump = %d, want %d", got, fullRefreshes+1)
+	}
+}
+
+func TestInformationSchemaFullRefreshStateIsSharedAcrossConnections(t *testing.T) {
+	ctx := context.Background()
+	conn1, conn2 := newSharedInformationSchemaTestConns(t, ctx)
+
+	if _, err := conn1.sqliteConn.ExecContext(ctx, `
+CREATE TABLE target_users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT
+)`); err != nil {
+		t.Fatalf("create target_users: %v", err)
+	}
+
+	if err := conn1.refreshInformationSchema(ctx); err != nil {
+		t.Fatalf("refresh full information_schema on first connection: %v", err)
+	}
+	if err := conn2.refreshInformationSchema(ctx); err != nil {
+		t.Fatalf("refresh full information_schema on second connection: %v", err)
+	}
+
+	stats := conn1.server.Stats().Metadata
+	if stats.FullRefreshes != 1 || stats.FullRefreshCacheHits != 1 {
+		t.Fatalf("full refresh stats = refreshes:%d hits:%d, want 1/1", stats.FullRefreshes, stats.FullRefreshCacheHits)
+	}
+	assertInformationSchemaColumnNames(t, ctx, conn2, "target_users", []string{"id"})
+}
+
 func newInformationSchemaTestConn(t testing.TB, ctx context.Context) *mysqlConn {
 	t.Helper()
 
@@ -326,6 +443,44 @@ func newInformationSchemaTestConn(t testing.TB, ctx context.Context) *mysqlConn 
 	return &mysqlConn{
 		sqliteConn:             sqliteConn,
 		server:                 &Server{indexMetadata: map[string]mysqlIndexMetadata{}},
+		currentDB:              "mysqlmock",
+		characterSetConnection: "utf8mb4",
+		collationConnection:    "utf8mb4_0900_ai_ci",
+	}
+}
+
+func newSharedInformationSchemaTestConns(t testing.TB, ctx context.Context) (*mysqlConn, *mysqlConn) {
+	t.Helper()
+
+	db, err := sql.Open("sqlite", "file:mysqlmock_info_schema_test_"+strings.NewReplacer("/", "_", " ", "_").Replace(t.Name())+"?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	db.SetMaxOpenConns(2)
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
+
+	server := &Server{indexMetadata: map[string]mysqlIndexMetadata{}}
+	conn1 := newInformationSchemaTestConnFromDB(t, ctx, db, server)
+	conn2 := newInformationSchemaTestConnFromDB(t, ctx, db, server)
+	return conn1, conn2
+}
+
+func newInformationSchemaTestConnFromDB(t testing.TB, ctx context.Context, db *sql.DB, server *Server) *mysqlConn {
+	t.Helper()
+
+	sqliteConn, err := db.Conn(ctx)
+	if err != nil {
+		t.Fatalf("open sqlite conn: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = sqliteConn.Close()
+	})
+
+	return &mysqlConn{
+		sqliteConn:             sqliteConn,
+		server:                 server,
 		currentDB:              "mysqlmock",
 		characterSetConnection: "utf8mb4",
 		collationConnection:    "utf8mb4_0900_ai_ci",
@@ -483,7 +638,7 @@ SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, COLUMN_TYPE
 FROM information_schema.columns
 ORDER BY TABLE_NAME, ORDINAL_POSITION`
 
-	b.Run("tables_100/com_query_streaming", func(b *testing.B) {
+	b.Run("tables_100/com_query_materialized", func(b *testing.B) {
 		conn := newInformationSchemaBenchmarkConn(b, ctx, tableCount)
 		if err := conn.refreshInformationSchema(ctx); err != nil {
 			b.Fatalf("warm information_schema: %v", err)
@@ -494,17 +649,13 @@ ORDER BY TABLE_NAME, ORDINAL_POSITION`
 		for i := 0; i < b.N; i++ {
 			resp, err := conn.executeQuery(ctx, "COM_QUERY", query)
 			if err != nil {
-				b.Fatalf("query information_schema stream: %v", err)
+				b.Fatalf("query information_schema materialized: %v", err)
 			}
-			stream, ok := resp.(*sqliteResultSet)
+			rs, ok := resp.(resultSet)
 			if !ok {
-				b.Fatalf("query information_schema stream returned %T, want *sqliteResultSet", resp)
+				b.Fatalf("query information_schema materialized returned %T, want resultSet", resp)
 			}
-			rows, err := consumeBenchmarkSQLiteResultStream(stream)
-			if err != nil {
-				b.Fatalf("consume information_schema stream: %v", err)
-			}
-			benchmarkInformationSchemaRows = rows
+			benchmarkInformationSchemaRows = len(rs.Rows)
 		}
 	})
 

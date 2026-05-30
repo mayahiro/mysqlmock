@@ -29,24 +29,49 @@ func (c *mysqlConn) queryInformationSchema(ctx context.Context, sqlText string, 
 }
 
 func (c *mysqlConn) queryInformationSchemaText(ctx context.Context, sqlText string, stream bool, args ...any) (any, error) {
-	if tableName, ok := informationSchemaTargetTable(sqlText, args); ok {
-		c.server.stats.recordInformationSchemaQuery(true)
+	tableName, targeted := informationSchemaTargetTable(sqlText, args)
+	c.server.stats.recordInformationSchemaQuery(targeted)
+
+	version := c.server.currentSchemaVersion()
+	query := c.server.translateSQLCached(rewriteInformationSchemaSQL(sqlText, c.currentDB))
+	cacheKey := informationSchemaQueryCacheKey(c.currentDB, query, args)
+	cacheable := isInformationSchemaResultCacheable(sqlText)
+	if cacheable {
+		if cached, ok := c.server.cachedInformationSchemaQueryResult(cacheKey, version); ok {
+			return cached, nil
+		}
+	}
+
+	if targeted {
 		if _, err := c.refreshInformationSchemaTable(ctx, tableName); err != nil {
 			return nil, err
 		}
 	} else {
-		c.server.stats.recordInformationSchemaQuery(false)
 		if err := c.refreshInformationSchema(ctx); err != nil {
 			return nil, err
 		}
 	}
-	query := c.server.translateSQLCached(rewriteInformationSchemaSQL(sqlText, c.currentDB))
-	return c.querySQLiteText(ctx, query, stream, args...)
+	if !cacheable {
+		return c.querySQLiteText(ctx, query, stream, args...)
+	}
+	result, err := c.querySQLite(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	c.server.markInformationSchemaQueryResult(cacheKey, version, result)
+	return result, nil
 }
 
 func (c *mysqlConn) refreshInformationSchema(ctx context.Context) error {
 	version := c.server.currentSchemaVersion()
-	if c.informationSchemaCache.hasFullRefresh(version) {
+	if err := c.prepareInformationSchema(ctx); err != nil {
+		return err
+	}
+
+	c.server.informationSchemaMu.Lock()
+	defer c.server.informationSchemaMu.Unlock()
+
+	if c.server.informationSchema.hasFullRefresh(version) {
 		c.server.stats.recordInformationSchemaFullRefreshCacheHit()
 		return nil
 	}
@@ -54,9 +79,6 @@ func (c *mysqlConn) refreshInformationSchema(ctx context.Context) error {
 	defer func() {
 		c.server.stats.recordPhaseTiming("information_schema.full_refresh", time.Since(refreshStart))
 	}()
-	if err := c.prepareInformationSchema(ctx); err != nil {
-		return err
-	}
 	if err := c.withInformationSchemaRefreshBatch(ctx, func() error {
 		if err := c.clearInformationSchema(ctx); err != nil {
 			return err
@@ -95,17 +117,24 @@ ORDER BY name`)
 		return err
 	}
 	c.server.stats.recordInformationSchemaFullRefresh()
-	c.informationSchemaCache.markFullRefresh(version)
+	c.server.informationSchema.markFullRefresh(version)
 	return nil
 }
 
 func (c *mysqlConn) refreshInformationSchemaTable(ctx context.Context, tableName string) (bool, error) {
 	version := c.server.currentSchemaVersion()
-	if exists, ok := c.informationSchemaCache.tableExists(tableName, version); ok {
+	if err := c.prepareInformationSchema(ctx); err != nil {
+		return false, err
+	}
+
+	c.server.informationSchemaMu.Lock()
+	defer c.server.informationSchemaMu.Unlock()
+
+	if exists, ok := c.server.informationSchema.tableExists(tableName, version); ok {
 		c.server.stats.recordInformationSchemaTargetTableCacheHit()
 		return exists, nil
 	}
-	if c.informationSchemaCache.hasFullRefresh(version) {
+	if c.server.informationSchema.hasFullRefresh(version) {
 		c.server.stats.recordInformationSchemaTargetTableCacheHit()
 		return c.informationSchemaCachedTableExists(ctx, tableName)
 	}
@@ -113,9 +142,6 @@ func (c *mysqlConn) refreshInformationSchemaTable(ctx context.Context, tableName
 	defer func() {
 		c.server.stats.recordPhaseTiming("information_schema.target_table_refresh", time.Since(refreshStart))
 	}()
-	if err := c.prepareInformationSchema(ctx); err != nil {
-		return false, err
-	}
 
 	exists := false
 	if err := c.withInformationSchemaRefreshBatch(ctx, func() error {
@@ -150,7 +176,7 @@ WHERE type IN ('table', 'view')
 		return false, err
 	}
 	c.server.stats.recordInformationSchemaTargetTableRefresh(exists)
-	c.informationSchemaCache.markTable(tableName, version, exists)
+	c.server.informationSchema.markTable(tableName, version, exists)
 	return exists, nil
 }
 
@@ -260,7 +286,7 @@ func (c *mysqlConn) ensureInformationSchemaAttached(ctx context.Context) error {
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("list sqlite databases: %w", err)
 	}
-	if _, err := c.sqliteConn.ExecContext(ctx, `ATTACH DATABASE ':memory:' AS "information_schema"`); err != nil {
+	if _, err := c.sqliteConn.ExecContext(ctx, `ATTACH DATABASE `+sqlStringLiteral(c.server.informationSchemaDSN())+` AS "information_schema"`); err != nil {
 		return fmt.Errorf("attach information_schema: %w", err)
 	}
 	return nil
@@ -858,6 +884,29 @@ func informationSchemaReferencesSchemata(sqlText string) bool {
 	normalized := strings.Join(strings.Fields(unquoted), " ")
 	return strings.Contains(normalized, "INFORMATION_SCHEMA.SCHEMATA") ||
 		strings.Contains(normalized, "INFORMATION_SCHEMA . SCHEMATA")
+}
+
+func isInformationSchemaResultCacheable(sqlText string) bool {
+	for _, name := range []string{
+		"CONNECTION_ID",
+		"CURRENT_DATE",
+		"CURRENT_TIME",
+		"CURRENT_TIMESTAMP",
+		"CURRENT_USER",
+		"LAST_INSERT_ID",
+		"NOW",
+		"RAND",
+		"RANDOM",
+		"ROW_COUNT",
+		"UNIX_TIMESTAMP",
+		"USER",
+		"UUID",
+	} {
+		if containsSQLIdentifier(sqlText, name) {
+			return false
+		}
+	}
+	return true
 }
 
 func informationSchemaTableNameArg(args []any, index int) (string, bool) {

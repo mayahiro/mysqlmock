@@ -1,6 +1,9 @@
 package mysqlmock
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 type informationSchemaTableCacheEntry struct {
 	version uint64
@@ -17,6 +20,9 @@ type informationSchemaCache struct {
 	fullVersion    uint64
 	tables         map[string]informationSchemaTableCacheEntry
 	showFullFields map[string]informationSchemaResultSetCacheEntry
+	showFullOrder  []string
+	queryResults   map[string]informationSchemaResultSetCacheEntry
+	queryOrder     []string
 }
 
 func (cache *informationSchemaCache) hasFullRefresh(version uint64) bool {
@@ -62,13 +68,53 @@ func (cache *informationSchemaCache) showFullFieldsResult(currentDB, tableName, 
 }
 
 func (cache *informationSchemaCache) markShowFullFieldsResult(currentDB, tableName, likePattern, collation string, version uint64, result resultSet) {
-	if cache.showFullFields == nil {
-		cache.showFullFields = map[string]informationSchemaResultSetCacheEntry{}
-	}
-	cache.showFullFields[showFullFieldsCacheKey(currentDB, tableName, likePattern, collation)] = informationSchemaResultSetCacheEntry{
+	key := showFullFieldsCacheKey(currentDB, tableName, likePattern, collation)
+	cacheStore(&cache.showFullFields, &cache.showFullOrder, key, informationSchemaResultSetCacheEntry{
 		version: version,
 		result:  cloneResultSet(result),
+	})
+}
+
+func (cache *informationSchemaCache) queryResult(key string, version uint64) (resultSet, bool) {
+	if cache.queryResults == nil {
+		return resultSet{}, false
 	}
+	entry, ok := cache.queryResults[key]
+	if !ok || entry.version != version {
+		return resultSet{}, false
+	}
+	return cloneResultSet(entry.result), true
+}
+
+func (cache *informationSchemaCache) markQueryResult(key string, version uint64, result resultSet) {
+	cacheStore(&cache.queryResults, &cache.queryOrder, key, informationSchemaResultSetCacheEntry{
+		version: version,
+		result:  cloneResultSet(result),
+	})
+}
+
+func (s *Server) cachedShowFullFieldsResult(currentDB, tableName, likePattern, collation string, version uint64) (resultSet, bool) {
+	s.informationSchemaMu.Lock()
+	defer s.informationSchemaMu.Unlock()
+	return s.informationSchema.showFullFieldsResult(currentDB, tableName, likePattern, collation, version)
+}
+
+func (s *Server) markShowFullFieldsResult(currentDB, tableName, likePattern, collation string, version uint64, result resultSet) {
+	s.informationSchemaMu.Lock()
+	defer s.informationSchemaMu.Unlock()
+	s.informationSchema.markShowFullFieldsResult(currentDB, tableName, likePattern, collation, version, result)
+}
+
+func (s *Server) cachedInformationSchemaQueryResult(key string, version uint64) (resultSet, bool) {
+	s.informationSchemaMu.Lock()
+	defer s.informationSchemaMu.Unlock()
+	return s.informationSchema.queryResult(key, version)
+}
+
+func (s *Server) markInformationSchemaQueryResult(key string, version uint64, result resultSet) {
+	s.informationSchemaMu.Lock()
+	defer s.informationSchemaMu.Unlock()
+	s.informationSchema.markQueryResult(key, version, result)
 }
 
 func canonicalInformationSchemaTableCacheKey(tableName string) string {
@@ -80,6 +126,22 @@ func showFullFieldsCacheKey(currentDB, tableName, likePattern, collation string)
 		canonicalInformationSchemaTableCacheKey(tableName) + "\x00" +
 		likePattern + "\x00" +
 		strings.ToLower(collation)
+}
+
+func informationSchemaQueryCacheKey(currentDB, query string, args []any) string {
+	var key strings.Builder
+	writeInformationSchemaCacheKeyPart(&key, strings.ToLower(currentDB))
+	writeInformationSchemaCacheKeyPart(&key, query)
+	for _, arg := range args {
+		writeInformationSchemaCacheKeyPart(&key, fmt.Sprintf("%T=%#v", arg, arg))
+	}
+	return key.String()
+}
+
+func writeInformationSchemaCacheKeyPart(key *strings.Builder, value string) {
+	key.WriteString(fmt.Sprintf("%d:", len(value)))
+	key.WriteString(value)
+	key.WriteByte('\x00')
 }
 
 func cloneResultSet(rs resultSet) resultSet {
