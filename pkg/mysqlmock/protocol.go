@@ -102,6 +102,7 @@ type mysqlConn struct {
 
 	informationSchemaCache     informationSchemaCache
 	autoIncrementRestoreTables map[string]string
+	packetBuf                  []byte
 }
 
 type resultColumn struct {

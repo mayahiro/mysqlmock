@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -199,12 +200,38 @@ func (c *mysqlConn) writePacket(seq byte, payload []byte) error {
 	if len(payload) >= 1<<24 {
 		return errors.New("mysqlmock does not support packets larger than 16MB")
 	}
-	header := []byte{byte(len(payload)), byte(len(payload) >> 8), byte(len(payload) >> 16), seq}
-	if _, err := c.netConn.Write(header); err != nil {
+	packetLen := 4 + len(payload)
+	packet := c.packetBuffer(packetLen)
+	packet[0] = byte(len(payload))
+	packet[1] = byte(len(payload) >> 8)
+	packet[2] = byte(len(payload) >> 16)
+	packet[3] = seq
+	copy(packet[4:], payload)
+	n, err := c.netConn.Write(packet)
+	c.releasePacketBuffer(packet)
+	if err != nil {
 		return err
 	}
-	_, err := c.netConn.Write(payload)
-	return err
+	if n != packetLen {
+		return io.ErrShortWrite
+	}
+	return nil
+}
+
+func (c *mysqlConn) packetBuffer(size int) []byte {
+	if cap(c.packetBuf) < size {
+		return make([]byte, size)
+	}
+	return c.packetBuf[:size]
+}
+
+func (c *mysqlConn) releasePacketBuffer(packet []byte) {
+	const maxRetainedPacketBuffer = 64 << 10
+	if cap(packet) > maxRetainedPacketBuffer {
+		c.packetBuf = nil
+		return
+	}
+	c.packetBuf = packet[:0]
 }
 
 func columnDefinition(schema string, col resultColumn) []byte {
@@ -240,9 +267,69 @@ func textRow(columns []resultColumn, values []any) []byte {
 		if i < len(columns) {
 			column = columns[i]
 		}
-		payload = appendLenEncString(payload, textValueForColumn(value, column))
+		payload = appendTextValueForColumn(payload, value, column)
 	}
 	return payload
+}
+
+func appendTextValueForColumn(buf []byte, value any, column resultColumn) []byte {
+	if column.ZeroFillWidth > 0 {
+		return appendLenEncString(buf, textValueForColumn(value, column))
+	}
+	switch v := value.(type) {
+	case []byte:
+		return appendLenEncBytes(buf, v)
+	case string:
+		return appendLenEncString(buf, v)
+	case time.Time:
+		return appendLenEncString(buf, v.Format("2006-01-02 15:04:05.999999"))
+	case bool:
+		if v {
+			return appendLenEncString(buf, "1")
+		}
+		return appendLenEncString(buf, "0")
+	case int:
+		return appendLenEncSigned(buf, int64(v))
+	case int8:
+		return appendLenEncSigned(buf, int64(v))
+	case int16:
+		return appendLenEncSigned(buf, int64(v))
+	case int32:
+		return appendLenEncSigned(buf, int64(v))
+	case int64:
+		return appendLenEncSigned(buf, v)
+	case uint:
+		return appendLenEncUnsigned(buf, uint64(v))
+	case uint8:
+		return appendLenEncUnsigned(buf, uint64(v))
+	case uint16:
+		return appendLenEncUnsigned(buf, uint64(v))
+	case uint32:
+		return appendLenEncUnsigned(buf, uint64(v))
+	case uint64:
+		return appendLenEncUnsigned(buf, v)
+	case float32:
+		return appendLenEncFloat(buf, float64(v), 32)
+	case float64:
+		return appendLenEncFloat(buf, v, 64)
+	default:
+		return appendLenEncString(buf, fmt.Sprint(v))
+	}
+}
+
+func appendLenEncSigned(buf []byte, value int64) []byte {
+	var scratch [20]byte
+	return appendLenEncBytes(buf, strconv.AppendInt(scratch[:0], value, 10))
+}
+
+func appendLenEncUnsigned(buf []byte, value uint64) []byte {
+	var scratch [20]byte
+	return appendLenEncBytes(buf, strconv.AppendUint(scratch[:0], value, 10))
+}
+
+func appendLenEncFloat(buf []byte, value float64, bitSize int) []byte {
+	var scratch [32]byte
+	return appendLenEncBytes(buf, strconv.AppendFloat(scratch[:0], value, 'g', -1, bitSize))
 }
 
 func textValueForColumn(value any, column resultColumn) string {
