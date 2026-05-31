@@ -186,11 +186,12 @@ changes, unsupported SQL, and aggregate timings. Timings are reported in
 nanoseconds as query totals by command, route, and kind, plus fixed internal
 phases such as `sqlite.query`, `sqlite.exec`, `protocol.result_set_text`,
 `protocol.result_set_sqlite_text`, `information_schema.target_table_refresh`,
+`information_schema.table_list_refresh`, `information_schema.schemata_refresh`,
 and `reset.data_only`. It does not store SQL text, normalized SQL, parameters,
-table names, or column names. Broad `information_schema` counters include
-fixed reason labels such as `contains_or`, `references_schemata`,
-`no_table_name_filter`, and `unsupported_table_filter` without storing the
-query body or object names.
+table names, or column names. Broad `information_schema` counters include fixed
+reason labels such as `contains_or`, `references_schemata`,
+`no_table_name_filter`, and `unsupported_table_filter` without storing the query
+body or object names.
 `Server.Reset` does not clear stats; take snapshots before and after a workflow
 when per-workflow counts or timings are needed.
 

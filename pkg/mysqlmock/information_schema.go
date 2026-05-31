@@ -47,7 +47,7 @@ func (c *mysqlConn) queryInformationSchemaText(ctx context.Context, sqlText stri
 			return nil, err
 		}
 	} else {
-		if err := c.refreshInformationSchema(ctx); err != nil {
+		if err := c.refreshInformationSchemaForQuery(ctx, sqlText); err != nil {
 			return nil, err
 		}
 	}
@@ -60,6 +60,17 @@ func (c *mysqlConn) queryInformationSchemaText(ctx context.Context, sqlText stri
 	}
 	c.server.markInformationSchemaQueryResult(cacheKey, version, result)
 	return result, nil
+}
+
+func (c *mysqlConn) refreshInformationSchemaForQuery(ctx context.Context, sqlText string) error {
+	switch informationSchemaBroadRefreshScope(sqlText) {
+	case informationSchemaRefreshScopeSchemata:
+		return c.refreshInformationSchemaSchemataOnly(ctx)
+	case informationSchemaRefreshScopeTableList:
+		return c.refreshInformationSchemaTableList(ctx)
+	default:
+		return c.refreshInformationSchema(ctx)
+	}
 }
 
 func (c *mysqlConn) refreshInformationSchema(ctx context.Context) error {
@@ -118,6 +129,88 @@ ORDER BY name`)
 	}
 	c.server.stats.recordInformationSchemaFullRefresh()
 	c.server.informationSchema.markFullRefresh(version)
+	return nil
+}
+
+func (c *mysqlConn) refreshInformationSchemaSchemataOnly(ctx context.Context) error {
+	version := c.server.currentSchemaVersion()
+	if err := c.prepareInformationSchema(ctx); err != nil {
+		return err
+	}
+
+	c.server.informationSchemaMu.Lock()
+	defer c.server.informationSchemaMu.Unlock()
+
+	if c.server.informationSchema.hasSchemataRefresh(version) {
+		return nil
+	}
+	refreshStart := time.Now()
+	defer func() {
+		c.server.stats.recordPhaseTiming("information_schema.schemata_refresh", time.Since(refreshStart))
+	}()
+	if err := c.withInformationSchemaRefreshBatch(ctx, func() error {
+		return c.refreshInformationSchemaSchemata(ctx)
+	}); err != nil {
+		return err
+	}
+	c.server.informationSchema.markSchemataRefresh(version)
+	return nil
+}
+
+func (c *mysqlConn) refreshInformationSchemaTableList(ctx context.Context) error {
+	version := c.server.currentSchemaVersion()
+	if err := c.prepareInformationSchema(ctx); err != nil {
+		return err
+	}
+
+	c.server.informationSchemaMu.Lock()
+	defer c.server.informationSchemaMu.Unlock()
+
+	if c.server.informationSchema.hasTableListRefresh(version) {
+		return nil
+	}
+	refreshStart := time.Now()
+	defer func() {
+		c.server.stats.recordPhaseTiming("information_schema.table_list_refresh", time.Since(refreshStart))
+	}()
+	if err := c.withInformationSchemaRefreshBatch(ctx, func() error {
+		if err := c.refreshInformationSchemaSchemata(ctx); err != nil {
+			return err
+		}
+		if _, err := c.sqliteConn.ExecContext(ctx, `DELETE FROM "information_schema"."tables"`); err != nil {
+			return fmt.Errorf("clear information_schema.tables: %w", err)
+		}
+
+		rows, err := c.sqliteConn.QueryContext(ctx, `
+SELECT type, name
+FROM main.sqlite_master
+WHERE type IN ('table', 'view')
+  AND name NOT LIKE 'sqlite_%'
+ORDER BY name`)
+		if err != nil {
+			return fmt.Errorf("list sqlite tables for information_schema: %w", err)
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var tableType string
+			var tableName string
+			if err := rows.Scan(&tableType, &tableName); err != nil {
+				return fmt.Errorf("scan sqlite table for information_schema: %w", err)
+			}
+			if err := c.insertInformationSchemaTable(ctx, tableName, tableType); err != nil {
+				return err
+			}
+			c.server.stats.recordInformationSchemaTableLoaded()
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("list sqlite tables for information_schema: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	c.server.informationSchema.markTableListRefresh(version)
 	return nil
 }
 
@@ -853,6 +946,14 @@ const (
 	informationSchemaBroadReasonUnsupportedTableFilter = "unsupported_table_filter"
 )
 
+type informationSchemaRefreshScope int
+
+const (
+	informationSchemaRefreshScopeFull informationSchemaRefreshScope = iota
+	informationSchemaRefreshScopeSchemata
+	informationSchemaRefreshScopeTableList
+)
+
 func informationSchemaTargetTable(sqlText string, args []any) (string, bool, string) {
 	if containsSQLIdentifier(sqlText, "OR") {
 		return "", false, informationSchemaBroadReasonContainsOr
@@ -906,6 +1007,81 @@ func informationSchemaTargetTable(sqlText string, args []any) (string, bool, str
 		return "", false, informationSchemaBroadReasonUnsupportedTableFilter
 	}
 	return "", false, informationSchemaBroadReasonNoTableNameFilter
+}
+
+func informationSchemaBroadRefreshScope(sqlText string) informationSchemaRefreshScope {
+	refs := informationSchemaReferencedTables(sqlText)
+	if len(refs) == 0 {
+		return informationSchemaRefreshScopeFull
+	}
+	for table := range refs {
+		if table != "schemata" && table != "tables" {
+			return informationSchemaRefreshScopeFull
+		}
+	}
+	if refs["tables"] {
+		return informationSchemaRefreshScopeTableList
+	}
+	if refs["schemata"] {
+		return informationSchemaRefreshScopeSchemata
+	}
+	return informationSchemaRefreshScopeFull
+}
+
+func informationSchemaReferencedTables(sqlText string) map[string]bool {
+	refs := map[string]bool{}
+	for i := 0; i < len(sqlText); {
+		if sqlText[i] == '\'' {
+			end, _ := quotedSQLSpan(sqlText, i)
+			i = end
+			continue
+		}
+		if end, ok := sqlCommentSpan(sqlText, i); ok {
+			i = end
+			continue
+		}
+		name, end, ok := readSQLNameToken(sqlText, i)
+		if !ok {
+			i++
+			continue
+		}
+		if !strings.EqualFold(unquoteSQLWord(name), "information_schema") {
+			i = end
+			continue
+		}
+		dot := skipSQLSpaces(sqlText, end)
+		if dot >= len(sqlText) || sqlText[dot] != '.' {
+			i = end
+			continue
+		}
+		tableToken, tableEnd, ok := readSQLNameToken(sqlText, dot+1)
+		if !ok {
+			i = dot + 1
+			continue
+		}
+		table := strings.ToLower(unquoteSQLWord(tableToken))
+		if isKnownInformationSchemaTable(table) {
+			refs[table] = true
+		}
+		i = tableEnd
+	}
+	return refs
+}
+
+func isKnownInformationSchemaTable(table string) bool {
+	switch table {
+	case "schemata",
+		"tables",
+		"columns",
+		"key_column_usage",
+		"statistics",
+		"table_constraints",
+		"referential_constraints",
+		"check_constraints":
+		return true
+	default:
+		return false
+	}
 }
 
 func informationSchemaReferencesSchemata(sqlText string) bool {

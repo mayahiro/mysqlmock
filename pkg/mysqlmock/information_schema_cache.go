@@ -16,13 +16,17 @@ type informationSchemaResultSetCacheEntry struct {
 }
 
 type informationSchemaCache struct {
-	fullLoaded     bool
-	fullVersion    uint64
-	tables         map[string]informationSchemaTableCacheEntry
-	showFullFields map[string]informationSchemaResultSetCacheEntry
-	showFullOrder  []string
-	queryResults   map[string]informationSchemaResultSetCacheEntry
-	queryOrder     []string
+	fullLoaded       bool
+	fullVersion      uint64
+	schemataLoaded   bool
+	schemataVersion  uint64
+	tableListLoaded  bool
+	tableListVersion uint64
+	tables           map[string]informationSchemaTableCacheEntry
+	showFullFields   map[string]informationSchemaResultSetCacheEntry
+	showFullOrder    []string
+	queryResults     map[string]informationSchemaResultSetCacheEntry
+	queryOrder       []string
 }
 
 func (cache *informationSchemaCache) hasFullRefresh(version uint64) bool {
@@ -33,6 +37,25 @@ func (cache *informationSchemaCache) markFullRefresh(version uint64) {
 	cache.fullLoaded = true
 	cache.fullVersion = version
 	cache.tables = map[string]informationSchemaTableCacheEntry{}
+}
+
+func (cache *informationSchemaCache) hasSchemataRefresh(version uint64) bool {
+	return cache.hasFullRefresh(version) || (cache.schemataLoaded && cache.schemataVersion == version)
+}
+
+func (cache *informationSchemaCache) markSchemataRefresh(version uint64) {
+	cache.schemataLoaded = true
+	cache.schemataVersion = version
+}
+
+func (cache *informationSchemaCache) hasTableListRefresh(version uint64) bool {
+	return cache.hasFullRefresh(version) || (cache.tableListLoaded && cache.tableListVersion == version)
+}
+
+func (cache *informationSchemaCache) markTableListRefresh(version uint64) {
+	cache.markSchemataRefresh(version)
+	cache.tableListLoaded = true
+	cache.tableListVersion = version
 }
 
 func (cache *informationSchemaCache) tableExists(tableName string, version uint64) (bool, bool) {

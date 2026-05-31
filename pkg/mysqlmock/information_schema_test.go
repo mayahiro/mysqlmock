@@ -369,6 +369,7 @@ ORDER BY TABLE_NAME`
 	}
 	sqliteQueries := phaseTimingCount(conn1, "sqlite.query")
 	fullRefreshes := conn1.server.Stats().Metadata.FullRefreshes
+	tableListRefreshes := phaseTimingCount(conn1, "information_schema.table_list_refresh")
 
 	second, err := conn2.queryInformationSchema(ctx, query)
 	if err != nil {
@@ -383,6 +384,9 @@ ORDER BY TABLE_NAME`
 	if got := conn1.server.Stats().Metadata.FullRefreshes; got != fullRefreshes {
 		t.Fatalf("full refreshes after shared query cache hit = %d, want %d", got, fullRefreshes)
 	}
+	if got := phaseTimingCount(conn1, "information_schema.table_list_refresh"); got != tableListRefreshes {
+		t.Fatalf("table list refreshes after shared query cache hit = %d, want %d", got, tableListRefreshes)
+	}
 
 	if _, err := conn1.sqliteConn.ExecContext(ctx, `CREATE TABLE fresh_users (id INTEGER PRIMARY KEY AUTOINCREMENT)`); err != nil {
 		t.Fatalf("create fresh_users: %v", err)
@@ -395,8 +399,63 @@ ORDER BY TABLE_NAME`
 	if got, want := resultColumnValues(refreshed, 0), []any{"fresh_users", "other_users", "target_users"}; !equalAnySlices(got, want) {
 		t.Fatalf("information_schema.tables after schema bump = %#v, want %#v", got, want)
 	}
-	if got := conn1.server.Stats().Metadata.FullRefreshes; got != fullRefreshes+1 {
-		t.Fatalf("full refreshes after schema bump = %d, want %d", got, fullRefreshes+1)
+	if got := conn1.server.Stats().Metadata.FullRefreshes; got != fullRefreshes {
+		t.Fatalf("full refreshes after schema bump = %d, want %d", got, fullRefreshes)
+	}
+	if got := phaseTimingCount(conn1, "information_schema.table_list_refresh"); got != tableListRefreshes+1 {
+		t.Fatalf("table list refreshes after schema bump = %d, want %d", got, tableListRefreshes+1)
+	}
+}
+
+func TestInformationSchemaLightweightBroadRefreshes(t *testing.T) {
+	ctx := context.Background()
+	conn := newInformationSchemaTestConn(t, ctx)
+
+	if _, err := conn.sqliteConn.ExecContext(ctx, `
+CREATE TABLE light_users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  email TEXT NOT NULL
+)`); err != nil {
+		t.Fatalf("create test table: %v", err)
+	}
+
+	schemata, err := conn.queryInformationSchema(ctx, `SELECT SCHEMA_NAME FROM information_schema.schemata`)
+	if err != nil {
+		t.Fatalf("query information_schema.schemata: %v", err)
+	}
+	if got, want := resultColumnValues(schemata, 0), []any{"mysqlmock"}; !equalAnySlices(got, want) {
+		t.Fatalf("information_schema.schemata result = %#v, want %#v", got, want)
+	}
+	if got := conn.server.Stats().Metadata.FullRefreshes; got != 0 {
+		t.Fatalf("full refreshes after schemata query = %d, want 0", got)
+	}
+	if got := phaseTimingCount(conn, "information_schema.schemata_refresh"); got != 1 {
+		t.Fatalf("schemata refreshes = %d, want 1", got)
+	}
+
+	tables, err := conn.queryInformationSchema(ctx, `SELECT TABLE_NAME FROM information_schema.tables ORDER BY TABLE_NAME`)
+	if err != nil {
+		t.Fatalf("query information_schema.tables: %v", err)
+	}
+	if got, want := resultColumnValues(tables, 0), []any{"light_users"}; !equalAnySlices(got, want) {
+		t.Fatalf("information_schema.tables result = %#v, want %#v", got, want)
+	}
+	if got := conn.server.Stats().Metadata.FullRefreshes; got != 0 {
+		t.Fatalf("full refreshes after tables query = %d, want 0", got)
+	}
+	if got := phaseTimingCount(conn, "information_schema.table_list_refresh"); got != 1 {
+		t.Fatalf("table list refreshes = %d, want 1", got)
+	}
+
+	columns, err := conn.queryInformationSchema(ctx, `SELECT COLUMN_NAME FROM information_schema.columns ORDER BY TABLE_NAME, ORDINAL_POSITION`)
+	if err != nil {
+		t.Fatalf("query information_schema.columns: %v", err)
+	}
+	if got, want := resultColumnValues(columns, 0), []any{"id", "email"}; !equalAnySlices(got, want) {
+		t.Fatalf("information_schema.columns result = %#v, want %#v", got, want)
+	}
+	if got := conn.server.Stats().Metadata.FullRefreshes; got != 1 {
+		t.Fatalf("full refreshes after columns query = %d, want 1", got)
 	}
 }
 
@@ -677,6 +736,26 @@ func BenchmarkInformationSchemaRefresh(b *testing.B) {
 				rows, err := countInformationSchemaRows(ctx, conn, "columns")
 				if err != nil {
 					b.Fatalf("count information_schema.columns: %v", err)
+				}
+				benchmarkInformationSchemaRows = rows
+			})
+
+			b.Run("table_list", func(b *testing.B) {
+				conn := newInformationSchemaBenchmarkConn(b, ctx, tableCount)
+
+				b.ReportAllocs()
+				b.ResetTimer()
+				for i := 0; i < b.N; i++ {
+					conn.server.bumpSchemaVersion()
+					if err := conn.refreshInformationSchemaTableList(ctx); err != nil {
+						b.Fatalf("refresh information_schema table list: %v", err)
+					}
+				}
+				b.StopTimer()
+
+				rows, err := countInformationSchemaRows(ctx, conn, "tables")
+				if err != nil {
+					b.Fatalf("count information_schema.tables: %v", err)
 				}
 				benchmarkInformationSchemaRows = rows
 			})

@@ -180,7 +180,7 @@ unsupportedSnapshot, err := server.UnsupportedSnapshotJSON()
 ```
 
 `Stats()` は routed query、metadata work、reset、schema change、unsupported SQL の counter と aggregate timings を返します
-timings は nanoseconds 単位で、query totals を command、route、kind 別に、internal phase を `sqlite.query`、`sqlite.exec`、`protocol.result_set_text`、`protocol.result_set_sqlite_text`、`information_schema.target_table_refresh`、`reset.data_only` のような固定名別に出力します
+timings は nanoseconds 単位で、query totals を command、route、kind 別に、internal phase を `sqlite.query`、`sqlite.exec`、`protocol.result_set_text`、`protocol.result_set_sqlite_text`、`information_schema.target_table_refresh`、`information_schema.table_list_refresh`、`information_schema.schemata_refresh`、`reset.data_only` のような固定名別に出力します
 SQL 本文、normalized SQL、parameters、table names、column names は保持しません
 broad `information_schema` counter は `contains_or`、`references_schemata`、`no_table_name_filter`、`unsupported_table_filter` のような固定 reason label を含み、query body や object name は保持しません
 `Server.Reset` は stats を消さないため、workflow 単位の件数や timings が必要な場合は前後の snapshot を比較してください
